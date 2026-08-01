@@ -15,7 +15,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Java（去掉 Maven 缓存，因为没有 pom.xml）
+      - name: 安装 Java（去掉 Maven 缓存，避免 pom.xml 报错）
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -27,14 +27,27 @@ jobs:
 
       - name: 下载 APK
         run: |
-          wget -O app.apk ${{ github.event.inputs.apk_url }}
+          wget -v -O app.apk ${{ github.event.inputs.apk_url }}
 
       - name: 执行加固
         run: |
           java -jar dpt-shell/executable/dpt.jar -f app.apk
 
+      - name: 确认加固结果文件并上传加固包
+        run: |
+          # dpt 默认在当前目录生成 <原文件名>-signed.apk，这里应该是 app-signed.apk
+          if [ -f "app-signed.apk" ]; then
+            echo "找到加固文件: app-signed.apk"
+          else
+            echo "未找到 app-signed.apk，列出当前目录内容："
+            ls -R
+            exit 1
+          fi
+        shell: bash
+
       - name: 上传加固包
         uses: actions/upload-artifact@v4
         with:
           name: 加固后的APK
-          path: dpt-shell/executable/*_signed.apk
+          path: app-signed.apk
+          if-no-files-found: error
