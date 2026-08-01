@@ -15,10 +15,12 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Java
-        run: |
-          sudo apt update
-          sudo apt install openjdk-17-jre -y
+      - name: 安装并缓存 Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
 
       - name: 解压 dpt-shell
         run: |
