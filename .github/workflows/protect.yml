@@ -1,0 +1,39 @@
+name: APK加固
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'APK下载链接'
+        required: true
+
+jobs:
+  protect:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Java
+        run: |
+          sudo apt update
+          sudo apt install openjdk-17-jre -y
+
+      - name: 解压 dpt-shell
+        run: |
+          unzip tools/dpt-shell-v2.16.1.zip -d dpt-shell
+
+      - name: 下载 APK
+        run: |
+          wget -O app.apk ${{ github.event.inputs.apk_url }}
+
+      - name: 执行加固
+        run: |
+          java -jar dpt-shell/executable/dpt.jar -f app.apk
+
+      - name: 上传加固包
+        uses: actions/upload-artifact@v4
+        with:
+          name: 加固后的APK
+          path: dpt-shell/executable/*_signed.apk
