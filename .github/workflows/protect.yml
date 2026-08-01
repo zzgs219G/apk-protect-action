@@ -10,17 +10,16 @@ on:
 jobs:
   protect:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装并缓存 Java
+      - name: 安装 Java（去掉 Maven 缓存，因为没有 pom.xml）
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'maven'
 
       - name: 解压 dpt-shell
         run: |
