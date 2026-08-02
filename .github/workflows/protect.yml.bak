@@ -1,0 +1,41 @@
+name: APK加固
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'APK下载链接'
+        required: true
+
+jobs:
+  protect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Java（去掉 Maven 缓存，避免 pom.xml 报错）
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 解压 dpt-shell
+        run: |
+          unzip tools/dpt-shell-v2.16.1.zip -d dpt-shell
+
+      - name: 下载 APK
+        run: |
+          wget -v -O app.apk ${{ github.event.inputs.apk_url }}
+
+      - name: 执行加固
+        run: |
+          java -jar dpt-shell/executable/dpt.jar -f app.apk
+
+      - name: 上传加固包（修正文件名：app_signed.apk）
+        uses: actions/upload-artifact@v4
+        with:
+          name: 加固后的APK
+          path: app_signed.apk
+          if-no-files-found: error
