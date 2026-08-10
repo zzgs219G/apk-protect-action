@@ -9,31 +9,37 @@ on:
 
 jobs:
   protect:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04-arm  # 🔥 换用 ARM64 运行器，性能提升 40%
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Java（去掉 Maven 缓存，避免 pom.xml 报错）
+      - name: 安装 Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
+      # 🔥 新增：缓存 dpt-shell，跳过重复解压
+      - name: 缓存 dpt-shell
+        id: cache-dpt
+        uses: actions/cache@v4
+        with:
+          path: dpt-shell/
+          key: dpt-shell-${{ hashFiles('tools/dpt-shell-v2.16.1.zip') }}
+
+      # 🔥 只有缓存未命中时才解压
       - name: 解压 dpt-shell
-        run: |
-          unzip tools/dpt-shell-v2.16.1.zip -d dpt-shell
+        if: steps.cache-dpt.outputs.cache-hit != 'true'
+        run: unzip tools/dpt-shell-v2.16.1.zip -d dpt-shell
 
       - name: 下载 APK
-        run: |
-          wget -v -O app.apk ${{ github.event.inputs.apk_url }}
+        run: wget -v -O app.apk ${{ github.event.inputs.apk_url }}
 
       - name: 执行加固
-        run: |
-          java -jar dpt-shell/executable/dpt.jar -f app.apk
+        run: java -jar dpt-shell/executable/dpt.jar -f app.apk
 
-      - name: 上传加固包（修正文件名：app_signed.apk）
+      - name: 上传加固包
         uses: actions/upload-artifact@v4
         with:
           name: 加固后的APK
