@@ -26,12 +26,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dpt-shell/
-          key: dpt-shell-${{ hashFiles('tools/dpt-shell-v2.16.1.zip') }}
+          key: dpt-shell-${{ hashFiles('tools/dpt-shell-v2.19.0.zip') }}
 
       # 🔥 只有缓存未命中时才解压
       - name: 解压 dpt-shell
         if: steps.cache-dpt.outputs.cache-hit != 'true'
-        run: unzip tools/dpt-shell-v2.16.1.zip -d dpt-shell
+        run: unzip tools/dpt-shell-v2.19.0.zip -d dpt-shell
 
       - name: 下载 APK
         run: wget -v -O app.apk ${{ github.event.inputs.apk_url }}
