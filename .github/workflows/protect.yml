@@ -9,7 +9,7 @@ on:
 
 jobs:
   protect:
-    runs-on: ubuntu-24.04-arm  # 🔥 换用 ARM64 运行器，性能提升 40%
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # 🔥 新增：缓存 dpt-shell，跳过重复解压
+      # 🔥 缓存 dpt-shell
       - name: 缓存 dpt-shell
         id: cache-dpt
         uses: actions/cache@v4
@@ -39,7 +39,55 @@ jobs:
       - name: 执行加固
         run: java -jar dpt-shell/executable/dpt.jar -f app.apk
 
-      - name: 上传加固包
+      # ════════════════════════════════════════════════
+      # 🚀 新增：上传到 R2 并返回公开链接
+      # ════════════════════════════════════════════════
+      - name: 安装 AWS CLI（用于 R2 上传）
+        run: |
+          pip install awscli --upgrade
+
+      - name: 上传加固包到 R2
+        id: upload-r2
+        env:
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_DOMAIN: ${{ secrets.R2_PUBLIC_DOMAIN }}
+        run: |
+          # 生成带时间戳的文件名（避免重名）
+          TIMESTAMP=$(date +%s)
+          SAFE_NAME="${GITHUB_RUN_ID}_加固包_${TIMESTAMP}.apk"
+          echo "📦 文件名: $SAFE_NAME"
+          echo "file_name=$SAFE_NAME" >> $GITHUB_OUTPUT
+
+          # 配置 AWS CLI 使用 R2
+          aws configure set aws_access_key_id "$R2_ACCESS_KEY"
+          aws configure set aws_secret_access_key "$R2_SECRET_KEY"
+          aws configure set default.region auto
+          aws configure set default.s3.max_concurrent_requests 20
+
+          # 上传到 R2
+          aws s3 cp app_signed.apk s3://$R2_BUCKET/apks/$SAFE_NAME \
+            --endpoint-url "$R2_ENDPOINT" \
+            --no-progress
+
+          # 生成公开下载链接
+          DOWNLOAD_URL="$R2_PUBLIC_DOMAIN/apks/$SAFE_NAME"
+          echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+          echo "✅ 上传成功！"
+          echo "🔗 下载地址: $DOWNLOAD_URL"
+
+      # 🔥 在 Actions 日志中醒目地输出下载链接
+      - name: 输出下载链接
+        run: |
+          echo "========================================"
+          echo "✅ 加固完成！下载地址："
+          echo "${{ steps.upload-r2.outputs.download_url }}"
+          echo "========================================"
+
+      # 保留 artifact 作为备用（可删除，看需求）
+      - name: 上传加固包（Artifact 备用）
         uses: actions/upload-artifact@v4
         with:
           name: 加固后的APK
