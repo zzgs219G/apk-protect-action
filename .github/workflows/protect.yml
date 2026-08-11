@@ -10,6 +10,13 @@ on:
 jobs:
   protect:
     runs-on: ubuntu-24.04-arm
+    # 全局统一注入所有R2密钥，所有步骤都能读取
+    env:
+      R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+      R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_DOMAIN: ${{ secrets.R2_PUBLIC_DOMAIN }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -40,15 +47,25 @@ jobs:
       - name: 安装 AWS CLI
         run: pip install awscli --upgrade
 
+      # 现在全局env生效，这里能正常打印所有密钥
+      - name: 调试R2变量是否正常读取
+        run: |
+          echo "R2_ACCESS_KEY: [$R2_ACCESS_KEY]"
+          echo "R2_SECRET_KEY: [$R2_SECRET_KEY]"
+          echo "R2_ENDPOINT: [$R2_ENDPOINT]"
+          echo "R2_BUCKET: [$R2_BUCKET]"
+          echo "R2_PUBLIC_DOMAIN: [$R2_PUBLIC_DOMAIN]"
+
       - name: 上传加固包到 R2
         id: upload-r2
-        env:
-          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
-          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          R2_PUBLIC_DOMAIN: ${{ secrets.R2_PUBLIC_DOMAIN }}
+        # 已经全局注入env，这里可以删掉重复env代码
         run: |
+          # 前置校验，变量为空直接退出，提前报错
+          if [[ -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]];then
+            echo "❌ R2_ENDPOINT/R2_BUCKET 变量为空，请检查仓库Secrets配置"
+            exit 1
+          fi
+
           TIMESTAMP=$(date +%s)
           SAFE_NAME="${GITHUB_RUN_ID}_加固包_${TIMESTAMP}.apk"
           echo "📦 文件名: $SAFE_NAME"
