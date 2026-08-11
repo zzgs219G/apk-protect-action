@@ -10,7 +10,6 @@ on:
 jobs:
   protect:
     runs-on: ubuntu-24.04-arm
-    # 全局注入所有R2密钥，所有步骤均可读取
     env:
       R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
       R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
@@ -47,7 +46,6 @@ jobs:
       - name: 安装 AWS CLI
         run: pip install awscli --upgrade
 
-      # 调试：检查R2密钥是否读取成功（只打印长度，不泄露内容）
       - name: 检查R2密钥
         run: |
           echo "R2_ACCESS_KEY 长度: ${#R2_ACCESS_KEY}"
@@ -60,7 +58,7 @@ jobs:
         id: upload-r2
         run: |
           if [[ -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
-            echo "❌ R2_ENDPOINT/R2_BUCKET 变量为空，请检查仓库Secrets配置"
+            echo "❌ R2_ENDPOINT/R2_BUCKET 变量为空"
             exit 1
           fi
 
@@ -91,6 +89,17 @@ jobs:
           echo "$DOWNLOAD_URL"
           echo "========================================"
           echo "::notice title=📥 点击下载加固包::$DOWNLOAD_URL"
+
+      # ⭐⭐⭐ 新增：写入 R2 链接到运行名称（APP 端轮询时读取）⭐⭐⭐
+      - name: 写入R2链接到运行名称
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DOWNLOAD_URL="${{ steps.upload-r2.outputs.download_url }}"
+          echo "📤 写入运行名称: ✅ $DOWNLOAD_URL"
+          gh api -X PATCH /repos/${{ github.repository }}/actions/runs/${{ github.run_id }} \
+            -f name="✅ $DOWNLOAD_URL"
+          echo "✅ 写入完成"
 
       - name: 上传加固包（Artifact 备用）
         uses: actions/upload-artifact@v4
