@@ -60,7 +60,13 @@ jobs:
       - name: 上传加固包到 R2
         id: upload-r2
         run: |
-          # ⭐ 文件名只用 run_id，不用时间戳（APP端可以直接拼接）
+          # 检查必要变量是否为空（避免 AWS CLI 报 Unable to locate credentials）
+          if [[ -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "❌ R2_ENDPOINT/R2_BUCKET 变量为空，请检查仓库Secrets配置"
+            exit 1
+          fi
+
+          # 文件名只用 run_id，不加时间戳，方便 APP 端直接拼接
           SAFE_NAME="${GITHUB_RUN_ID}_加固包.apk"
           echo "📦 文件名: $SAFE_NAME"
 
