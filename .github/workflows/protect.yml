@@ -18,6 +18,7 @@ jobs:
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_PUBLIC_DOMAIN: ${{ secrets.R2_PUBLIC_DOMAIN }}
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -59,20 +60,9 @@ jobs:
       - name: 上传加固包到 R2
         id: upload-r2
         run: |
-          if [[ -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
-            echo "❌ R2_ENDPOINT/R2_BUCKET 变量为空"
-            exit 1
-          fi
-
-          TIMESTAMP=$(date +%s)
-          SAFE_NAME="${GITHUB_RUN_ID}_加固包_${TIMESTAMP}.apk"
+          # ⭐ 文件名只用 run_id，不用时间戳（APP端可以直接拼接）
+          SAFE_NAME="${GITHUB_RUN_ID}_加固包.apk"
           echo "📦 文件名: $SAFE_NAME"
-          echo "file_name=$SAFE_NAME" >> $GITHUB_OUTPUT
-
-          aws configure set aws_access_key_id "$R2_ACCESS_KEY"
-          aws configure set aws_secret_access_key "$R2_SECRET_KEY"
-          aws configure set default.region auto
-          aws configure set default.s3.max_concurrent_requests 20
 
           aws s3 cp app_signed.apk s3://$R2_BUCKET/apks/$SAFE_NAME \
             --endpoint-url "$R2_ENDPOINT" \
@@ -80,7 +70,6 @@ jobs:
 
           DOWNLOAD_URL="$R2_PUBLIC_DOMAIN/apks/$SAFE_NAME"
           echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
-          echo "✅ 上传成功！"
           echo "🔗 下载地址: $DOWNLOAD_URL"
 
       - name: 显示下载链接
@@ -91,17 +80,6 @@ jobs:
           echo "$DOWNLOAD_URL"
           echo "========================================"
           echo "::notice title=📥 点击下载加固包::$DOWNLOAD_URL"
-
-      # ⭐⭐⭐ 新增：写入 R2 链接到运行名称（APP 端轮询时读取）⭐⭐⭐
-      - name: 写入R2链接到运行名称
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          DOWNLOAD_URL="${{ steps.upload-r2.outputs.download_url }}"
-          echo "📤 写入运行名称: ✅ $DOWNLOAD_URL"
-          gh api -X PATCH /repos/${{ github.repository }}/actions/runs/${{ github.run_id }} \
-            -f name="✅ $DOWNLOAD_URL"
-          echo "✅ 写入完成"
 
       - name: 上传加固包（Artifact 备用）
         uses: actions/upload-artifact@v4
