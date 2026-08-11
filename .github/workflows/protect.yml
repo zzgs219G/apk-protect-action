@@ -10,7 +10,11 @@ on:
 jobs:
   protect:
     runs-on: ubuntu-24.04-arm
-    # 全局统一注入所有R2密钥，所有步骤都能读取
+    # API/网页手动触发都能读取密钥的权限配置
+    permissions:
+      contents: read
+      secrets: read
+    # 全局注入所有R2密钥，全流程所有步骤均可读取
     env:
       R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
       R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
@@ -34,6 +38,70 @@ jobs:
           path: dpt-shell/
           key: dpt-shell-${{ hashFiles('tools/dpt-shell-v2.19.0.zip') }}
 
+      - name: 解压 dpt-shell
+        if: steps.cache-dpt.outputs.cache-hit != 'true'
+        run: unzip tools/dpt-shell-v2.19.0.zip -d dpt-shell
+
+      - name: 下载 APK
+        run: wget -v -O app.apk ${{ github.event.inputs.apk_url }}
+
+      - name: 执行加固
+        run: java -jar dpt-shell/executable/dpt.jar -f app.apk
+
+      - name: 安装 AWS CLI
+        run: pip install awscli --upgrade
+
+      # 调试密钥读取（只打印长度，不泄露明文）
+      - name: 调试R2密钥是否正常读取
+        run: |
+          echo "R2_ACCESS_KEY 长度: ${#R2_ACCESS_KEY}"
+          echo "R2_SECRET_KEY 长度: ${#R2_SECRET_KEY}"
+          echo "R2_ENDPOINT 长度: ${#R2_ENDPOINT}"
+          echo "R2_BUCKET 长度: ${#R2_BUCKET}"
+          echo "R2_PUBLIC_DOMAIN 长度: ${#R2_PUBLIC_DOMAIN}"
+
+          if [[ ${#R2_ENDPOINT} -eq 0 || ${#R2_BUCKET} -eq 0 ]];then
+            echo "❌ R2_ENDPOINT/R2_BUCKET 变量为空，请检查仓库Secrets配置"
+            exit 1
+          fi
+
+      - name: 上传加固包到 R2
+        id: upload-r2
+        run: |
+          TIMESTAMP=$(date +%s)
+          SAFE_NAME="${GITHUB_RUN_ID}_加固包_${TIMESTAMP}.apk"
+          echo "📦 文件名: $SAFE_NAME"
+          echo "file_name=$SAFE_NAME" >> $GITHUB_OUTPUT
+
+          aws configure set aws_access_key_id "$R2_ACCESS_KEY"
+          aws configure set aws_secret_access_key "$R2_SECRET_KEY"
+          aws configure set default.region auto
+          aws configure set default.s3.max_concurrent_requests 20
+
+          aws s3 cp app_signed.apk s3://$R2_BUCKET/apks/$SAFE_NAME \
+            --endpoint-url "$R2_ENDPOINT" \
+            --no-progress
+
+          DOWNLOAD_URL="$R2_PUBLIC_DOMAIN/apks/$SAFE_NAME"
+          echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+          echo "✅ 上传成功！"
+          echo "🔗 下载地址: $DOWNLOAD_URL"
+
+      - name: 显示下载链接
+        run: |
+          DOWNLOAD_URL="${{ steps.upload-r2.outputs.download_url }}"
+          echo "========================================"
+          echo "✅ 加固完成！下载地址："
+          echo "$DOWNLOAD_URL"
+          echo "========================================"
+          echo "::notice title=📥 点击下载加固包::$DOWNLOAD_URL"
+
+      - name: 上传加固包（Artifact 备用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: 加固后的APK
+          path: app_signed.apk
+          if-no-files-found: error
       - name: 解压 dpt-shell
         if: steps.cache-dpt.outputs.cache-hit != 'true'
         run: unzip tools/dpt-shell-v2.19.0.zip -d dpt-shell
