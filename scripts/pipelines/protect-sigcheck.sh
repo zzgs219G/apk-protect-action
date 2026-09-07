@@ -70,11 +70,14 @@ log "步骤 5/6 解包注入重打包"
 # git 不跟踪空目录 → 云端检出后该路径必然不存在(报错三同源的路径漂移问题)
 APKTOOL_JAR="$ROOT/sigcheck/dex2c/dcc/tools/apktool.jar"
 [[ -f "$APKTOOL_JAR" ]] || { echo "❌ apktool.jar 缺失: $APKTOOL_JAR"; exit 1; }
-java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
+java -jar "$APKTOOL_JAR" d -r -f --no-debug-info -o "$WORK/decompiled" "$IN_APK"
 # ↑ 不带 --force-manifest(报错五):带上时顶层 manifest 被解码成文本 XML,
 #   apktool b 在 -r 模式下会把文本 manifest 原样拷回 APK、不重编成 AXML,
 #   产物是系统/文件管理器都不认的"灰包"。不带它时顶层保持二进制,回编合法。
 #   联合方案无需读文本 manifest(mark-native.py 只碰 smali,filter 走 androguard 读原包)。
+#   --no-debug-info(报错八):baksmali 丢弃 .line/.local 等调试指令,回编后
+#   dex 不再重建 debug_info 区块(实测简盒包 dex 缩小约 1.8MB)。debug_info
+#   仅用于断点调试/崩溃行号,发布加固包无运行时作用,剥离无功能损失。
 
 # native 化：把已抽进 so 的方法在 smali 里改成 native 壳，并插 System.loadLibrary("nc")
 # （dcc 原版只在自带重打包路径里做壳替换且不插 loadLibrary，纯成品 APK 后处理必须自动补齐）

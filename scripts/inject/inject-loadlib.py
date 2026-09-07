@@ -29,7 +29,7 @@ import os
 import re
 import sys
 
-SMALI_DIR_RE = re.compile(r'^smali(?:_classes\\d+)?$')
+SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')
 
 # androguard 从 dcc 目录导入(dcc 内置版,勿用 pip 版替换,见 make-filter-from-apk.py)
 _DCC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
