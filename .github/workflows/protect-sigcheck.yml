@@ -41,21 +41,24 @@ jobs:
       - name: 下载 APK
         timeout-minutes: 5
         run: |
-          curl -fL --retry 3 -o app.apk "${{ github.event.inputs.apk_url }}"
-          ls -la app.apk
+          set -o pipefail
+          curl -fL --retry 3 -o app.apk "${{ github.event.inputs.apk_url }}" 2>&1 | tee -a build.log
+          ls -la app.apk | tee -a build.log
 
       - name: 执行 sigcheck 注入
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           chmod +x scripts/sigcheck_inject.sh scripts/gen_sig_hash.sh
-          ./scripts/sigcheck_inject.sh app.apk protected_unsigned.apk
+          set -o pipefail
+          ./scripts/sigcheck_inject.sh app.apk protected_unsigned.apk 2>&1 | tee -a build.log
 
       - name: 上传加固包到 R2
         id: upload-r2
         run: |
+          set -o pipefail
           if [[ -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
-            echo "❌ R2_ENDPOINT/R2_BUCKET 为空，检查仓库 Secrets"
+            echo "❌ R2_ENDPOINT/R2_BUCKET 为空，检查仓库 Secrets" | tee -a build.log
             exit 1
           fi
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY"
@@ -63,14 +66,22 @@ jobs:
           export AWS_DEFAULT_REGION="auto"
           SAFE_NAME="${GITHUB_RUN_ID}_sigcheck包.apk"
           aws s3 cp protected_unsigned.apk "s3://$R2_BUCKET/apks/$SAFE_NAME" \
-            --endpoint-url "$R2_ENDPOINT" --no-progress
+            --endpoint-url "$R2_ENDPOINT" --no-progress 2>&1 | tee -a build.log
           DL="$R2_PUBLIC_DOMAIN/apks/$SAFE_NAME"
           echo "download_url=$DL" >> "$GITHUB_OUTPUT"
-          echo "🔗 下载地址: $DL"
+          echo "🔗 下载地址: $DL" | tee -a build.log
 
       - name: 显示下载链接
         run: |
           echo "::notice title=📥 sigcheck加固包(未签名,请自行重签)::${{ steps.upload-r2.outputs.download_url }}"
+
+      - name: 上传构建日志（无论成败都可下载）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 构建日志-build.log
+          path: build.log
+          if-no-files-found: warn
 
       - name: Artifact 备用
         uses: actions/upload-artifact@v4
