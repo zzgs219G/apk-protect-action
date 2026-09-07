@@ -114,7 +114,11 @@ def _find_launcher_from_axml(manifest_path, package_name):
         content = xml_bytes.decode('utf-8', 'replace') \
             if isinstance(xml_bytes, bytes) else str(xml_bytes)
     except ImportError as e:
-        print(f'⚠️ androguard 不可用({_DCC_DIR}): {e},降级文本解析', file=sys.stderr)
+        # 常见根因(报错六):dcc 内置 androguard 的 AXMLPrinter 依赖 lxml,
+        # runner 系统 python 不带 → pip3 install -r sigcheck/dex2c/dcc/requirements.txt
+        print(f'⚠️ androguard 不可用({_DCC_DIR}): {e};'
+              f'若提示缺 lxml,请先 pip3 install -r sigcheck/dex2c/dcc/requirements.txt;'
+              f'降级文本解析(仅对文本 XML 有效,二进制 AXML 必失败)', file=sys.stderr)
         return None
     except Exception as e:
         print(f'⚠️ AXML 解析失败: {type(e).__name__}: {e},降级文本解析', file=sys.stderr)

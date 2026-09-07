@@ -39,6 +39,12 @@ jobs:
           ndk-version: r26d
           add-to-path: false
 
+      - name: 安装 python 依赖(dcc)
+        # 报错六:dcc 内置 androguard 的 AXMLPrinter 依赖 lxml,runner 系统
+        # python 没有它 → LAUNCHER 解析降级文本正则 → 二进制 manifest 必失败。
+        # 与 protect-sigcheck.yml / protect-dcc.yml 保持一致,统一装 requirements.txt。
+        run: pip3 install -r sigcheck/dex2c/dcc/requirements.txt
+
       - name: 下载 APK
         timeout-minutes: 5
         run: |
