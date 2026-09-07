@@ -13,7 +13,7 @@ IN_APK="$1"
 OUT_APK="$2"
 # dcc.py 需要切换到自身目录运行，输入路径必须先转为绝对路径，避免 cd 后相对路径失效
 IN_APK="$(cd "$(dirname "$IN_APK")" && pwd)/$(basename "$IN_APK")"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # apk-protect-action 根目录
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"    # apk-protect-action 根目录
 DCC_DIR="$ROOT/sigcheck/dex2c/dcc"            # dcc 工具目录
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

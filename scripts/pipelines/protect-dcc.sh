@@ -28,7 +28,7 @@ IN_APK="$(cd "$(dirname "$IN_APK")" && pwd)/$(basename "$IN_APK")"
 RULES="$(cd "$(dirname "$RULES")" && pwd)/$(basename "$RULES")"
 OUT_APK="$(pwd)/$(basename "$OUT_APK")"
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DCC_DIR="$ROOT/sigcheck/dex2c/dcc"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
