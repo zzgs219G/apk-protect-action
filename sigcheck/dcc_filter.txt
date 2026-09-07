@@ -8,4 +8,6 @@
 !<clinit|init>
 
 # 只转译 MainActivity.onCreate —— 注入目标的唯一入口
-.*;onCreate\(Landroid/os/Bundle;\).*Lcom/.*MainActivity;.*
+# ⚠️ dcc full_name 无 "->"!真实格式: 类名;方法名(原型)，由 ''.join(method_triple) 拼接
+# 例: Lcom/xixin/box/MainActivity;onCreate(Landroid/os/Bundle;)V
+L.*MainActivity;onCreate\(Landroid/os/Bundle;\)
