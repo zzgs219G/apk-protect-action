@@ -1,4 +1,4 @@
-name: APK签名校验注入(sigcheck)
+name: 签名校验
 
 on:
   workflow_dispatch:
@@ -49,9 +49,9 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          chmod +x scripts/sigcheck_inject.sh scripts/gen_sig_hash.sh
+          chmod +x scripts/pipelines/protect-sigcheck.sh scripts/sig-hash/make-sig-hash.sh
           set -o pipefail
-          ./scripts/sigcheck_inject.sh app.apk protected_unsigned.apk 2>&1 | tee -a build.log
+          ./scripts/pipelines/protect-sigcheck.sh app.apk protected_unsigned.apk 2>&1 | tee -a build.log
 
       - name: 上传加固包到 R2
         id: upload-r2

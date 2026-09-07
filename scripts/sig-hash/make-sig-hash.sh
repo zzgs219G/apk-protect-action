@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# gen_sig_hash.sh — 从 APK 提取证书指纹，生成 sig_hash.h
-# 用法: gen_sig_hash.sh <apk路径> <输出sig_hash.h路径>
+# make-sig-hash.sh — 从 APK 提取证书指纹，生成 sig_hash.h
+# 用法: make-sig-hash.sh <apk路径> <输出sig_hash.h路径>
 # 依赖（按优先级）:
 #   1. apksigner (build-tools) — v1/v2/v3 全支持
-#   2. scripts/extract_cert_fp.py (纯 python3 标准库) — 解析 v2/v3 Signing Block
+#   2. scripts/extract-cert-fp.py (纯 python3 标准库) — 解析 v2/v3 Signing Block
 #   3. keytool (JDK) — 仅 v1 (JAR) 签名兜底
 set -euo pipefail
 
@@ -38,12 +38,12 @@ done
 
 # 方案 B: 纯 Python 解析 APK Signing Block（v2/v3），零外部依赖兜底
 if [[ -z "$HASH_HEX" ]] && command -v python3 >/dev/null 2>&1; then
-  HASH_HEX=$(python3 "$SCRIPT_DIR/extract_cert_fp.py" "$APK" 2>&1 | tail -1 || true)
+  HASH_HEX=$(python3 "$SCRIPT_DIR/extract-cert-fp.py" "$APK" 2>&1 | tail -1 || true)
   if [[ ! "$HASH_HEX" =~ ^[0-9a-f]{64}$ ]]; then
     echo "⚠️ Python Signing Block 解析失败: $HASH_HEX" >&2
     HASH_HEX=""
   else
-    echo "ℹ️ 指纹提取自 extract_cert_fp.py (v2/v3 Signing Block)"
+    echo "ℹ️ 指纹提取自 extract-cert-fp.py (v2/v3 Signing Block)"
   fi
 fi
 
@@ -59,7 +59,7 @@ fi
 if [[ -z "$HASH_HEX" ]]; then
   echo "❌ 无法提取证书指纹：apksigner / Signing Block 解析 / keytool 三种方式均失败" >&2
   echo "   排查: 1) APK 是否完整下载  2) 是否至少有 v1/v2/v3 之一签名  3) 手动运行:" >&2
-  echo "         python3 $SCRIPT_DIR/extract_cert_fp.py \"$APK\"" >&2
+  echo "         python3 $SCRIPT_DIR/extract-cert-fp.py \"$APK\"" >&2
   exit 1
 fi
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# dcc_protect.sh — 单独的 Dex2C 加固脚本（不掺签名校验，纯 dcc 流程）
+# protect-dcc.sh — 单独的 Dex2C 加固脚本（不掺签名校验，纯 dcc 流程）
 #
-# 与 sigcheck_inject.sh（联合方案）的区别：
+# 与 protect-sigcheck.sh（联合方案）的区别：
 #   - 不注入 sig_check.c / 签名校验
-#   - 类名由调用方手动指定（一行一个,支持通配符,详见 wildcard_to_filter.py）
+#   - 类名由调用方手动指定（一行一个,支持通配符,详见 rules-to-filter.py）
 #
 # 用法:
-#   dcc_protect.sh <输入.apk> <输出_unsigned.apk> <规则文件>
+#   protect-dcc.sh <输入.apk> <输出_unsigned.apk> <规则文件>
 #
 # 规则文件格式（一行一个类,支持 ! 排除、# 注释、空行）:
 #   com.test.**           com.test 包下所有类(含子包)
@@ -42,13 +42,13 @@ grep -q '[^[:space:]#]' "$RULES" || { echo "❌ 规则文件为空（至少一�
 
 # ── 步骤 1: 通配符规则 → dcc filter ─────────────────────────────────
 log "步骤 1/4 解析类名规则"
-python3 "$ROOT/scripts/wildcard_to_filter.py" "$RULES" "$WORK/dcc_filter.txt" \
+python3 "$ROOT/scripts/filter/rules-to-filter.py" "$RULES" "$WORK/dcc_filter.txt" \
   --classes "$WORK/activity_classes.txt"
 
 # activity* 需要 Activity 类列表 → 从 Manifest 动态提取
 if grep -q '^[[:space:]]*activity\*[[:space:]]*$' "$RULES"; then
   log "检测到 activity* 规则,从 Manifest 提取 Activity 列表"
-  python3 "$ROOT/scripts/gen_filter_from_apk.py" "$IN_APK" \
+  python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" \
     "$WORK/.placeholder_filter.txt" --classes "$WORK/activity_classes.txt" \
     --on-fail skip || true
 fi
@@ -76,7 +76,7 @@ APKTOOL_JAR="$ROOT/sigcheck/tools/apktool.jar"
 java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
 
 # native 壳替换 + System.loadLibrary("nc") 插桩
-python3 "$ROOT/scripts/mark_native.py" \
+python3 "$ROOT/scripts/repack/mark-native.py" \
   "$WORK/project/jni/nc/compiled_methods.txt" "$WORK/decompiled"
 
 for abi_dir in "$WORK/project/libs"/*; do

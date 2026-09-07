@@ -1,4 +1,4 @@
-name: Dex2C加固(指定类名)
+name: dex2c
 
 on:
   workflow_dispatch:
@@ -62,9 +62,9 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          chmod +x scripts/dcc_protect.sh scripts/mark_native.py
+          chmod +x scripts/pipelines/protect-dcc.sh scripts/repack/mark-native.py
           set -o pipefail
-          ./scripts/dcc_protect.sh app.apk protected_unsigned.apk class_rules.txt 2>&1 | tee -a build.log
+          ./scripts/pipelines/protect-dcc.sh app.apk protected_unsigned.apk class_rules.txt 2>&1 | tee -a build.log
 
       - name: 上传加固包到 R2
         id: upload-r2

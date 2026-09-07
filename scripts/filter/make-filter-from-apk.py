@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gen_filter_from_apk.py — 从 APK 的 AndroidManifest.xml 动态解析 LAUNCHER
+"""make-filter-from-apk.py — 从 APK 的 AndroidManifest.xml 动态解析 LAUNCHER
 activity,生成 dcc filter 文件(联合方案的"自动获取类名"环节)。
 
 原理:
@@ -10,7 +10,7 @@ activity,生成 dcc filter 文件(联合方案的"自动获取类名"环节)。
   4. 顺带产出所有 Activity 类列表(供 activity* 通配符展开,--emit-classes)。
 
 用法:
-  gen_filter_from_apk.py <apk> <输出filter> [--classes 类列表输出文件]
+  make-filter-from-apk.py <apk> <输出filter> [--classes 类列表输出文件]
                          [--on-fail error|skip] [--all-activities]
 """
 import os
