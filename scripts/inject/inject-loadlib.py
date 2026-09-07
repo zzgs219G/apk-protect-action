@@ -14,11 +14,18 @@
   2. 命令行方式(调试/独立测试):
        inject-loadlib.py <解包目录> <smali类名 Lcom/a/B;> [--so-name nc]
        inject-loadlib.py <解包目录> --launcher [--so-name nc]   # 自动找 LAUNCHER activity
+       inject-loadlib.py <解包目录> --launcher --entrypoints    # 双保险:<clinit>+onCreate
 
 插桩策略(与 mark-native.py 一致,防误插):
   - 目标类已有 loadLibrary 调用 → 跳过(幂等,多模块共存时不重复插)
   - 已有 <clinit> → 在其开头插入
   - 没有 <clinit> → 在 .class 行后新建一个
+
+双保险模式(--entrypoints,单独签名校验方案用):
+  <clinit> + onCreate 各插一份 System.loadLibrary,攻击者要删两处才绕过。
+  联合方案(dex2c)不需要:onCreate 已被抽进 so 变 native 壳,攻击者删
+  <clinit> 的 loadLibrary 会让 native 壳 UnsatisfiedLinkError 自爆,
+  双保险反而多余。
 
 LAUNCHER 解析(报错五修复后 manifest 全程保持二进制):
   - 顶层 AndroidManifest.xml 为二进制 AXML 时走 androguard 解析
@@ -34,6 +41,146 @@ SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')
 # androguard 从 dcc 目录导入(dcc 内置版,勿用 pip 版替换,见 make-filter-from-apk.py)
 _DCC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          '..', '..', 'sigcheck', 'dex2c', 'dcc'))
+
+
+def _count_param_regs(args_sig):
+    """统计方法参数描述符占用的寄存器数(J/D 各占 2 个寄存器)。
+    args_sig 为方法签名 () 内的描述符串,如 'Landroid/os/Bundle;'。"""
+    n = 0
+    i = 0
+    while i < len(args_sig):
+        c = args_sig[i]
+        if c == 'L':
+            i = args_sig.index(';', i) + 1
+            n += 1
+        elif c == '[':
+            while i < len(args_sig) and args_sig[i] == '[':
+                i += 1
+            if i < len(args_sig) and args_sig[i] == 'L':
+                i = args_sig.index(';', i)
+            n += 1
+            i += 1
+        elif c in 'JD':
+            n += 2
+            i += 1
+        else:
+            n += 1
+            i += 1
+    return n
+
+
+_CLINIT_HEADER_RE = re.compile(
+    r'^\.method\s[^\n]*\bconstructor\s+<clinit>\(\)', re.M)
+_ONCREATE_HEADER_RE = re.compile(r'^\.method\s[^\n]*\bonCreate\(', re.M)
+
+
+def _method_span(content, header_re):
+    """header_re 命中的方法 → (方法头行起始偏移, .end method 行结束偏移)。
+    找不到返回 None。"""
+    m = header_re.search(content)
+    if not m:
+        return None
+    end = content.find('.end method', m.start())
+    if end == -1:
+        return None
+    return m.start(), end + len('.end method')
+
+
+def _inject_into_method_body(content, header_re, so_name):
+    """向【已有】方法体开头头插 System.loadLibrary。
+
+    寄存器策略:插桩指令用 v0。v0 必须是局部寄存器(非参数):
+      .locals M    → M >= 1 时 v0 是局部
+      .registers N → N > 参数寄存器数时 v0 是局部
+    零局部方法跳过不插 —— 若给 .registers +1,参数寄存器在末尾、编号会全体
+    平移,方法体里用 v 别名引用参数的指令全部错位,得不偿失。onCreate
+    现实中必有局部寄存器(至少要调 super.onCreate),此分支仅兜底。
+
+    返回 (new_content, status):
+      prepended / already / no-method / no-registers / no-local-register
+    """
+    span = _method_span(content, header_re)
+    if not span:
+        return content, 'no-method'
+    body = content[span[0]:span[1]]
+    if 'loadLibrary' in body:
+        return content, 'already'
+
+    rm = re.search(r'^[ \t]*\.(registers|locals)[ \t]+(\d+)[ \t]*$', body, re.M)
+    if not rm:
+        return content, 'no-registers'
+    kind, total = rm.group(1), int(rm.group(2))
+
+    if kind == 'locals':
+        if total < 1:
+            return content, 'no-local-register'
+    else:
+        first_line = body[:body.index('\n')]
+        pm = re.search(r'\(([^)]*)\)', first_line)
+        if not pm:
+            return content, 'no-local-register'
+        p_regs = _count_param_regs(pm.group(1))
+        if not re.search(r'\bstatic\b', first_line):
+            p_regs += 1                      # virtual 方法 this 占 1 个
+        if total <= p_regs:
+            return content, 'no-local-register'
+
+    load_stmt = ('const-string v0, "%s"\n'
+                 'invoke-static {v0}, Ljava/lang/System;'
+                 '->loadLibrary(Ljava/lang/String;)V' % so_name)
+    # 插在寄存器声明行之后(re.M 下 $ 匹配在 \n 之前,故补 \n;
+    # load_stmt 不带尾换行,由原文的 \n 收尾)
+    body = body[:rm.end()] + '\n' + load_stmt + body[rm.end():]
+    return content[:span[0]] + body + content[span[1]:], 'prepended'
+
+
+def inject_loadlib_to_entrypoints(class_name, decompiled_dir, so_name='nc'):
+    """双保险插桩:<clinit> + onCreate 各插一份 System.loadLibrary。
+
+    背景:攻击者可整体删除 <clinit>(或其中 loadLibrary 语句)绕过签名校验
+    (单独签名校验方案没有 dex2c 的 native 壳自爆保护);onCreate 里再插
+    一份,要删两处才失效。两处各自独立幂等(按方法体检查 loadLibrary,
+    而非按类 —— 否则 clinit 已插会连累 onCreate 跳过)。
+
+    为什么 <clinit> 不能被 dex2c 抽进 so:被抽进 so 的方法依赖先加载 so
+    才能执行,而 loadLibrary 就在 <clinit> 里,鸡生蛋。dex 里必须永远
+    保留一条 Java 层 loadLibrary(filter 的 !<clinit|init> 排除即此意)。
+
+    返回 {'clinit': 状态, 'onCreate': 状态}:
+      clinit:   inserted(新建)/ prepended(已有头插)/ already / missing
+      onCreate: prepended / already / no-method(类未 override onCreate,
+                继承自父类,无法插 —— clinit 那份仍在)/ no-registers /
+                no-local-register / missing
+    """
+    if not class_name.endswith(';'):
+        class_name += ';'
+    smali_path = find_smali_file_by_class(decompiled_dir, class_name)
+    if not smali_path:
+        return {'clinit': 'missing', 'onCreate': 'missing'}
+
+    with open(smali_path) as fp:
+        content = fp.read()
+
+    # <clinit>:有则头插,无则新建(与 inject_loadlib_to_class 相同逻辑)
+    content, clinit_status = _inject_into_method_body(
+        content, _CLINIT_HEADER_RE, so_name)
+    if clinit_status == 'no-method':
+        clinit = ('.method static constructor <clinit>()V\n'
+                  '    .registers 1\n\n'
+                  'const-string v0, "%s"\n'
+                  'invoke-static {v0}, Ljava/lang/System;'
+                  '->loadLibrary(Ljava/lang/String;)V\n'
+                  '    return-void\n.end method\n\n' % so_name)
+        content = re.sub(r'(\.class[^\n]*\n)', r'\1\n' + clinit, content, count=1)
+        clinit_status = 'inserted'
+
+    # onCreate:类未 override(继承父类)时 no-method,不强插 —— clinit 那份仍在
+    content, oncreate_status = _inject_into_method_body(
+        content, _ONCREATE_HEADER_RE, so_name)
+
+    with open(smali_path, 'w') as fp:
+        fp.write(content)
+    return {'clinit': clinit_status, 'onCreate': oncreate_status}
 
 
 def find_smali_file_by_class(decompiled_dir, class_name):
@@ -185,12 +332,13 @@ def _find_launchers_in_text(content, package_name=None):
 
 
 def _parse_cli_args(argv):
-    """解析 CLI 参数 → (decompiled_dir, target, so_name, launcher)。
-    支持 --launcher / --so-name 出现在任意位置。"""
+    """解析 CLI 参数 → (decompiled_dir, target, so_name, launcher, entrypoints)。
+    支持 --launcher / --so-name / --entrypoints 出现在任意位置。"""
     decompiled_dir = None
     target = None
     so_name = 'nc'
     launcher = False
+    entrypoints = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -200,18 +348,21 @@ def _parse_cli_args(argv):
         elif a == '--launcher':
             launcher = True
             i += 1
+        elif a == '--entrypoints':
+            entrypoints = True
+            i += 1
         elif decompiled_dir is None:
             decompiled_dir = a
             i += 1
         else:
             target = a
             i += 1
-    return decompiled_dir, target, so_name, launcher
+    return decompiled_dir, target, so_name, launcher, entrypoints
 
 
 def _cli():
     """命令行入口(调试/独立测试用)。"""
-    decompiled_dir, target, so_name, launcher = _parse_cli_args(sys.argv[1:])
+    decompiled_dir, target, so_name, launcher, entrypoints = _parse_cli_args(sys.argv[1:])
     if not decompiled_dir or (not target and not launcher):
         print(__doc__, file=sys.stderr)
         return 1
@@ -227,10 +378,16 @@ def _cli():
 
     rc = 0
     for cls in classes:
-        r = inject_loadlib_to_class(cls, decompiled_dir, so_name)
-        print(f'  {cls}: {r}')
-        if r == 'missing':
-            rc = 3
+        if entrypoints:
+            r = inject_loadlib_to_entrypoints(cls, decompiled_dir, so_name)
+            print(f'  {cls}: clinit={r["clinit"]} onCreate={r["onCreate"]}')
+            if r['clinit'] == 'missing':
+                rc = 3
+        else:
+            r = inject_loadlib_to_class(cls, decompiled_dir, so_name)
+            print(f'  {cls}: {r}')
+            if r == 'missing':
+                rc = 3
     return rc
 
 
