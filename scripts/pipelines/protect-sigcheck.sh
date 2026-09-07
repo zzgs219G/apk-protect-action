@@ -70,7 +70,7 @@ log "步骤 5/6 解包注入重打包"
 # git 不跟踪空目录 → 云端检出后该路径必然不存在(报错三同源的路径漂移问题)
 APKTOOL_JAR="$ROOT/sigcheck/dex2c/dcc/tools/apktool.jar"
 [[ -f "$APKTOOL_JAR" ]] || { echo "❌ apktool.jar 缺失: $APKTOOL_JAR"; exit 1; }
-java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
+java -jar "$APKTOOL_JAR" d -r -f --force-manifest -o "$WORK/decompiled" "$IN_APK"
 
 # native 化：把已抽进 so 的方法在 smali 里改成 native 壳，并插 System.loadLibrary("nc")
 # （dcc 原版只在自带重打包路径里做壳替换且不插 loadLibrary，纯成品 APK 后处理必须自动补齐）
