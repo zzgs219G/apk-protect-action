@@ -87,6 +87,28 @@ def auto_vm(filename):
     raise Exception("unsupported file %s" % filename)
 
 
+def auto_vm_all(filename):
+    """多 dex 支持: APK → 所有 classes*.dex 的 DalvikVMFormat 列表。
+
+    原版 auto_vm 只读 classes.dex(get_dex),多 dex 包里 LAUNCHER activity
+    若在 classes2.dex…classesN.dex 就会 no compiled methods(报错九)。
+    非 APK 输入保持与 auto_vm 一致(单文件),统一包装成列表返回。"""
+    ret = androconf.is_android(filename)
+    if ret == 'APK':
+        a = apk.APK(filename)
+        vms = []
+        for dex_name in sorted(a.get_dex_names()):
+            vm = dvm.DalvikVMFormat(a.get_file(dex_name))
+            logger.info("loaded dex: %s (%d classes)" % (
+                dex_name, len(vm.get_classes())))
+            vms.append(vm)
+        if not vms:
+            raise Exception("no dex found in %s" % filename)
+        return vms
+    # DEX / DEY: 单文件,统一包装成列表走同一条编译路径
+    return [auto_vm(filename)]
+
+
 class MethodFilter(object):
     def __init__(self, configure, vm):
         self._compile_filters = []
@@ -264,37 +286,47 @@ def archive_compiled_code(project_dir):
 def compile_dex(apkfile, filtercfg):
     show_logging(level=logging.INFO)
 
-    d = auto_vm(apkfile)
-    dx = analysis.Analysis(d)
+    # 多 dex 支持(报错九): 遍历 APK 全部 classes*.dex。
+    # Analysis 构造时加入第一个 vm,其余逐个 add(xref 未用到,add 足够)。
+    # MethodFilter 的 conflict/native 检测按 dex 独立执行(all_methods 是局部变量,
+    # 跨 dex 同名方法不会互相误杀)。
+    vms = auto_vm_all(apkfile)
+    dx = analysis.Analysis(vms[0])
+    for vm in vms[1:]:
+        dx.add(vm)
 
-    method_filter = MethodFilter(filtercfg, d)
+    method_filter = MethodFilter(filtercfg, vms[0])
+    for vm in vms[1:]:
+        method_filter._init_conflict_methods(vm)
+        method_filter._init_native_methods(vm)
 
-    compiler = Dex2C(d, dx)
+    compiler = Dex2C(vms[0], dx)
 
     compiled_method_code = {}
     errors = []
 
-    for m in d.get_methods():
-        method_triple = get_method_triple(m)
+    for vm in vms:
+        for m in vm.get_methods():
+            method_triple = get_method_triple(m)
 
-        jni_longname = JniLongName(*method_triple)
-        full_name = ''.join(method_triple)
+            jni_longname = JniLongName(*method_triple)
+            full_name = ''.join(method_triple)
 
-        if len(jni_longname) > 220:
-            logger.debug("name to long %s(> 220) %s" % (jni_longname, full_name))
-            continue
-
-        if method_filter.should_compile(m):
-            logger.debug("compiling %s" % (full_name))
-            try:
-                code = compiler.get_source_method(m)
-            except Exception as e:
-                logger.warning("compile method failed:%s (%s)" % (full_name, str(e)), exc_info=True)
-                errors.append('%s:%s' % (full_name, str(e)))
+            if len(jni_longname) > 220:
+                logger.debug("name to long %s(> 220) %s" % (jni_longname, full_name))
                 continue
 
-            if code:
-                compiled_method_code[method_triple] = code
+            if method_filter.should_compile(m):
+                logger.debug("compiling %s" % (full_name))
+                try:
+                    code = compiler.get_source_method(m)
+                except Exception as e:
+                    logger.warning("compile method failed:%s (%s)" % (full_name, str(e)), exc_info=True)
+                    errors.append('%s:%s' % (full_name, str(e)))
+                    continue
+
+                if code:
+                    compiled_method_code[method_triple] = code
 
     return compiled_method_code, errors
 
