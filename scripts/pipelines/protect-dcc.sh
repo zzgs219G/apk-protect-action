@@ -72,7 +72,10 @@ PATH="$ANDROID_NDK_HOME:$PATH" ndk-build -j"$(nproc)" -C "$WORK/project"
 
 # ── 步骤 4: 解包 → native 化 → 放 so → 重打包（不签名） ────────────
 log "步骤 4/4 解包注入重打包"
-APKTOOL_JAR="$ROOT/sigcheck/tools/apktool.jar"
+# apktool.jar 实际随 dcc 工具包提交(仓库只此一份);sigcheck/tools/ 是空目录,
+# git 不跟踪空目录 → 云端检出后该路径必然不存在
+APKTOOL_JAR="$ROOT/sigcheck/dex2c/dcc/tools/apktool.jar"
+[[ -f "$APKTOOL_JAR" ]] || { echo "❌ apktool.jar 缺失: $APKTOOL_JAR"; exit 1; }
 java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
 
 # native 壳替换 + System.loadLibrary("nc") 插桩

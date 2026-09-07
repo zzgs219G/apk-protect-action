@@ -16,8 +16,11 @@ activity,生成 dcc filter 文件(联合方案的"自动获取类名"环节)。
 import os
 import sys
 
-DCC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
-                       'sigcheck', 'dex2c', 'dcc')
+# 本脚本位于 scripts/filter/,dcc 在 sigcheck/dex2c/dcc/ → 需要向上两级
+# (0f80c69 把脚本从 scripts/ 移入 scripts/filter/ 时,这里少改了一级,
+#  导致云端流水线 ModuleNotFoundError: androguard)
+DCC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       '..', '..', 'sigcheck', 'dex2c', 'dcc')
 
 
 def load_apk(apk_path):
