@@ -67,6 +67,13 @@ python3 dcc.py "$IN_APK" \
 log "步骤 3/4 NDK 编译"
 mkdir -p "$WORK/project"
 unzip -q "$WORK/dcc-project.zip" -d "$WORK/project"
+# 双 ABI 输出（dcc 默认只编 armeabi-v7a，与 protect-sigcheck.sh 保持一致）
+cat > "$WORK/project/jni/Application.mk" <<'EOF'
+APP_STL := c++_static
+APP_CPPFLAGS += -fvisibility=hidden
+APP_PLATFORM := android-21
+APP_ABI := armeabi-v7a arm64-v8a
+EOF
 : "${ANDROID_NDK_HOME:?需要设置 ANDROID_NDK_HOME 环境变量指向 NDK 根目录}"
 PATH="$ANDROID_NDK_HOME:$PATH" ndk-build -j"$(nproc)" -C "$WORK/project"
 
