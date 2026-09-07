@@ -76,7 +76,10 @@ log "步骤 4/4 解包注入重打包"
 # git 不跟踪空目录 → 云端检出后该路径必然不存在
 APKTOOL_JAR="$ROOT/sigcheck/dex2c/dcc/tools/apktool.jar"
 [[ -f "$APKTOOL_JAR" ]] || { echo "❌ apktool.jar 缺失: $APKTOOL_JAR"; exit 1; }
-java -jar "$APKTOOL_JAR" d -r -f --force-manifest -o "$WORK/decompiled" "$IN_APK"
+java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
+# ↑ 不带 --force-manifest(报错五):带上时顶层 manifest 被解码成文本 XML,
+#   apktool b 在 -r 模式下会把文本 manifest 原样拷回 APK、不重编成 AXML,
+#   产物是系统/文件管理器都不认的"灰包"。本流水线无需读文本 manifest。
 
 # native 壳替换 + System.loadLibrary("nc") 插桩
 python3 "$ROOT/scripts/repack/mark-native.py" \
