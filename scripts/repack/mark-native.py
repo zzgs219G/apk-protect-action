@@ -97,29 +97,46 @@ def process_smali(smali_path, targets):
     n_methods = 0
     while i < len(lines):
         line = lines[i]
-        out.append(line)
         stripped = line.strip()
-        if stripped.startswith('.method'):
-            header = stripped
-            # 解析方法头:.method public onCreate(Landroid/os/Bundle;)V
-            m = re.match(r'\.method\s+.*?([^\s(]+)(\(.*\)\S+)\s*$', header)
-            if m:
-                name, proto = m.group(1), m.group(2)
-                if (cls, name, proto) in my_targets:
-                    # 把方法体整体替换为 native 声明(跳到 .end method)
+        if not stripped.startswith('.method'):
+            out.append(line)
+            i += 1
+            continue
+        header = stripped
+        # 解析方法头:.method public onCreate(Landroid/os/Bundle;)V
+        # 名字必须取括号前紧邻的一段 —— 不能用贪婪 (\(.*\)\S+)$:
+        # access$000(Lcom/A;->onCreate(...))V 这类参数里嵌套方法引用的行,
+        # 贪婪版会把名字解析成参数里的 onCreate,误杀无关方法(报错十)。
+        m = re.match(r'\.method\s+(.*\S)\s*(\(.*\)\S+)\s*$', header)
+        if m:
+            toks = m.group(1).split()
+            name, proto = toks[-1], m.group(2)
+            flags = ' '.join(toks[:-1])
+            if (cls, name, proto) in my_targets:
+                # 构造器不允许 native(dex 校验直接拒),dcc 规则也不会抽它
+                if '<init>' in name or '<clinit>' in name:
+                    print(f'⚠️ {smali_path}: 跳过构造器 {name}{proto}(不允许 native)',
+                          file=sys.stderr)
+                else:
+                    # 找到本方法的 .end method 行
                     j = i
                     while j < len(lines) and lines[j].strip() != '.end method':
                         j += 1
-                    # native 方法不能有方法体:替换行为纯声明
-                    access = header[len('.method'):].strip()
-                    out[-1] = f'.method native {access}'.replace(
-                        f' {name}{proto}', '') + f' {name}{proto}'
-                    # 跳过原方法体
-                    i = j  # 循环尾部 i+=1 后指向 .end method 行,一并丢弃
+                    if j >= len(lines):
+                        # 原文件缺 .end method(不应发生),不改动以免越界
+                        out.append(line)
+                        i += 1
+                        continue
+                    # native 方法不能有方法体:方法体整段丢弃,但必须保留
+                    # .end method(原实现把它一并吞掉 → 回编报
+                    # missing END_METHOD_DIRECTIVE,即 docs/build.log 的死因)
+                    out.append(f'.method native {flags} {name}{proto}'.rstrip())
+                    out.append('.end method')
+                    i = j + 1          # 跳过原方法体,.end method 已自行补回
                     n_methods += 1
                     changed = True
-                    i += 1
                     continue
+        out.append(line)
         i += 1
 
     if n_methods == 0:
@@ -127,22 +144,21 @@ def process_smali(smali_path, targets):
 
     content = '\n'.join(out)
 
-    # 插 System.loadLibrary:优先已有 <clinit>,否则新建 static 块
-    if 'loadLibrary' not in content:
-        load_stmt = (f'const-string v0, "{SO_NAME}"\n'
-                     'invoke-static {v0}, Ljava/lang/System;'
-                     '->loadLibrary(Ljava/lang/String;)V\n')
-        if '.method static constructor <clinit>()V' in content:
-            content = content.replace(
-                '.method static constructor <clinit>()V\n',
-                '.method static constructor <clinit>()V\n' + load_stmt, 1)
-        else:
-            # 在 .class 行后插入一个新的 <clinit>
-            clinit = (f'.method static constructor <clinit>()V\n'
-                      f'    .registers 1\n\n' + load_stmt +
-                      '    return-void\n.end method\n\n')
-            content = re.sub(r'(\.class[^\n]*\n)', r'\1\n' + clinit, content, count=1)
-        changed = True
+    # 插 System.loadLibrary:复用签名校验方案已验证的插桩模块
+    # (inject-loadlib.py 的 _inject_into_method_body:寄存器检查 +
+    # 按方法体幂等,勿再手写一份容易出错的)
+    content, status = _inject_loadlib._inject_into_method_body(
+        content, _inject_loadlib._CLINIT_HEADER_RE, SO_NAME)
+    if status == 'no-method':
+        # 类没有 <clinit> → 在 .class 行后新建一个
+        clinit = ('.method static constructor <clinit>()V\n'
+                  '    .registers 1\n\n'
+                  f'const-string v0, "{SO_NAME}"\n'
+                  'invoke-static {v0}, Ljava/lang/System;'
+                  '->loadLibrary(Ljava/lang/String;)V\n'
+                  '    return-void\n.end method\n\n')
+        content = re.sub(r'(\.class[^\n]*\n)', r'\1\n' + clinit, content, count=1)
+    changed = True
 
     if changed:
         with open(smali_path, 'w') as fp:
