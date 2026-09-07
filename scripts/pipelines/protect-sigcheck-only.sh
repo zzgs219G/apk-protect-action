@@ -77,7 +77,10 @@ PATH="$ANDROID_NDK_HOME:$PATH" ndk-build -j"$(nproc)" -C "$WORK/project"
 # 模式下会把文本 manifest 原样拷回 APK、不重编成 AXML → 产物是系统/MT 都
 # 不认的"灰包"。不带它时顶层保持二进制 AXML,回编原样带走,产物合法。
 log "步骤 4/5 解包注入重打包"
-java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
+java -jar "$APKTOOL_JAR" d -r -f --no-debug-info -o "$WORK/decompiled" "$IN_APK"
+# ↑ 不带 --force-manifest(报错五)。--no-debug-info(报错八):baksmali 丢弃
+#   .line/.local 等调试指令,回编后 dex 不再重建 debug_info 区块(实测简盒包
+#   dex 缩小约 1.8MB)。debug_info 仅用于断点调试/崩溃行号,无运行时作用。
 
 # loadLibrary("nc") 插进主 Activity 的 <clinit>(App 启动即加载 so → 触发校验)
 # 幂等:若后续叠加 dex2c 模块(该类已有 loadLibrary),会自动跳过不重复插
