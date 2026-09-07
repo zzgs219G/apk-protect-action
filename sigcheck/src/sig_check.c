@@ -11,6 +11,7 @@
  *      与编译期注入的期望指纹（sig_hash.h 中的 SIG_HASH）比对。
  *   3. 校验失败不直接 exit(0)：起分离线程延时随机 abort，
  *      让"hook exit/abort 即绕过"的通用脚本失效（二期继续增强为隐蔽破坏）。
+ *      当前延时 1~3 秒(调试)，改法见 delayed_kill 函数上方注释。
  *   4. SIG_HASH 全零 = 调试模式（流水线未注入指纹时跳过校验，便于本地测试）。
  *
  * 编译：由流水线把本文件与 dcc 生成的 C 代码一起放进 ndk 工程编译，
@@ -388,11 +389,18 @@ fail:
 
 /* ─────────────────────────── 校验主逻辑 ─────────────────────────── */
 
+/* 失败后延时随机 abort，攻击者难以关联崩溃原因。
+ * 二期升级为污染数据等更隐蔽的破坏策略。
+ *
+ * 【改延时看这里】直接改下面 delay 一行:
+ *   delay = 1 + rand_r(&seed) % 3   →  随机 1~3 秒(当前,方便调试肉眼确认)
+ *   想改回正式发布的 90~270 秒,把那行换成:
+ *   delay = 90 + rand_r(&seed) % 180
+ *   (通用格式: 下限 + rand_r(&seed) % 跨度, 跨度=上限-下限+1)
+ * ⚠️ 发布前记得改回大延时,否则 hook 绕过成本大幅下降。 */
 static void *delayed_kill(void *arg) {
-    /* 失败后延时随机 90~270 秒再 abort，攻击者难以关联崩溃原因；
-       二期升级为污染数据等更隐蔽的破坏策略 */
     unsigned int seed = (unsigned int)(time(NULL) ^ getpid());
-    int delay = 90 + (int)(rand_r(&seed) % 180);
+    int delay = 1 + (int)(rand_r(&seed) % 3);   /* 随机 1~3 秒(调试用) */
     LOGD("v");
     sleep(delay);
     abort();

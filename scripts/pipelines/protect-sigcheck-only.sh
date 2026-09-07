@@ -82,11 +82,14 @@ java -jar "$APKTOOL_JAR" d -r -f --no-debug-info -o "$WORK/decompiled" "$IN_APK"
 #   .line/.local 等调试指令,回编后 dex 不再重建 debug_info 区块(实测简盒包
 #   dex 缩小约 1.8MB)。debug_info 仅用于断点调试/崩溃行号,无运行时作用。
 
-# loadLibrary("nc") 插进主 Activity 的 <clinit>(App 启动即加载 so → 触发校验)
-# 幂等:若后续叠加 dex2c 模块(该类已有 loadLibrary),会自动跳过不重复插
+# loadLibrary("nc") 双保险插桩:<clinit> + onCreate 各一份
+# —— 单独方案没有 dex2c 的 native 壳保护,攻击者删掉 <clinit> 即可绕过校验;
+#    onCreate 里再插一份,要删两处才失效(联合方案 protect-sigcheck.sh 不需要:
+#    onCreate 已抽进 so,删 <clinit> 的 loadLibrary 会让 native 壳直接自爆)。
+# 幂等:按方法体分别检查,两处互不影响
 # manifest 是二进制 AXML → inject-loadlib 内部走 androguard AXMLPrinter 解析
-log "步骤 4.5/5 主 Activity loadLibrary 插桩"
-python3 "$ROOT/scripts/inject/inject-loadlib.py" "$WORK/decompiled" --launcher --so-name nc
+log "步骤 4.5/5 主 Activity loadLibrary 双保险插桩"
+python3 "$ROOT/scripts/inject/inject-loadlib.py" "$WORK/decompiled" --launcher --entrypoints --so-name nc
 
 for abi_dir in "$WORK/project/libs"/*; do
   abi=$(basename "$abi_dir")
