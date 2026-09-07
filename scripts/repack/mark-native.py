@@ -22,9 +22,19 @@ native 化(改 smali + 重打包);我们流水线用 --no-build + --project-arch
 
 用法: mark-native.py <compiled_methods.txt> <解包目录>
 """
+import importlib.util
 import os
 import re
 import sys
+
+# inject-loadlib.py 文件名带连字符,不能常规 import → 用 importlib 显式加载
+# (0f80c69 教训:基于 __file__ 的路径,移动脚本时必须重算;此处从本文件位置推算)
+_INJECT_MOD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '..', 'inject', 'inject-loadlib.py')
+_spec = importlib.util.spec_from_file_location('inject_loadlib', _INJECT_MOD_PATH)
+_inject_loadlib = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_inject_loadlib)
+SMALI_DIR_RE = _inject_loadlib.SMALI_DIR_RE
 
 SO_NAME = 'nc'
 
@@ -44,9 +54,6 @@ def parse_compiled_methods(path):
                 continue
             result.add((m.group(1), m.group(2), m.group(3)))
     return result
-
-
-SMALI_DIR_RE = __import__('re').compile(r'^smali(?:_classes\d+)?$')
 
 
 def find_smali_files(decompiled_dir):
