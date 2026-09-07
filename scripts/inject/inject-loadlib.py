@@ -19,12 +19,21 @@
   - 目标类已有 loadLibrary 调用 → 跳过(幂等,多模块共存时不重复插)
   - 已有 <clinit> → 在其开头插入
   - 没有 <clinit> → 在 .class 行后新建一个
+
+LAUNCHER 解析(报错五修复后 manifest 全程保持二进制):
+  - 顶层 AndroidManifest.xml 为二进制 AXML 时走 androguard 解析
+    (dcc 自带,见 make-filter-from-apk.py 同款导入方式)
+  - 解析失败或为文本 XML 时降级为文本正则(兼容旧流程/调试)
 """
 import os
 import re
 import sys
 
-SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')
+SMALI_DIR_RE = re.compile(r'^smali(?:_classes\\d+)?$')
+
+# androguard 从 dcc 目录导入(dcc 内置版,勿用 pip 版替换,见 make-filter-from-apk.py)
+_DCC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         '..', '..', 'sigcheck', 'dex2c', 'dcc'))
 
 
 def find_smali_file_by_class(decompiled_dir, class_name):
@@ -86,16 +95,54 @@ def inject_loadlib_to_class(class_name, decompiled_dir, so_name='nc'):
     return result
 
 
+def _find_launcher_from_axml(manifest_path, package_name):
+    """二进制 AXML 路径:用 dcc 内置 androguard 的 AXMLPrinter 转文本后复用
+    现有正则逻辑。裸 AXML 不是 zip,不能喂给 APK();必须走 AXMLPrinter。
+    成功返回 smali 格式类名列表;androguard 不可用/解析失败返回 None(降级)。"""
+    if os.path.getsize(manifest_path) < 8:
+        return None
+    with open(manifest_path, 'rb') as fp:
+        head = fp.read(4)
+    if head != b'\x03\x00\x08\x00':     # 非二进制 AXML → 交给文本正则分支
+        return None
+    if _DCC_DIR not in sys.path:
+        sys.path.insert(0, _DCC_DIR)
+    try:
+        from androguard.core.bytecodes.axml import AXMLPrinter
+        with open(manifest_path, 'rb') as fp:
+            xml_bytes = AXMLPrinter(fp.read()).get_xml()
+        content = xml_bytes.decode('utf-8', 'replace') \
+            if isinstance(xml_bytes, bytes) else str(xml_bytes)
+    except ImportError as e:
+        print(f'⚠️ androguard 不可用({_DCC_DIR}): {e},降级文本解析', file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f'⚠️ AXML 解析失败: {type(e).__name__}: {e},降级文本解析', file=sys.stderr)
+        return None
+    return _find_launchers_in_text(content, package_name)
+
+
 def find_launcher_classes(decompiled_dir, package_name=None):
-    """从 apktool 解包目录的 AndroidManifest.xml(文本)提取 LAUNCHER activity。
-    纯文本正则,不依赖 androguard(与 dcc 模块解耦,模块化原则)。
+    """从 apktool 解包目录的 AndroidManifest.xml 提取 LAUNCHER activity。
+    二进制 AXML → androguard AXMLPrinter;文本 XML → 纯文本正则。
     返回 smali 格式类名列表(Lcom/a/B;)。"""
     manifest = os.path.join(decompiled_dir, 'AndroidManifest.xml')
     if not os.path.exists(manifest):
         return []
+
+    # 报错五修复后顶层 manifest 是二进制 AXML;先试 androguard,失败降级文本正则
+    result = _find_launcher_from_axml(manifest, package_name)
+    if result is not None:
+        return result
+
     with open(manifest, encoding='utf-8', errors='replace') as fp:
         content = fp.read()
 
+    return _find_launchers_in_text(content, package_name)
+
+
+def _find_launchers_in_text(content, package_name=None):
+    """文本 XML → LAUNCHER activity smali 类名列表(AXMLPrinter 分支复用)。"""
     if package_name is None:
         m = re.search(r'package="([^"]+)"', content)
         package_name = m.group(1) if m else ''

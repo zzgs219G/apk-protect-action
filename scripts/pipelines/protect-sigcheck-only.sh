@@ -72,11 +72,16 @@ log "步骤 3/5 NDK 编译"
 PATH="$ANDROID_NDK_HOME:$PATH" ndk-build -j"$(nproc)" -C "$WORK/project"
 
 # ── 步骤 4: apktool 解包 → loadLibrary 插桩 → 放 so → 重打包 ───────
+# 注意:解包命令不带 --force-manifest(报错五)。
+# 带 --force-manifest 时顶层 manifest 被解码成文本 XML,而 apktool b 在 -r
+# 模式下会把文本 manifest 原样拷回 APK、不重编成 AXML → 产物是系统/MT 都
+# 不认的"灰包"。不带它时顶层保持二进制 AXML,回编原样带走,产物合法。
 log "步骤 4/5 解包注入重打包"
-java -jar "$APKTOOL_JAR" d -r -f --force-manifest -o "$WORK/decompiled" "$IN_APK"
+java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
 
 # loadLibrary("nc") 插进主 Activity 的 <clinit>(App 启动即加载 so → 触发校验)
 # 幂等:若后续叠加 dex2c 模块(该类已有 loadLibrary),会自动跳过不重复插
+# manifest 是二进制 AXML → inject-loadlib 内部走 androguard AXMLPrinter 解析
 log "步骤 4.5/5 主 Activity loadLibrary 插桩"
 python3 "$ROOT/scripts/inject/inject-loadlib.py" "$WORK/decompiled" --launcher --so-name nc
 
@@ -86,11 +91,9 @@ for abi_dir in "$WORK/project/libs"/*; do
   cp "$abi_dir/libnc.so" "$WORK/decompiled/lib/$abi/"
 done
 # 强制解压 so 加载(本方案唯一允许的 Manifest 修改)
-sed -i 's/android:extractNativeLibs="false"/android:extractNativeLibs="true"/' \
-  "$WORK/decompiled/AndroidManifest.xml" || true
-grep -q 'extractNativeLibs="true"' "$WORK/decompiled/AndroidManifest.xml" || \
-  sed -i '0,/<application/s//<application android:extractNativeLibs="true"/' \
-    "$WORK/decompiled/AndroidManifest.xml"
+# 二进制 AXML 无法 sed → 用 patch-extractnativelibs.py 原位等尺寸改写
+log "步骤 4.6/5 extractNativeLibs=true(二进制 AXML 原位补丁)"
+python3 "$ROOT/scripts/repack/patch-extractnativelibs.py" "$WORK/decompiled/AndroidManifest.xml"
 
 java -jar "$APKTOOL_JAR" b -o "$WORK/unsigned.apk" "$WORK/decompiled"
 
