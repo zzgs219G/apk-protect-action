@@ -73,7 +73,7 @@ PATH="$ANDROID_NDK_HOME:$PATH" ndk-build -j"$(nproc)" -C "$WORK/project"
 
 # ── 步骤 4: apktool 解包 → loadLibrary 插桩 → 放 so → 重打包 ───────
 log "步骤 4/5 解包注入重打包"
-java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
+java -jar "$APKTOOL_JAR" d -r -f --force-manifest -o "$WORK/decompiled" "$IN_APK"
 
 # loadLibrary("nc") 插进主 Activity 的 <clinit>(App 启动即加载 so → 触发校验)
 # 幂等:若后续叠加 dex2c 模块(该类已有 loadLibrary),会自动跳过不重复插
