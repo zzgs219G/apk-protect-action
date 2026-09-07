@@ -1,0 +1,11 @@
+# dcc 方法过滤规则（sigcheck 注入专用）
+# 语法（继承 dcc 原生 filter）：
+#   !规则  = 排除（不转译）
+#   =全名  = 精确匹配转译
+#   正则   = 匹配即转译
+
+# 排除所有构造器与类初始化器（风险高、易编译失败）
+!<clinit|init>
+
+# 只转译 MainActivity.onCreate —— 注入目标的唯一入口
+.*;onCreate\(Landroid/os/Bundle;\).*Lcom/.*MainActivity;.*
