@@ -204,6 +204,18 @@ static int find_apk_path(char *out, size_t outlen) {
     char line[512];
     char *p;
 
+#ifdef SIGCHECK_HOST_TEST
+    /* 宿主测试：直接用环境变量指定的路径 */
+    {
+        const char *t = getenv("SIGCHECK_TEST_APK");
+        if (t && *t) {
+            snprintf(out, outlen, "%s", t);
+            LOGI("apk path from test env: %s", out);
+            return 0;
+        }
+    }
+#endif
+
     fp = fopen("/proc/self/maps", "r");
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
@@ -262,12 +274,12 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
     off_t fsize;
     unsigned char eocd[22];
     off_t search_start, pos;
-    unsigned long long cd_size, cd_off;
+    unsigned long long cd_off;
     unsigned char magic[16];
     unsigned long long block_size;
     off_t block_start, pair_pos;
     unsigned char header[12];
-    unsigned int block_id = 0;
+    unsigned long long block_id = 0;
     unsigned char *value = NULL;
     int found = -1;
 
@@ -282,23 +294,25 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
     }
     if (pos < search_start) return -1;
 
-    cd_size = rd32le(eocd + 12);
-    cd_off  = rd32le(eocd + 16);
+    cd_off = rd32le(eocd + 16);
     if (cd_off == 0 || cd_off == 0xffffffffULL) return -1; /* 空/zip64 不支持 */
 
-    /* 2. CD 前应紧邻 Signing Block 尾部：magic 在 cd_off-16 */
+    /* 2. CD 前应紧邻 Signing Block 尾部：magic 在 cd_off-16。
+     * AOSP 布局: [size-payload(8)][pairs...][size-total(8)][magic(16)]
+     * 尾部 size-total = pairs + 尾部 24 字节，整块 = size-total + 头部 8 字节，
+     * 块起点 = cd_off - size_total - 8。（实测部分签名工具头尾两字段写相同值，
+     * 故不校验头部 size-payload，定位以尾部字段为准） */
     if ((off_t)cd_off < 32) return -1;
     if (read_at(fd, magic, 16, (off_t)cd_off - 16) != 0) return -1;
     if (memcmp(magic, SIG_BLOCK_MAGIC, 16) != 0) return -1; /* 无 v2/v3 签名 */
 
-    block_size = rd64le((unsigned char[]){0}); /* 占位，真正读取见下 */
     {
         unsigned char sz8[8];
         if (read_at(fd, sz8, 8, (off_t)cd_off - 24) != 0) return -1;
         block_size = rd64le(sz8);
     }
-    if ((off_t)(block_size + 24) > cd_off) return -1;
-    block_start = (off_t)cd_off - 24 - (off_t)block_size;
+    if ((off_t)(block_size + 8) > cd_off) return -1;
+    block_start = (off_t)cd_off - 8 - (off_t)block_size;
 
     /* 3. 遍历 ID-value pairs，找 v2/v3 块 */
     pair_pos = block_start + 8;
@@ -306,7 +320,7 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
         unsigned long long pair_len;
         if (read_at(fd, header, 12, pair_pos) != 0) break;
         pair_len = rd64le(header);            /* 长度含 id(4)+value */
-        block_id = rd32le(header + 8);
+        block_id = (unsigned long long)rd32le(header + 8);
         if (pair_len < 4 || pair_len > block_size) break;
         if (block_id == V2_BLOCK_ID || block_id == V3_BLOCK_ID) {
             unsigned long long vlen = pair_len - 4;
@@ -330,11 +344,10 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
     {
         const unsigned char *p = value;
         const unsigned char *end = value + found;
-        unsigned int signers_len, signer_len, sd_len, digests_len, certs_len, cert_len;
+        unsigned int signer_len, sd_len, digests_len, certs_len, cert_len;
         const unsigned char *signer, *sd, *certs;
 
-        if (p + 4 > end) goto fail;
-        signers_len = rd32le(p); p += 4;            /* signers 区总长（其实可直接用） */
+        p += 4;                                     /* signers 区总长（无需使用） */
         if (p + 4 > end) goto fail;
         signer_len = rd32le(p); p += 4;             /* 第一个 signer 的长度 */
         if (p + signer_len > end) goto fail;
@@ -451,3 +464,11 @@ fail:
 __attribute__((constructor)) static void sig_check_entry(void) {
     sig_verify();
 }
+
+/* ── 宿主端测试钩子（仅 SIGCHECK_HOST_TEST 编译时启用，Android 构建不受影响）── */
+#ifdef SIGCHECK_HOST_TEST
+#include <stdlib.h>
+/* 测试时用环境变量 SIGCHECK_TEST_APK 覆盖 find_apk_path 的结果 */
+const char *sigcheck_test_apk_path(void);
+void sig_verify_test(void) { sig_verify(); }
+#endif
