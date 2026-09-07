@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""wildcard_to_filter.py — 把「一行一个类」的通配符规则转成 dcc filter 文件
+"""rules-to-filter.py — 把「一行一个类」的通配符规则转成 dcc filter 文件
 
 输入(每行一个规则,支持 ! 开头排除,空行和 # 注释跳过):
   通配符语义(沿用用户提供的规则,按实际实现):
@@ -18,11 +18,11 @@
 
 输出: dcc filter 格式,每行一条正则。类名规则会被转换为
   L<类名>.*  (匹配该类下的所有方法)
-特殊关键字 activity* 需要 --classes 参数(由 gen_filter_from_apk.py 或
+特殊关键字 activity* 需要 --classes 参数(由 make-filter-from-apk.py 或
 dcc 解析 dex 得到的类列表文件),逐个匹配后展开为具体类。
 
 用法:
-  wildcard_to_filter.py <规则文件> <输出filter> [--classes 类列表文件]
+  rules-to-filter.py <规则文件> <输出filter> [--classes 类列表文件]
 """
 import re
 import sys
@@ -85,7 +85,7 @@ def has_wildcard(rule: str) -> bool:
 def expand_activity_keyword(classes_file: str) -> list:
     """从类列表文件展开 activity* 规则。
     类列表文件: 每行一个类(两种格式都兼容):
-      1. gen_filter_from_apk.py 生成: com.demo.app.MainActivity # activity
+      1. make-filter-from-apk.py 生成: com.demo.app.MainActivity # activity
       2. smali 风格: Lcom/demo/MainActivity;
     返回统一为 smali 风格 L...; (供 class_rule_to_filter 剥壳使用)。"""
     result = []
@@ -150,7 +150,7 @@ def main() -> int:
         lines_out.append(prefix + class_rule_to_filter(body, has_wildcard(body)))
 
     if activity_mode:
-        print('ℹ️ activity* 关键字已展开(注意:非标准命名的 Activity 需 gen_filter_from_apk.py 提供类列表)', file=sys.stderr)
+        print('ℹ️ activity* 关键字已展开(注意:非标准命名的 Activity 需 make-filter-from-apk.py 提供类列表)', file=sys.stderr)
 
     with open(out_path, 'w') as fp:
         fp.write('\n'.join(lines_out) + '\n')

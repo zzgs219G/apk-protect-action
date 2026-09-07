@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mark_native.py — 把 dcc 转译过的方法在解包后的 smali 里改成 native 壳,
+"""mark-native.py — 把 dcc 转译过的方法在解包后的 smali 里改成 native 壳,
 并在所属类中插入 System.loadLibrary("nc"),保证 so 被加载。
 
 背景:dcc.py 的 dcc() 只有在【不指定 --project-archive】时才顺手做
@@ -20,7 +20,7 @@ native 化(改 smali + 重打包);我们流水线用 --no-build + --project-arch
       每行格式: Lcom/a/B;method(args)ret   (dcc 的 full_name,无箭头)
   $2  apktool 解包目录(含 smali*/ 子目录)
 
-用法: mark_native.py <compiled_methods.txt> <解包目录>
+用法: mark-native.py <compiled_methods.txt> <解包目录>
 """
 import os
 import re

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# sigcheck_inject.sh — 签名校验注入总控脚本（在 GitHub Actions 流水线中执行）
+# protect-sigcheck.sh — 签名校验注入总控脚本（在 GitHub Actions 流水线中执行）
 #
 # 输入: 已下载的用户 APK（开发者自己 keystore 签名）
 # 输出: 加固后的未签名 APK（用户自行重签后发布）
 #
 # 前置依赖（由流水线安装）: python3 + pip 依赖、JDK 17、Android NDK、apktool
 # 用法:
-#   sigcheck_inject.sh <输入.apk> <输出_unsigned.apk>
+#   protect-sigcheck.sh <输入.apk> <输出_unsigned.apk>
 set -euo pipefail
 
 IN_APK="$1"
@@ -25,22 +25,23 @@ log() { echo "━━━ [sigcheck] $* ━━━"; }
 
 # ── 步骤 1: 提取证书指纹，生成 sig_hash.h ──────────────────────────
 log "步骤 1/6 提取证书指纹"
-"$ROOT/scripts/gen_sig_hash.sh" "$IN_APK" "$WORK/sig_hash.h"
+"$ROOT/scripts/sig-hash/make-sig-hash.sh" "$IN_APK" "$WORK/sig_hash.h"
 
 # ── 步骤 2: dcc 编译主 Activity → C 代码（不编译，只产出工程包） ──
 log "步骤 2/6 Dex2C 转译"
 cd "$DCC_DIR"
 # 动态解析 Manifest 里的 LAUNCHER activity → 自动生成 filter（一行一个类）
-python3 "$ROOT/scripts/gen_filter_from_apk.py" "$IN_APK" "$WORK/auto_filter.txt" \
+python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" "$WORK/auto_filter.txt" \
   --classes "$WORK/activity_classes.txt" --on-fail error
-python3 "$ROOT/scripts/wildcard_to_filter.py" "$WORK/auto_filter.txt" \
-  "$WORK/dcc_filter_final.txt" --classes "$WORK/activity_classes.txt"
+# auto_filter.txt 已是 dcc filter 正则格式(见 make-filter-from-apk.py),
+# 直接使用,不要二次转换 —— 曾经二次转换产生畸形正则导致 no compiled methods
+DCC_FILTER="$WORK/auto_filter.txt"
 
 # filter: 只转译主 Activity 的方法（动态类名）
 python3 dcc.py "$IN_APK" \
   --project-archive "$WORK/dcc-project.zip" \
   --no-build \
-  --filter "$WORK/dcc_filter_final.txt"
+  --filter "$DCC_FILTER"
 
 [[ -f "$WORK/dcc-project.zip" ]] || { echo "❌ dcc 未产出工程包（filter 可能未命中任何方法）"; exit 1; }
 
@@ -71,7 +72,7 @@ java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
 # native 化：把已抽进 so 的方法在 smali 里改成 native 壳，并插 System.loadLibrary("nc")
 # （dcc 原版只在自带重打包路径里做壳替换且不插 loadLibrary，纯成品 APK 后处理必须自动补齐）
 log "步骤 5.5/6 smali native 化"
-python3 "$ROOT/scripts/mark_native.py" \
+python3 "$ROOT/scripts/repack/mark-native.py" \
   "$WORK/project/jni/nc/compiled_methods.txt" "$WORK/decompiled"
 
 for abi_dir in "$WORK/project/libs"/*; do

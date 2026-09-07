@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""extract_cert_fp.py — 从 APK 提取 v2/v3 签名证书的 SHA-256 指纹
+"""extract-cert-fp.py — 从 APK 提取 v2/v3 签名证书的 SHA-256 指纹
 
 不依赖 apksigner / keytool / build-tools，纯标准库解析 APK Signing Block：
   EOCD → 定位 Signing Block（magic "APK Sig Block 42"）→ 遍历 ID-value pairs
   → 取 v3 (0xf05368c0) 或 v2 (0x7109871a) 块 → 解析 signer 结构取第一张证书 DER
   → hashlib.sha256(der).hexdigest()
 
-用法: extract_cert_fp.py <apk路径>
+用法: extract-cert-fp.py <apk路径>
 成功: stdout 输出 64 位小写十六进制指纹
 失败: stderr 报错并 exit 1
 """
