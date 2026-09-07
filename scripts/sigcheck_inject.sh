@@ -11,6 +11,8 @@ set -euo pipefail
 
 IN_APK="$1"
 OUT_APK="$2"
+# dcc.py 需要切换到自身目录运行，输入路径必须先转为绝对路径，避免 cd 后相对路径失效
+IN_APK="$(cd "$(dirname "$IN_APK")" && pwd)/$(basename "$IN_APK")"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"       # apk-protect-action 根目录
 DCC_DIR="$ROOT/sigcheck/dex2c/dcc"            # dcc 工具目录
 WORK="$(mktemp -d)"
@@ -25,14 +27,20 @@ log() { echo "━━━ [sigcheck] $* ━━━"; }
 log "步骤 1/6 提取证书指纹"
 "$ROOT/scripts/gen_sig_hash.sh" "$IN_APK" "$WORK/sig_hash.h"
 
-# ── 步骤 2: dcc 编译 MainActivity → C 代码（不编译，只产出工程包） ──
+# ── 步骤 2: dcc 编译主 Activity → C 代码（不编译，只产出工程包） ──
 log "步骤 2/6 Dex2C 转译"
 cd "$DCC_DIR"
-# filter: 只转译 onCreate（含 Bundle 签名），与 dcc 默认 filter 一致
+# 动态解析 Manifest 里的 LAUNCHER activity → 自动生成 filter（一行一个类）
+python3 "$ROOT/scripts/gen_filter_from_apk.py" "$IN_APK" "$WORK/auto_filter.txt" \
+  --classes "$WORK/activity_classes.txt" --on-fail error
+python3 "$ROOT/scripts/wildcard_to_filter.py" "$WORK/auto_filter.txt" \
+  "$WORK/dcc_filter_final.txt" --classes "$WORK/activity_classes.txt"
+
+# filter: 只转译主 Activity 的方法（动态类名）
 python3 dcc.py "$IN_APK" \
   --project-archive "$WORK/dcc-project.zip" \
   --no-build \
-  --filter "$ROOT/sigcheck/dcc_filter.txt"
+  --filter "$WORK/dcc_filter_final.txt"
 
 [[ -f "$WORK/dcc-project.zip" ]] || { echo "❌ dcc 未产出工程包（filter 可能未命中任何方法）"; exit 1; }
 
@@ -59,6 +67,13 @@ PATH="$ANDROID_NDK_HOME:$PATH" ndk-build -j"$(nproc)" -C "$WORK/project"
 log "步骤 5/6 解包注入重打包"
 APKTOOL_JAR="$ROOT/sigcheck/tools/apktool.jar"
 java -jar "$APKTOOL_JAR" d -r -f -o "$WORK/decompiled" "$IN_APK"
+
+# native 化：把已抽进 so 的方法在 smali 里改成 native 壳，并插 System.loadLibrary("nc")
+# （dcc 原版只在自带重打包路径里做壳替换且不插 loadLibrary，纯成品 APK 后处理必须自动补齐）
+log "步骤 5.5/6 smali native 化"
+python3 "$ROOT/scripts/mark_native.py" \
+  "$WORK/project/jni/nc/compiled_methods.txt" "$WORK/decompiled"
+
 for abi_dir in "$WORK/project/libs"/*; do
   abi=$(basename "$abi_dir")
   mkdir -p "$WORK/decompiled/lib/$abi"
