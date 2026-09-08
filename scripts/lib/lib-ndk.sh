@@ -34,8 +34,13 @@ include \$(CLEAR_VARS)
 LOCAL_MODULE    := $mod
 LOCAL_LDLIBS    := -llog
 
-SOURCES := \$(wildcard \$(LOCAL_PATH)/*.cpp) \$(wildcard \$(LOCAL_PATH)/*.c)
-LOCAL_C_INCLUDES := \$(LOCAL_PATH)
+# 必须同时收根目录与 nc/ 子目录(报错十三):联合方案里 dcc 产出的
+# Dex2C.cpp / well_known_classes.cpp / 各方法 .cpp 与 sig_check.c 全在
+# jni/nc/ 下,sigcheck-only 的源文件在 jni/ 根下 —— 两级都要 wildcard,
+# 只写一级必然产出"空壳 so" → 运行时 UnsatisfiedLinkError
+SOURCES := \$(wildcard \$(LOCAL_PATH)/*.cpp) \$(wildcard \$(LOCAL_PATH)/*.c) \
+           \$(wildcard \$(LOCAL_PATH)/nc/*.cpp) \$(wildcard \$(LOCAL_PATH)/nc/*.c)
+LOCAL_C_INCLUDES := \$(LOCAL_PATH) \$(LOCAL_PATH)/nc
 
 LOCAL_SRC_FILES := \$(SOURCES:\$(LOCAL_PATH)/%=%)
 
