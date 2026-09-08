@@ -66,6 +66,24 @@ require_env() {
   [[ -n "${!name:-}" ]] || { log_err "环境变量 $name 未设置${2:+（$2）}"; exit 1; }
 }
 
+# ensure_dcc [解压根目录，默认 "$ROOT/build/dcc"] → 解压后 dcc 目录路径(stdout)
+# dcc 已从 sigcheck/dex2c/dcc/ 摊开目录改为 tools/dcc.zip 分发(单文件制品,
+# 与 dpt-shell 形态一致)。zip 内顶层是 dcc/,解压到 <根>/ 即得 <根>/dcc。
+# 幂等:目标已存在(dcc.py 可见)则跳过解压,重复调用零开销。
+DCC_ZIP="$ROOT/tools/dcc.zip"    # dcc 分发包(唯一真源,严禁与解压产物混改)
+ensure_dcc() {
+  local dest="${1:-$ROOT/build/dcc}"
+  if [[ -f "$dest/dcc/dcc.py" ]]; then
+    echo "$dest/dcc"
+    return 0
+  fi
+  require_file "$DCC_ZIP" "dcc 分发包"
+  mkdir -p "$dest"
+  unzip -qo "$DCC_ZIP" -d "$dest"
+  [[ -f "$dest/dcc/dcc.py" ]] || { log_err "dcc.zip 解压后缺 dcc/dcc.py: $dest"; exit 1; }
+  echo "$dest/dcc"
+}
+
 # module_cd_run <目录> <命令...> — 在子 shell 里切目录执行，主进程 cwd 永不漂移
 module_cd_run() {
   local dir="$1"; shift

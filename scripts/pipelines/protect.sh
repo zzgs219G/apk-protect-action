@@ -41,7 +41,7 @@ source "$ROOT/scripts/lib/lib-repack.sh"
 # shellcheck source=../lib/lib-ndk.sh
 source "$ROOT/scripts/lib/lib-ndk.sh"
 
-DCC_DIR="$ROOT/sigcheck/dex2c/dcc"            # dcc 工具目录（冻结区，严禁改动）
+DCC_DIR=""                                    # dcc 工具目录(dex2c 勾选时经 ensure_dcc 解压填充)
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -70,6 +70,7 @@ require_file "$IN_APK" "输入 APK"
 repack_require_tools
 if [[ $WANT_DEX2C -eq 1 ]]; then
   require_nonempty_file "$DEX2C_RULES" "dex2c 规则文件"
+  DCC_DIR="$(ensure_dcc)"                   # 从 tools/dcc.zip 解压(幂等)并取得 dcc 目录
   require_dir "$DCC_DIR" "dcc 工具目录"
 fi
 if [[ $WANT_PACKER -eq 1 ]]; then

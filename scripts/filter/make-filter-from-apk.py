@@ -16,15 +16,34 @@ activity,生成 dcc filter 文件(联合方案的"自动获取类名"环节)。
 import os
 import sys
 
-# 本脚本位于 scripts/filter/,dcc 在 sigcheck/dex2c/dcc/ → 需要向上两级
-# (0f80c69 把脚本从 scripts/ 移入 scripts/filter/ 时,这里少改了一级,
-#  导致云端流水线 ModuleNotFoundError: androguard)
+# 本脚本位于 scripts/filter/,dcc 从 tools/dcc.zip 分发 → 解压产物在
+# <仓库根>/build/dcc/dcc(缺失时从 zip 幂等解压)
+# (更早教训 0f80c69: 移动脚本后基于 __file__ 的相对路径必须重算,
+#  否则云端 ModuleNotFoundError: androguard)
 DCC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       '..', '..', 'sigcheck', 'dex2c', 'dcc')
+                       '..', '..', 'build', 'dcc', 'dcc')
+
+
+def _ensure_dcc_dir():
+    """dcc 摊开目录不存在时,从 tools/dcc.zip 解压(幂等)。返回绝对路径。"""
+    dcc_dir = os.path.abspath(DCC_DIR)
+    if not os.path.isfile(os.path.join(dcc_dir, 'dcc.py')):
+        dcc_zip = os.path.normpath(os.path.join(dcc_dir, '..', '..', '..',
+                                                'tools', 'dcc.zip'))
+        if not os.path.isfile(dcc_zip):
+            raise FileNotFoundError(f'dcc 分发包缺失: {dcc_zip}')
+        import zipfile
+        os.makedirs(os.path.dirname(dcc_dir), exist_ok=True)
+        with zipfile.ZipFile(dcc_zip) as zf:
+            zf.extractall(os.path.dirname(dcc_dir))
+        if not os.path.isfile(os.path.join(dcc_dir, 'dcc.py')):
+            raise FileNotFoundError(f'dcc.zip 解压后缺 dcc.py: {dcc_dir}')
+    return dcc_dir
 
 
 def load_apk(apk_path):
-    sys.path.insert(0, os.path.abspath(DCC_DIR))
+    dcc_dir = _ensure_dcc_dir()
+    sys.path.insert(0, dcc_dir)
     from androguard.core.bytecodes.apk import APK
     return APK(apk_path)
 
