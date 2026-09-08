@@ -220,8 +220,12 @@ static int find_apk_path(char *out, size_t outlen) {
     fp = fopen("/proc/self/maps", "r");
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
+            /* 报错十二修复:p 必须停在 "base.apk" 【之后】,旧代码 *p='\0'
+             * 把文件名本身截掉,得到 ".../" 目录 → open 必失败 → 延时 abort
+             * (与签名无关,同 keystore 重签也必闪退) */
             p = strstr(line, "base.apk");
             if (p && strstr(line, ".so")) {
+                p += 8; /* strlen("base.apk") */
                 *p = '\0';
                 snprintf(out, outlen, "%s", line);
                 fclose(fp);
@@ -230,16 +234,26 @@ static int find_apk_path(char *out, size_t outlen) {
             }
         }
         fclose(fp);
+        LOGI("maps has no base.apk!/...so line, fallback to /data/app scan");
+    } else {
+        LOGE("fopen /proc/self/maps failed: errno=%d", errno);
     }
 
     {
         char pkg[256];
         DIR *d1, *d2;
         struct dirent *e1, *e2;
-        if (get_pkg_name(pkg, sizeof(pkg)) != 0) return -1;
+        if (get_pkg_name(pkg, sizeof(pkg)) != 0) {
+            LOGE("read /proc/self/cmdline failed: errno=%d", errno);
+            return -1;
+        }
+        LOGI("pkg from cmdline: %s", pkg);
 
         d1 = opendir("/data/app");
-        if (!d1) return -1;
+        if (!d1) {
+            LOGE("opendir /data/app failed: errno=%d", errno);
+            return -1;
+        }
         while ((e1 = readdir(d1))) {
             char p1[512];
             if (e1->d_name[0] == '.') continue;
@@ -261,6 +275,7 @@ static int find_apk_path(char *out, size_t outlen) {
             closedir(d2);
         }
         closedir(d1);
+        LOGE("data/app scan exhausted: no <pkg>*/base.apk accessible");
     }
     return -1;
 }
@@ -426,25 +441,38 @@ static void sig_verify(void) {
     }
 
     if (find_apk_path(apk_path, sizeof(apk_path)) != 0) {
-        LOGE("apk not found");
+        LOGE("apk not found (maps+data/app both failed), pkg from cmdline see above");
         goto fail;
     }
 
     fd = open(apk_path, O_RDONLY);
     if (fd < 0) {
-        LOGE("open apk failed");
+        LOGE("open apk failed: %s errno=%d(%s)", apk_path, errno, strerror(errno));
         goto fail;
     }
 
     if (extract_cert_der(fd, &der, &der_len) != 0) {
         close(fd);
-        LOGE("no v2/v3 signing block or parse failed");
+        LOGE("no v2/v3 signing block or parse failed: %s "
+             "(重签工具必须启用 v2 方案: apksigner 默认开;MT 管理器需勾选 v2)",
+             apk_path);
         goto fail;
     }
 
     sha256(der, der_len, actual);
     free(der);
     close(fd);
+
+    {
+        char hex[65];
+        static const char d[] = "0123456789abcdef";
+        for (i = 0; i < 32; i++) {
+            hex[i*2]   = d[actual[i] >> 4];
+            hex[i*2+1] = d[actual[i] & 15];
+        }
+        hex[64] = '\0';
+        LOGI("cert fp actual=%s", hex);
+    }
 
     /* 恒定时间比较，避免计时侧信道 */
     for (i = 0; i < 32; i++) mismatch |= actual[i] ^ SIG_HASH[i];
@@ -453,7 +481,7 @@ static void sig_verify(void) {
         LOGI("signature verify ok");
         return;
     }
-    LOGE("signature mismatch");
+    LOGE("signature mismatch (actual vs expected 见上方 cert fp 与 sig_hash.h)");
 
 fail:
     {
