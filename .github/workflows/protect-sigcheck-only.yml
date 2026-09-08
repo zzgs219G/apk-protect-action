@@ -32,12 +32,11 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 安装 Android NDK
+      - name: 安装 Android NDK（优先预装，零下载）
         id: ndk
-        uses: nttld/setup-ndk@v1
+        uses: ./.github/actions/setup-ndk
         with:
           ndk-version: r26d
-          add-to-path: false
 
       - name: 安装 python 依赖(dcc)
         # 报错六:dcc 内置 androguard 的 AXMLPrinter 依赖 lxml,runner 系统
