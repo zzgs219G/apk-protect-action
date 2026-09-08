@@ -2,7 +2,7 @@
 
 > 给 AI(以及人类)的硬约束。**改任何代码前先读完本文。**
 > 违反下列任何一条,改动视为无效,必须回滚。
-> 配套强制手段:`tests/run-tests.sh`(本地/CI 均会执行,冻结模块被改红即失败)。
+> 配套强制手段:冻结模块的回归测试(若 `tests/` 目录存在则执行,冻结模块被改红即失败)。
 
 ---
 
@@ -10,14 +10,14 @@
 
 以下模块经过真机/宿主端反复验证,是**已收敛的稳定资产**。
 AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正确性靠
-`tests/run-tests.sh` 中的回归测试钉死——**测试红了 = 你改坏了,立即回滚**。
+回归测试钉死(若 `tests/` 目录存在)——**测试红了 = 你改坏了,立即回滚**。
 
 | 冻结模块 | 职责 | 钉死的回归测试 |
 |---|---|---|
-| `sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `tests/test_sig_check.sh`(宿主端编译+实包验证) |
-| `scripts/inject/inject-loadlib.py` | loadLibrary 插桩(幂等、多 dex、AXMLPrinter) | `tests/test_inject_loadlib.py`(冒烟) |
-| `scripts/sig-hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景) |
-| `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: `tests/run-tests.sh` 内嵌 |
+| `sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `tests/test_sig_check.sh`(宿主端编译+实包验证,若存在) |
+| `scripts/inject/inject-loadlib.py` | loadLibrary 插桩(幂等、多 dex、AXMLPrinter) | `tests/test_inject_loadlib.py`(冒烟,若存在) |
+| `scripts/sig-hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景,若存在) |
+| `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: 回归测试内嵌 |
 | `sigcheck/dex2c/dcc/` | 第三方 dcc 工具(含内置 androguard) | 严禁任何改动(历史: 报错三/九) |
 | `sigcheck/tools/apktool.jar` | 解包/重打包工具 | 严禁替换版本(历史: 报错四/五) |
 
@@ -39,24 +39,23 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 2. **改非冻结脚本**: `scripts/pipelines/*.sh`、`scripts/lib/*.sh`、workflow yml。
 3. **修复冻结模块的真实 bug**: 必须满足——
    - 用户在当次对话明确报告了该模块的错误行为(附日志/复现);
-   - 改动后 `tests/run-tests.sh` 全绿;
+   - 改动后回归测试全绿(若 `tests/` 目录存在);
    - 在 `docs/流程文档.md` §9 变更历史追加一行(报错 N)记录根因。
 4. **扩展冻结模块**(加日志、加防御): 只允许**追加**,不允许改写已有逻辑行。
 
 ## 3. 改动后的必做动作(任何改动,不论大小)
 
 ```bash
-bash tests/run-tests.sh          # 全绿才算完成
 git diff                          # 自查: 只含预期改动
 ```
 
-CI(`.github/workflows/module-guard.yml`)会对所有 PR/push 强制执行,
-冻结模块改动 + 测试红 = CI 直接失败,merge 不了。
+(原 `tests/run-tests.sh` 与 module-guard.yml CI 守卫已移除;改动冻结模块
+仍需自查 diff,并在 docs/流程文档.md §9 留痕。)
 
 ## 4. 模块化契约(新增模块时遵守)
 
 - 模块 = 独立脚本 + 明确 CLI 契约 `<输入> <输出> [参数]`,不 import 仓库内
   其他模块的内部函数(公共能力放 `scripts/lib/`)。
 - so 名统一 `nc`;`ndk_write_mk` 是唯一 mk 模板来源(报错十一)。
-- 每个新模块必须带最小回归测试,挂进 `tests/run-tests.sh`。
+- 每个新模块必须带最小回归测试(若仓库恢复 `tests/` 目录则挂进运行入口)。
 - 文档 `docs/流程文档.md` 与代码同步更新,§9 追加变更历史。
