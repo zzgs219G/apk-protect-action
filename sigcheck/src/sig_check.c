@@ -51,6 +51,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <dlfcn.h>     /* 报错十四: dladdr/dlsym 定位本 so 真实路径 */
 
 #define SIGLOG_SENTINEL "/storage/emulated/0/sigcheck_debug"
 
@@ -272,7 +273,11 @@ static int get_pkg_name(char *out, size_t outlen) {
  * 定位当前 APK：
  *   1. 先扫 /proc/self/maps，若 extractNativeLibs=false，so 直接映射自
  *      base.apk（行内含 "base.apk"），截取路径即可；
- *   2. 否则按包名遍历 /data/app/ 的两层目录找 <pkg>* /base.apk。
+ *   2. 报错十四：extractNativeLibs=true 时 so 是从 lib/<abi>/libnc.so
+ *      加载的，由 so 自身路径反推同安装目录下的 base.apk
+ *      （/proc/<pid>/root 前缀是为了获得 SELinux 可读的真实路径）；
+ *   3. 最后兜底遍历 /data/app/（Android 11+ 因 SELinux 大概率 EACCES，
+ *      保留兼容旧机型）。
  */
 static int find_apk_path(char *out, size_t outlen) {
     FILE *fp;
@@ -308,9 +313,61 @@ static int find_apk_path(char *out, size_t outlen) {
             }
         }
         fclose(fp);
-        LOGI("maps has no base.apk!/...so line, fallback to /data/app scan");
+        LOGI("maps has no base.apk!/...so line, try lib-path fallback");
     } else {
         LOGE("fopen /proc/self/maps failed: errno=%d", errno);
+    }
+
+    /* ── 报错十四修复：由 so 自身路径反推 base.apk ────────────────────
+     * 现象(2026-09-08 真机日志, com.xixin.box): extractNativeLibs=true
+     * (本流水线强制)时 so 从 lib/<abi>/libnc.so 加载, maps 无 base.apk 行;
+     * 兜底 opendir("/data/app") 在 Android 11+ 被 SELinux 拒 → errno=13
+     * → "apk not found" → 签名一致也延时 abort。
+     * 修法: dladdr 取本 so 真实路径(/proc/<pid>/root 前缀)或直接扫 maps
+     * 里本 so 的映射行, 截掉 "/lib/<abi>/libnc.so" 得安装根目录,
+     * 拼上 base.apk 后 access(R_OK) 确认。 */
+    {
+        Dl_info info;
+        char root[1024];
+        size_t r;
+        /* 直接对本文件的 static 函数指针做 dladdr 即可(dlsym 查不到 static
+         * 符号;dladdr 按"地址落在哪个 so"反查,static 函数一样有效) */
+        if (dladdr((void *)&find_apk_path, &info) && info.dli_fname) {
+            snprintf(root, sizeof(root), "%s", info.dli_fname);
+        } else {
+            FILE *mfp = fopen("/proc/self/maps", "r");
+            root[0] = '\0';
+            if (mfp) {
+                while (fgets(line, sizeof(line), mfp)) {
+                    char *q = strstr(line, "/libnc.so");
+                    if (q) { *q = '\0'; snprintf(root, sizeof(root), "%s", line); break; }
+                }
+                fclose(mfp);
+            }
+        }
+        r = strlen(root);
+        if (r > 0) {
+            const char *sfx = "/lib/";
+            char *cut = NULL;
+            char *s = strstr(root, sfx);
+            /* 只认“安装根目录/lib/”结构，且截点在路径中后段，防止包名含 /lib/ 误截 */
+            if (s && (size_t)(s - root) > 6) cut = s;
+            if (cut) {
+                char candidate[1100];
+                *cut = '\0';
+                snprintf(candidate, sizeof(candidate), "/proc/self/root%s/base.apk", root);
+                if (access(candidate, R_OK) == 0) {
+                    snprintf(out, outlen, "%s", candidate);
+                    LOGI("apk path from so dir: %s", out);
+                    return 0;
+                }
+                LOGE("so-dir candidate not accessible: %s errno=%d", candidate, errno);
+            } else {
+                LOGE("so path not in expected layout: %s", root);
+            }
+        } else {
+            LOGE("cannot resolve self so path (dladdr+maps both empty)");
+        }
     }
 
     {
