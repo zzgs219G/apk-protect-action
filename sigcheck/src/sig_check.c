@@ -35,6 +35,80 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+/* ─────────────────────────── 文件日志(追加能力,用户 2026-09-08 需求) ───────────────────────────
+ * 背景:logcat 在无 adb 的真机排障场景拿不到,"签名一致仍闪退"无法定位。
+ * 方案:LOGD/LOGI/LOGE 在原 logcat 输出之外,同步追加写入应用外部目录文件。
+ *
+ * 开关(哨兵文件,运行时生效,无需重编译/重装):
+ *   /storage/emulated/0/sigcheck_debug   存在 → 写文件日志
+ *   (放 sdcard 根而非 Android/data:MT 管理器等工具在 Android 11+ 也能直接建)
+ * 日志输出:
+ *   /storage/emulated/0/Android/data/<包名>/files/sigcheck_log.txt
+ *
+ * 安全性:所有文件 I/O 失败一律静默忽略(constructor 早期 FUSE 可能未就绪),
+ * 不影响校验主流程;日志内容只有路径/指纹哈希/分支结论,无密钥无用户数据。 */
+
+#include <stdarg.h>
+#include <time.h>
+#include <sys/stat.h>
+
+#define SIGLOG_SENTINEL "/storage/emulated/0/sigcheck_debug"
+
+static char siglog_path[512];   /* 日志文件完整路径,'' = 未探测 */
+static int  siglog_ready = -1;  /* -1 未探测, 0 开关关/不可用, 1 可写 */
+
+/* 前向声明:get_pkg_name 定义在本文件后部(§定位 base.apk),此处先用 */
+static int get_pkg_name(char *out, size_t outlen);
+
+static void siglog_detect(void) {
+    char pkg[256];
+    const char *env;
+    if (siglog_ready >= 0) return;
+    siglog_ready = 0;
+#ifdef SIGCHECK_HOST_TEST
+    /* 宿主测试:不碰 sdcard,开关用环境变量控制 */
+    env = getenv("SIGCHECK_TEST_LOG");
+    if (!env || !*env) return;
+    snprintf(siglog_path, sizeof(siglog_path), "%s", env);
+    siglog_ready = 1;
+    return;
+#endif
+    if (access(SIGLOG_SENTINEL, F_OK) != 0) return;   /* 哨兵不存在 → 关 */
+    if (get_pkg_name(pkg, sizeof(pkg)) != 0) return;
+    snprintf(siglog_path, sizeof(siglog_path),
+             "/storage/emulated/0/Android/data/%s/files/sigcheck_log.txt", pkg);
+    siglog_ready = 1;   /* 真正可写性由 siglog 打开时判定,失败静默 */
+}
+
+static void siglog(const char *prio, const char *fmt, ...) {
+    FILE *fp;
+    struct timespec ts;
+    unsigned long ms;
+    va_list ap;
+    if (siglog_ready != 1) return;
+    fp = fopen(siglog_path, "a");
+    if (!fp) { siglog_ready = 0; return; }   /* 不可写 → 本次进程内放弃,不重试 */
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ms = (unsigned long)ts.tv_sec * 1000UL + (unsigned long)(ts.tv_nsec / 1000000UL);
+    fprintf(fp, "[%lu][%s][pid %d] ", ms, prio, (int)getpid());
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
+
+/* 重定义三个日志宏为"logcat + 文件"双写;所有调用点零改动(纯追加原则) */
+#undef LOGD
+#undef LOGI
+#undef LOGE
+#define LOGD(...) do { __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__); \
+                       siglog("D", __VA_ARGS__); } while (0)
+#define LOGI(...) do { __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__); \
+                       siglog("I", __VA_ARGS__); } while (0)
+#define LOGE(...) do { __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__); \
+                       siglog("E", __VA_ARGS__); } while (0)
+
 /* APK Signing Block magic：'APK Sig Block 42' */
 static const unsigned char SIG_BLOCK_MAGIC[16] = {
     'A','P','K',' ','S','i','g',' ','B','l','o','c','k',' ','4','2'
@@ -431,6 +505,8 @@ static void sig_verify(void) {
     int i, mismatch = 0;
     int slot_configured = 0;
 
+    siglog_detect();   /* 文件日志开关探测(只做一次,失败静默) */
+
     /* 调试模式：槽位全零（流水线未注入）则跳过 */
     for (i = 0; i < 32; i++) {
         if (SIG_HASH[i] != 0) { slot_configured = 1; break; }
@@ -508,3 +584,13 @@ __attribute__((constructor)) static void sig_check_entry(void) {
 const char *sigcheck_test_apk_path(void);
 void sig_verify_test(void) { sig_verify(); }
 #endif
+
+/*
+ * 兼容性说明(追加的文件日志与两种构建方式):
+ *   - 联合方案/sigcheck-only: Android.mk(由 scripts/lib/lib-ndk.sh 生成)
+ *     的 wildcard 收 jni/ 或 jni/nc/ 下所有 .c/.cpp,本文件在其中即被编译,
+ *     无需单独源文件列表。
+ *   - siglog_detect 依赖 get_pkg_name(/proc/self/cmdline),而 get_pkg_name
+ *     定义在本文件前部,无新增外部依赖;CLOCK_REALTIME 与 clock_gettime
+ *     在 bionic(API>=21)与 glibc 均内置,无需 -lrt。
+ */
