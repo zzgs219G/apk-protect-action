@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # lib-repack.sh — apktool 解包/注入/重打包公共库（source 使用，不直接执行）
 #
-# 抽取自 protect-sigcheck.sh / protect-sigcheck-only.sh / protect-dcc.sh 三处
-# 几乎相同的"解包 → 放 so → 改 extractNativeLibs → 回编 → zipalign"逻辑。
+# 抽取自旧 protect-sigcheck.sh / protect-sigcheck-only.sh / protect-dcc.sh 三处
+# 几乎相同的"解包 → 放 so → 改 extractNativeLibs → 回编 → zipalign"逻辑
+# （2025-09 三总控已合并为 protect.sh，本库继续为其唯一解包/回编实现）。
 #
 # 依赖：ROOT（仓库根，绝对路径）、MODULE_TAG 已由调用方设置。
 # 历次报错教训固定在代码里：

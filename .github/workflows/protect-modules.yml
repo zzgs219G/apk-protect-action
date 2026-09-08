@@ -1,8 +1,8 @@
 name: APK加固-模块勾选
 
-# 勾选式统一入口：想加固哪些模块就勾选哪些，执行顺序由编排器固定为
+# 勾选式统一入口：想加固哪些模块就勾选哪些，执行顺序由 protect.sh 固定为
 #   签名校验 → Dex2C → 基础加壳（加壳必须最后，加了壳其它模块改不动）
-# 旧 workflow（签名校验/签名校验-单独/dex2c/APK加固）保留作单模块直通入口。
+# 旧 workflow（签名校验/签名校验-单独/dex2c/APK加固）已移除，本入口为唯一入口。
 
 on:
   workflow_dispatch:
@@ -87,13 +87,13 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          chmod +x scripts/pipelines/run-modules.sh scripts/modules/*.sh
+          chmod +x scripts/pipelines/protect.sh
           ARGS=""
           if [[ "${{ inputs.sigcheck }}" == "true" ]]; then ARGS="$ARGS --sigcheck"; fi
           if [[ "${{ inputs.dex2c }}" == "true" ]]; then ARGS="$ARGS --dex2c dex2c_rules.txt"; fi
           if [[ "${{ inputs.packer }}" == "true" ]]; then ARGS="$ARGS --packer"; fi
           set -o pipefail
-          ./scripts/pipelines/run-modules.sh app.apk protected_unsigned.apk $ARGS 2>&1 | tee -a build.log
+          ./scripts/pipelines/protect.sh app.apk protected_unsigned.apk $ARGS 2>&1 | tee -a build.log
 
       - name: 上传加固包到 R2
         id: upload-r2
