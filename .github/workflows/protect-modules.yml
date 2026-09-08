@@ -56,6 +56,7 @@ jobs:
 
       - name: 解压 dcc 分发包
         run: |
+          mkdir -p build   # unzip 的 checkdir 不会自建多级父目录,build/ 不在仓库里必须先建(报错十五)
           unzip -qo tools/dcc.zip -d build/dcc
           test -f build/dcc/dcc/dcc.py || { echo "❌ dcc.zip 解压产物异常"; exit 1; }
 
