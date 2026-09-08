@@ -1,0 +1,64 @@
+name: 'Setup NDK (prefers preinstalled)'
+description: '优先使用 runner 预装的 Android NDK（零下载零耗时），预装版本不匹配时回退到 nttld/setup-ndk 下载'
+inputs:
+  ndk-version:
+    description: 'NDK 版本号（r26d 等 nttld 写法）'
+    required: false
+    default: 'r26d'
+outputs:
+  ndk-path:
+    description: 'NDK 根目录绝对路径'
+    value: ${{ steps.resolve.outputs.ndk-path }}
+  source:
+    description: 'ndk 来源: preinstalled | downloaded'
+    value: ${{ steps.resolve.outputs.source }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        NDK_R: ${{ inputs.ndk-version }}
+      run: |
+        set -euo pipefail
+        # r26d → 26.3.11579264（runner 预装目录以版本号命名）
+        case "$NDK_R" in
+          r26d) VER="26.3.11579264" ;;
+          *)    VER="" ;;
+        esac
+
+        # 1) 首选：GitHub ubuntu runner 预装的 NDK（ANDROID_NDK_HOME 或标准 SDK 目录）
+        CANDIDATES=()
+        [[ -n "${ANDROID_NDK_HOME:-}" ]] && CANDIDATES+=("$ANDROID_NDK_HOME")
+        if [[ -n "${ANDROID_HOME:-}" ]]; then
+          [[ -n "$VER" ]] && CANDIDATES+=("$ANDROID_HOME/ndk/$VER")
+          CANDIDATES+=("$ANDROID_HOME"/ndk/*)
+        fi
+        for c in "${CANDIDATES[@]}"; do
+          if [[ -d "$c" && -x "$c/ndk-build" ]]; then
+            echo "ndk-path=$c" >> "$GITHUB_OUTPUT"
+            echo "source=preinstalled" >> "$GITHUB_OUTPUT"
+            echo "✅ 使用 runner 预装 NDK（零下载）: $c"
+            exit 0
+          fi
+        done
+
+        # 2) 回退：预装版本不匹配 → 下载指定版本
+        echo "⚠️ 预装 NDK 不匹配，回退下载 r 版本: $NDK_R"
+        DEST="${RUNNER_TEMP:-/tmp}/ndk"
+        rm -rf "$DEST"
+        case "$NDK_R" in
+          r26d)
+            URL="https://dl.google.com/android/repository/android-ndk-r26d-linux.zip"
+            ;;
+          *)
+            echo "❌ 不支持的回退版本: $NDK_R"; exit 1 ;;
+        esac
+        curl -fL --retry 3 -o "$DEST.zip" "$URL"
+        unzip -q "$DEST.zip" -d "$(dirname "$DEST")"
+        DIR="$(dirname "$DEST")/android-ndk-$NDK_R"
+        [[ -x "$DIR/ndk-build" ]] || { echo "❌ NDK 解压后校验失败: $DIR"; exit 1; }
+        echo "ndk-path=$DIR" >> "$GITHUB_OUTPUT"
+        echo "source=downloaded" >> "$GITHUB_OUTPUT"
+        echo "✅ 已下载 NDK: $DIR"
