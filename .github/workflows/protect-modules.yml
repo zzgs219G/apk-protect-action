@@ -54,8 +54,13 @@ jobs:
         with:
           ndk-version: r26d
 
+      - name: 解压 dcc 分发包
+        run: |
+          unzip -qo tools/dcc.zip -d build/dcc
+          test -f build/dcc/dcc/dcc.py || { echo "❌ dcc.zip 解压产物异常"; exit 1; }
+
       - name: 安装 python 依赖(dcc)
-        run: pip3 install -r sigcheck/dex2c/dcc/requirements.txt
+        run: pip3 install -r build/dcc/dcc/requirements.txt
 
       - name: 勾选前置校验
         run: |

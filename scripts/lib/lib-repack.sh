@@ -21,11 +21,14 @@ _lib_repack_guard() {
 }
 _lib_repack_guard
 
-APKTOOL_JAR="$ROOT/sigcheck/dex2c/dcc/tools/apktool.jar"
+# apktool.jar 随 dcc 分发包(dcc.zip)携带:dcc 改为 tools/dcc.zip 分发后,
+# jar 从解压产物取。ensure_dcc 幂等,重复调用零开销。
+ensure_dcc >/dev/null
+APKTOOL_JAR="$ROOT/build/dcc/dcc/tools/apktool.jar"
 
 # repack_require_tools — 开工前校验 apktool.jar 存在
 repack_require_tools() {
-  require_file "$APKTOOL_JAR" "apktool.jar"
+  require_file "$APKTOOL_JAR" "apktool.jar（dcc.zip 解压产物，缺了先跑 ensure_dcc）"
 }
 
 # repack_unpack <输出目录> <输入.apk>
