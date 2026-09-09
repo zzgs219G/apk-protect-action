@@ -8,11 +8,12 @@
  *   2. 完全不经过 Java 层 API（不调 PackageManager / FileInputStream），
  *      直接 open/read /data/app/.../base.apk，手工解析 APK Signing Block
  *      (v2: 0x7109871a / v3: 0xf05368c0)，提取证书 DER 后计算 SHA-256，
- *      与编译期注入的期望指纹（sig_hash.h 中的 SIG_HASH）比对。
+ *      经双轮派生(derive_expected,2026-10 追加)后与 sig_hash.h 中的
+ *      SIG_HASH_STORED 比对——明文指纹不再落盘(防搜索替换攻击)。
  *   3. 校验失败不直接 exit(0)：起分离线程延时随机 abort，
  *      让"hook exit/abort 即绕过"的通用脚本失效（二期继续增强为隐蔽破坏）。
  *      当前延时 1~3 秒(调试)，改法见 delayed_kill 函数上方注释。
- *   4. SIG_HASH 全零 = 调试模式（流水线未注入指纹时跳过校验，便于本地测试）。
+ *   4. SIG_HASH_STORED 全零 = 调试模式（流水线未注入派生槽位时跳过校验，便于本地测试）。
  *
  * 编译：由流水线把本文件与 dcc 生成的 C 代码一起放进 ndk 工程编译，
  *      最终产物与业务逻辑同在 libnc.so，防剥离。
@@ -535,6 +536,22 @@ fail:
 
 /* ─────────────────────────── 校验主逻辑 ─────────────────────────── */
 
+/* [2026-10 追加] 双轮派生:期望值存储形态还原(与 make-sig-hash.sh 生成侧逐字节一致)。
+ * 背景:明文指纹 SIG_HASH 在 so 里可被十六进制搜索替换(攻击者拿公开证书指纹
+ * 原地覆盖期望值即绕过)。改为存 SIG_SALT/SIG_HASH_STORED:
+ *   生成侧: salt=os.urandom(16); t1=SHA256(fp); stored[i]=t1[i]^salt[i%16]^(i*0x9E&0xFF)
+ *   校验侧(本函数): 对运行时提取的实际指纹 actual 做同样变换,再与 stored 比对。
+ * 明文指纹从二进制中消失;攻击者无法脱离本函数的派生逻辑构造替换目标。
+ * ⚠️ 两侧实现必须逐字节一致,否则正确签名也闪退(显性失败,联调即暴露)。 */
+static void derive_expected(const unsigned char actual[32], unsigned char out[32]) {
+    unsigned char t1[32];
+    int i;
+    sha256(actual, 32, t1);   /* 复用文件内已有 sha256,零新增依赖 */
+    for (i = 0; i < 32; i++)
+        out[i] = (unsigned char)(t1[i] ^ SIG_SALT[i % SIG_SALT_LEN]
+                                 ^ (unsigned char)((i * 0x9E) & 0xFF));
+}
+
 /* 失败后延时随机 abort，攻击者难以关联崩溃原因。
  * 二期升级为污染数据等更隐蔽的破坏策略。
  *
@@ -564,9 +581,9 @@ static void sig_verify(void) {
 
     siglog_detect();   /* 文件日志开关探测(只做一次,失败静默) */
 
-    /* 调试模式：槽位全零（流水线未注入）则跳过 */
+    /* [2026-10 改] 调试模式判定改用派生后的存储槽位(全零=流水线未注入则跳过) */
     for (i = 0; i < 32; i++) {
-        if (SIG_HASH[i] != 0) { slot_configured = 1; break; }
+        if (SIG_HASH_STORED[i] != 0) { slot_configured = 1; break; }
     }
     if (!slot_configured) {
         LOGI("sig hash slot empty, skip verify");
@@ -607,8 +624,13 @@ static void sig_verify(void) {
         LOGI("cert fp actual=%s", hex);
     }
 
-    /* 恒定时间比较，避免计时侧信道 */
-    for (i = 0; i < 32; i++) mismatch |= actual[i] ^ SIG_HASH[i];
+    /* [2026-10 改] 恒定时间比较:对实际指纹做双轮派生后与 SIG_HASH_STORED 比对
+     * (原来直接比明文 SIG_HASH;expected 含派生结果,still 恒定时间) */
+    {
+        unsigned char expected[32];
+        derive_expected(actual, expected);
+        for (i = 0; i < 32; i++) mismatch |= expected[i] ^ SIG_HASH_STORED[i];
+    }
 
     if (mismatch == 0) {
         LOGI("signature verify ok");

@@ -70,17 +70,50 @@ if [[ ! "$HASH_HEX" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-# 生成 C 头文件（每行 8 字节）
+# ── 双轮派生:so 内不存明文指纹(防十六进制搜索替换攻击) ──────────────
+# 生成侧(python)与校验侧(sig_check.c derive_expected)必须逐字节一致:
+#   salt   = os.urandom(16)                        每次构建随机 → 旧包攻击偏移全部失效
+#   t1     = SHA256(fp)                            轮1: 吸收(只对指纹,不含 salt)
+#   stored = t1[i] ^ salt[i%16] ^ (i*0x9E & 0xFF)  轮2: 位置依赖 XOR 扩散
+# 攻击者拿不到派生逻辑就不知道"换成自己的证书该写什么";明文指纹不再出现于 so。
+DERIVED_JSON=$(python3 - "$HASH_HEX" <<'PYEOF'
+import hashlib, os, sys, json
+fp = bytes.fromhex(sys.argv[1])
+salt = os.urandom(16)
+t1 = hashlib.sha256(fp).digest()
+stored = bytes(t1[i] ^ salt[i % 16] ^ ((i * 0x9E) & 0xFF) for i in range(32))
+print(json.dumps({"salt": salt.hex(), "stored": stored.hex()}))
+PYEOF
+)
+SALT_HEX=$(printf '%s' "$DERIVED_JSON" | grep -o '"salt": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{32\}')
+STORED_HEX=$(printf '%s' "$DERIVED_JSON" | grep -o '"stored": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{64\}')
+if [[ ${#SALT_HEX} -ne 32 || ${#STORED_HEX} -ne 64 ]]; then
+  echo "❌ 双轮派生失败(python 输出异常): $DERIVED_JSON" >&2
+  exit 1
+fi
+
+# 生成 C 头文件（每行 8 字节;SIG_SALT 随机、SIG_HASH_STORED 为派生形态,均非明文指纹）
 {
-  echo "/* 由流水线自动生成：$(basename "$APK") 的证书 SHA-256 指纹 */"
+  echo "/* 由流水线自动生成: $(basename "$APK") 证书指纹的双轮派生形态 */"
+  echo "/* 攻防说明: 明文指纹不落盘。攻击面分析见 docs/流程文档.md §9(2026-10 存储混淆) */"
   echo "#ifndef _SIG_HASH_H_"
   echo "#define _SIG_HASH_H_"
   echo "#define SIG_HASH_LEN 32"
-  echo "static const unsigned char SIG_HASH[SIG_HASH_LEN] = {"
+  echo "#define SIG_SALT_LEN 16"
+  echo "static const unsigned char SIG_SALT[SIG_SALT_LEN] = {"
+  for ((i = 0; i < 32; i += 16)); do
+    row=""
+    for ((j = 0; j < 16; j += 2)); do
+      row+="0x${SALT_HEX:i+j:2}, "
+    done
+    echo "    ${row%, },"
+  done
+  echo "};"
+  echo "static const unsigned char SIG_HASH_STORED[SIG_HASH_LEN] = {"
   for ((i = 0; i < 64; i += 16)); do
     row=""
     for ((j = 0; j < 16; j += 2)); do
-      row+="0x${HASH_HEX:i+j:2}, "
+      row+="0x${STORED_HEX:i+j:2}, "
     done
     echo "    ${row%, },"
   done
@@ -88,4 +121,4 @@ fi
   echo "#endif"
 } > "$OUT"
 
-echo "✅ sig_hash.h 已生成，指纹: $HASH_HEX"
+echo "✅ sig_hash.h 已生成(双轮派生形态,明文指纹未写入): 指纹=$HASH_HEX salt=$SALT_HEX"
