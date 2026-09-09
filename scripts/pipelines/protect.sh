@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # protect.sh — 唯一加固总控（勾选式合并版，取代旧三个 pipeline 总控 + run-modules.sh）
 #
-# 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dex2c <规则文件>] [--packer]
+# 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dex2c [规则文件]] [--envcheck] [--packer]
 #   - 输入/输出/规则路径一律 normalize 成绝对路径（报错三教训：dcc 运行时要切目录，
 #     相对输出路径会被写进 dcc 目录）
 #   - 主进程 cwd 全程不漂移：dcc.py 在子 shell 里运行（module_cd_run）
@@ -11,11 +11,17 @@
 # 行为对齐（与旧脚本逐一等价）：
 #   只 --sigcheck        → 提取指纹 → sig_check.c 单独成 so → inject-loadlib.py
 #                          双保险插桩（<clinit> + onCreate）→ 回编
-#   只 --dex2c <规则>    → 规则转 filter → dcc 转译 → mark-native.py 壳替换 → 回编
+#   只 --dex2c [规则]    → 规则转 filter → dcc 转译 → mark-native.py 壳替换 → 回编
 #   --sigcheck --dex2c   → 提取指纹 → dcc 转译 → sig_check.c 合入同一 NDK 工程 →
 #                          mark-native.py 壳替换（不插 loadLibrary：onCreate 已抽进 so，
 #                          删 <clinit> 的 loadLibrary 会让 native 壳直接自爆）→ 回编
+#   --envcheck           → 环境检测(Frida/Xposed/调试器)并入 libnc.so(可与其余模块任意组合)
 #   --packer             → 占位报错（dpt-shell 流程迁移中，与旧 packer.sh 一致）
+#
+# dex2c 类名来源决策(规则优先,修复联合勾选无视用户规则的 bug):
+#   提供了规则(无论是否联合勾选) → 用户规则(rules-to-filter.py)
+#   未提供规则 + 联合勾选 sigcheck → 自动抽主类(make-filter-from-apk.py)
+#   未提供规则 + 未勾 sigcheck   → 报错退出(fail-fast,无类名来源)
 #
 # 固定执行顺序（与勾选顺序无关）：sigcheck → dex2c → packer
 #
@@ -45,21 +51,24 @@ DCC_DIR=""                                    # dcc 工具目录(dex2c 勾选时
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; DEX2C_RULES=""
+WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sigcheck) WANT_SIGCHECK=1; shift ;;
     --dex2c)    WANT_DEX2C=1; shift
-                [[ $# -ge 1 ]] || { log_err "--dex2c 需要规则文件参数"; exit 1; }
-                DEX2C_RULES="$(normalize_path "$1")"; shift ;;
+                # 规则文件可选(联合勾选 sigcheck 时可省略 → 自动抽主类)
+                if [[ $# -ge 1 && "$1" != --* ]]; then
+                  DEX2C_RULES="$(normalize_path "$1")"; shift
+                fi ;;
+    --envcheck) WANT_ENVCHECK=1; shift ;;
     --packer)   WANT_PACKER=1; shift ;;
     *)          log_err "未知参数: $1"; usage ;;
   esac
 done
 
-TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER))
+TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK))
 if [[ $TOTAL -eq 0 ]]; then
-  log_err "未勾选任何模块（--sigcheck / --dex2c <规则> / --packer）"
+  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --envcheck / --packer）"
   exit 1
 fi
 
@@ -69,9 +78,16 @@ OUT_APK="$(normalize_path "$OUT_APK")"
 require_file "$IN_APK" "输入 APK"
 repack_require_tools
 if [[ $WANT_DEX2C -eq 1 ]]; then
-  require_nonempty_file "$DEX2C_RULES" "dex2c 规则文件"
   DCC_DIR="$(ensure_dcc)"                   # 从 tools/dcc.zip 解压(幂等)并取得 dcc 目录
   require_dir "$DCC_DIR" "dcc 工具目录"
+  # 规则文件:提供了就必须非空;没提供且未联合 sigcheck → 无类名来源,fail-fast
+  if [[ -n "$DEX2C_RULES" ]]; then
+    require_nonempty_file "$DEX2C_RULES" "dex2c 规则文件"
+  elif [[ $WANT_SIGCHECK -eq 0 ]]; then
+    log_err "--dex2c 未提供规则文件且未勾选 --sigcheck,没有类名来源"
+    log_err "     (提供规则文件: --dex2c rules.txt;或联合 --sigcheck 自动抽取主类)"
+    exit 1
+  fi
 fi
 if [[ $WANT_PACKER -eq 1 ]]; then
   log_err "packer 模块尚未接入（dpt-shell 流程迁移中）；请先去掉 --packer 重试"
@@ -89,16 +105,11 @@ fi
 # ── STEP 2: dcc 转译（仅 --dex2c，--no-build 只产出工程包） ─────────
 if [[ $WANT_DEX2C -eq 1 ]]; then
   log_step 2 5 "Dex2C 转译"
-  # 类名来源二选一：显式规则文件，或（联合勾选 sigcheck 时旧联合方案的行为）
-  # 由 Manifest 动态解析 LAUNCHER activity 自动生成 filter
-  if [[ $WANT_SIGCHECK -eq 1 ]]; then
-    # 动态解析 Manifest 里的 LAUNCHER activity → 自动生成 filter（一行一个类）
-    python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" \
-      "$WORK/auto_filter.txt" --classes "$WORK/activity_classes.txt" --on-fail error
-    # auto_filter.txt 已是 dcc filter 正则格式(见 make-filter-from-apk.py),
-    # 直接使用,不要二次转换 —— 曾经二次转换产生畸形正则导致 no compiled methods
-    DCC_FILTER="$WORK/auto_filter.txt"
-  else
+  # 类名来源决策(规则优先,修复:联合勾选 sigcheck 时无视用户规则的 bug):
+  #   1) 提供了用户规则 → 一律走用户规则(无论是否联合勾选)
+  #   2) 未提供规则 + 联合勾选 sigcheck → Manifest 动态解析 LAUNCHER 自动生成 filter
+  if [[ -n "$DEX2C_RULES" ]]; then
+    log_info "filter 来源: 用户规则 $DEX2C_RULES"
     python3 "$ROOT/scripts/filter/rules-to-filter.py" "$DEX2C_RULES" \
       "$WORK/dcc_filter.txt" --classes "$WORK/activity_classes.txt"
     # activity* 需要 Activity 类列表 → 从 Manifest 动态提取
@@ -109,6 +120,14 @@ if [[ $WANT_DEX2C -eq 1 ]]; then
         --on-fail skip || true
     fi
     DCC_FILTER="$WORK/dcc_filter.txt"
+  elif [[ $WANT_SIGCHECK -eq 1 ]]; then
+    log_info "filter 来源: 未提供规则,自动抽取主类(make-filter-from-apk)"
+    # 动态解析 Manifest 里的 LAUNCHER activity → 自动生成 filter（一行一个类）
+    python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" \
+      "$WORK/auto_filter.txt" --classes "$WORK/activity_classes.txt" --on-fail error
+    # auto_filter.txt 已是 dcc filter 正则格式(见 make-filter-from-apk.py),
+    # 直接使用,不要二次转换 —— 曾经二次转换产生畸形正则导致 no compiled methods
+    DCC_FILTER="$WORK/auto_filter.txt"
   fi
 
   # dcc.py 需要在自身目录运行 → 子 shell 隔离，主进程 cwd 不漂移
@@ -137,6 +156,16 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
     mkdir -p "$WORK/project/jni"
     cp "$ROOT/sigcheck/src/sig_check.c" "$WORK/project/jni/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/"
+  fi
+fi
+if [[ $WANT_ENVCHECK -eq 1 ]]; then
+  # 环境检测(Frida/Xposed/调试器):与 sigcheck 同型并入同一 libnc.so(constructor 天然共存)
+  if [[ $WANT_DEX2C -eq 1 ]]; then
+    mkdir -p "$WORK/project/jni/nc"
+    cp "$ROOT/sigcheck/src/env_check.c" "$WORK/project/jni/nc/"
+  else
+    mkdir -p "$WORK/project/jni"
+    cp "$ROOT/sigcheck/src/env_check.c" "$WORK/project/jni/"
   fi
 fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc

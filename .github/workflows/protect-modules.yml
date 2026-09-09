@@ -15,13 +15,17 @@ on:
         type: boolean
         default: true
       dex2c:
-        description: '勾选: Dex2C 转译(需提供类规则)'
+        description: '勾选: Dex2C 转译(提供类规则→按规则;联合签名校验且不填→自动抽主类)'
         type: boolean
         default: false
       dex2c_rules:
-        description: 'Dex2C 类名规则(每行一条,支持 com.test.** / activity*)'
+        description: 'Dex2C 类名规则(每行一条,支持 com.test.** / activity*;联合签名校验时可留空)'
         required: false
         default: ''
+      envcheck:
+        description: '勾选: 环境检测(Frida/Xposed/调试器,检测到随机延时闪退)'
+        type: boolean
+        default: false
       packer:
         description: '勾选: 基础加壳(尚未接入)'
         type: boolean
@@ -66,11 +70,12 @@ jobs:
       - name: 勾选前置校验
         run: |
           ok=1
-          if [[ "${{ inputs.dex2c }}" == "true" && -z "${{ inputs.dex2c_rules }}" ]]; then
-            echo "❌ 勾选了 Dex2C 但未提供类名规则(dex2c_rules)"
+          # 单独 dex2c(未联合 sigcheck)必须提供规则;联合 sigcheck 时允许留空(自动抽主类)
+          if [[ "${{ inputs.dex2c }}" == "true" && "${{ inputs.sigcheck }}" != "true" && -z "${{ inputs.dex2c_rules }}" ]]; then
+            echo "❌ 单独勾选 Dex2C 必须提供类名规则(dex2c_rules);或同时勾选签名校验以自动抽取主类"
             ok=0
           fi
-          if [[ "${{ inputs.sigcheck }}" != "true" && "${{ inputs.dex2c }}" != "true" && "${{ inputs.packer }}" != "true" ]]; then
+          if [[ "${{ inputs.sigcheck }}" != "true" && "${{ inputs.dex2c }}" != "true" && "${{ inputs.packer }}" != "true" && "${{ inputs.envcheck }}" != "true" ]]; then
             echo "❌ 至少勾选一个模块"
             ok=0
           fi
@@ -84,9 +89,12 @@ jobs:
           ls -la app.apk | tee -a build.log
 
       - name: 生成 Dex2C 规则文件
-        if: ${{ inputs.dex2c }}
+        if: ${{ inputs.dex2c && inputs.dex2c_rules != '' }}
+        env:
+          # 经 env 中转,避免用户输入直接插值进 shell(命令注入面)
+          RULES: ${{ inputs.dex2c_rules }}
         run: |
-          printf '%s\n' "${{ inputs.dex2c_rules }}" > dex2c_rules.txt
+          printf '%s\n' "$RULES" > dex2c_rules.txt
           cat dex2c_rules.txt | tee -a build.log
 
       - name: 执行模块编排（固定顺序-签名校验-Dex2C-加壳）
@@ -96,7 +104,14 @@ jobs:
           chmod +x scripts/pipelines/protect.sh
           ARGS=""
           if [[ "${{ inputs.sigcheck }}" == "true" ]]; then ARGS="$ARGS --sigcheck"; fi
-          if [[ "${{ inputs.dex2c }}" == "true" ]]; then ARGS="$ARGS --dex2c dex2c_rules.txt"; fi
+          if [[ "${{ inputs.dex2c }}" == "true" ]]; then
+            if [[ -n "${{ inputs.dex2c_rules }}" ]]; then
+              ARGS="$ARGS --dex2c dex2c_rules.txt"
+            else
+              ARGS="$ARGS --dex2c"   # 联合 sigcheck,protect.sh 内自动抽主类
+            fi
+          fi
+          if [[ "${{ inputs.envcheck }}" == "true" ]]; then ARGS="$ARGS --envcheck"; fi
           if [[ "${{ inputs.packer }}" == "true" ]]; then ARGS="$ARGS --packer"; fi
           set -o pipefail
           ./scripts/pipelines/protect.sh app.apk protected_unsigned.apk $ARGS 2>&1 | tee -a build.log
