@@ -142,6 +142,16 @@ fi
 # ── STEP 3: 组装 NDK 工程 → 编译 libnc.so ───────────────────────────
 log_step 3 5 "组装 NDK 工程"
 mkdir -p "$WORK/project"
+
+# 中文流程日志文案表(2026-11 用户需求):扫描 sig_check.c/env_check.c 的
+# LSG 标记注释生成 sig_log_data.h(XOR 密文,strings 不泄语义)。
+# 勾 sigcheck 或 envcheck 时需要;生成失败 fail-fast(文案缺失=编译必炸,早炸早定位)
+if [[ $WANT_SIGCHECK -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
+  python3 "$ROOT/scripts/sig-log/make-sig-log.py" \
+    "$ROOT/sigcheck/src/sig_check.c" "$ROOT/sigcheck/src/env_check.c" \
+    "$WORK/sig_log_data.h"
+fi
+
 if [[ $WANT_DEX2C -eq 1 ]]; then
   unzip -q "$WORK/dcc-project.zip" -d "$WORK/project"
 fi
@@ -152,10 +162,12 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
     mkdir -p "$WORK/project/jni/nc"
     cp "$ROOT/sigcheck/src/sig_check.c" "$WORK/project/jni/nc/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/nc/"
+    cp "$WORK/sig_log_data.h"           "$WORK/project/jni/nc/"
   else
     mkdir -p "$WORK/project/jni"
     cp "$ROOT/sigcheck/src/sig_check.c" "$WORK/project/jni/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/"
+    cp "$WORK/sig_log_data.h"           "$WORK/project/jni/"
   fi
 fi
 if [[ $WANT_ENVCHECK -eq 1 ]]; then
@@ -166,6 +178,14 @@ if [[ $WANT_ENVCHECK -eq 1 ]]; then
   else
     mkdir -p "$WORK/project/jni"
     cp "$ROOT/sigcheck/src/env_check.c" "$WORK/project/jni/"
+  fi
+  # envcheck 未勾 sigcheck 时也要有文案表(仅勾 envcheck 的组合)
+  if [[ $WANT_SIGCHECK -ne 1 ]]; then
+    if [[ $WANT_DEX2C -eq 1 ]]; then
+      cp "$WORK/sig_log_data.h" "$WORK/project/jni/nc/"
+    else
+      cp "$WORK/sig_log_data.h" "$WORK/project/jni/"
+    fi
   fi
 fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc

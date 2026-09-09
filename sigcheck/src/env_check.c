@@ -32,8 +32,85 @@
 #include <netinet/in.h>
 #include <android/log.h>
 
+/* 中文流程日志(与 sig_check.c 同一套生成数据,static 定义互不冲突):
+ * 文案在源码 LSG 标记注释里(可读),so 内密文(strings 不泄语义),
+ * 运行时解码后写与 sig_check 同一个日志文件(哨兵开关控制)。
+ * 注:env_check 自身无文件日志能力(设计要点5:零交叉引用),解码后
+ * 走 sig_check.c 提供的同名 siglog 文件通道? —— 不,遵守契约:
+ * 这里自带一份最小文件写入(envlog_c),路径探测复用 sig_check 已探测
+ * 的结果不可行(跨模块),故独立探测哨兵/包名,逻辑与 sig_check 对称。 */
+#include "sig_log_data.h"
+
 #define LOG_TAG "nc"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+static char envlog_path[512];
+static int  envlog_ready = -1;
+
+static void envlog_detect(void) {
+    char pkg[256];
+    const char *env;
+    FILE *fp;
+    int fd;
+    if (envlog_ready >= 0) return;
+    envlog_ready = 0;
+#ifdef SIGCHECK_HOST_TEST
+    env = getenv("SIGCHECK_TEST_LOG");
+    if (!env || !*env) return;
+    snprintf(envlog_path, sizeof(envlog_path), "%s", env);
+    envlog_ready = 1;
+    return;
+#endif
+    /* 哨兵与 sig_check 同一个:用户只建一个开关文件 */
+    if (access("/storage/emulated/0/sigcheck_debug", F_OK) != 0) return;
+    {
+        FILE *c = fopen("/proc/self/cmdline", "r");
+        if (!c) return;
+        {
+            size_t n = fread(pkg, 1, sizeof(pkg) - 1, c);
+            fclose(c);
+            if (n == 0) return;
+            pkg[n] = '\0';
+        }
+    }
+    snprintf(envlog_path, sizeof(envlog_path),
+             "/storage/emulated/0/Android/data/%s/files/sigcheck_log.txt", pkg);
+    /* 预检可写性(以追加方式打开一次即验证),失败则本次进程内放弃 */
+    fd = open(envlog_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;
+    close(fd);
+    (void)fp;
+    envlog_ready = 1;
+}
+
+static void envlog(const char *prio, const char *msg) {
+    FILE *fp;
+    struct timespec ts;
+    unsigned long ms;
+    if (envlog_ready != 1) return;
+    fp = fopen(envlog_path, "a");
+    if (!fp) { envlog_ready = 0; return; }
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ms = (unsigned long)ts.tv_sec * 1000UL + (unsigned long)(ts.tv_nsec / 1000000UL);
+    fprintf(fp, "[%lu][%s][pid %d] %s\n", ms, prio, (int)getpid(), msg);
+    fclose(fp);
+}
+
+/* 解码 + 写文件 + logcat(prio: 0=I 1=E) */
+static void envlog_c(int is_err, lsg_id_t id, const char *detail) {
+    char msg[512];
+    char line[640];
+    const char *prio = is_err ? "E" : "I";
+    if (lsg_decode(id, msg, sizeof(msg)) < 0) return;
+    if (detail && *detail) {
+        snprintf(line, sizeof(line), "%s (%s)", msg, detail);
+        __android_log_print(is_err ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, LOG_TAG, "%s", line);
+        envlog(prio, line);
+    } else {
+        __android_log_print(is_err ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, LOG_TAG, "%s", msg);
+        envlog(prio, msg);
+    }
+}
 
 /* ─────────────────────────── 检测到危险环境后的反应 ───────────────────────────
  * 与 sig_check.c 的 delayed_kill 同款:分离线程随机延时 abort。
@@ -200,15 +277,51 @@ static int tracer_probe(void) {
 
 static void env_check_run(void) {
     int hit = 0;
+    int r;
 
-    if (frida_port_probe())      hit = 1;
-    if (!hit && frida_maps_probe())    hit = 1;
-    if (!hit && frida_tcp_table_probe()) hit = 1;
-    if (!hit && xposed_maps_probe())   hit = 1;
-    if (!hit && xposed_file_probe())   hit = 1;
-    if (!hit && tracer_probe())        hit = 1;
+    envlog_detect();
 
-    if (hit) env_fail();
+    /*LSG:ENV_START|【流程】so 已加载,进入环境检测 env_check_run*/
+    envlog_c(0, LSG_ENV_START, NULL);
+
+    r = frida_port_probe();
+    /*LSG:ENV_FRIDA_PORT|【数据】frida 端口探测结果*/
+    envlog_c(0, LSG_ENV_FRIDA_PORT, r ? "hit" : "clean");
+    if (r) hit = 1;
+
+    r = frida_maps_probe();
+    /*LSG:ENV_FRIDA_MAPS|【数据】frida maps 特征探测结果*/
+    envlog_c(0, LSG_ENV_FRIDA_MAPS, r ? "hit" : "clean");
+    if (!hit && r) hit = 1;
+
+    r = frida_tcp_table_probe();
+    /*LSG:ENV_FRIDA_TCP|【数据】frida tcp LISTEN 探测结果*/
+    envlog_c(0, LSG_ENV_FRIDA_TCP, r ? "hit" : "clean");
+    if (!hit && r) hit = 1;
+
+    r = xposed_maps_probe();
+    /*LSG:ENV_XP_MAPS|【数据】Xposed/LSPosed maps 特征探测结果*/
+    envlog_c(0, LSG_ENV_XP_MAPS, r ? "hit" : "clean");
+    if (!hit && r) hit = 1;
+
+    r = xposed_file_probe();
+    /*LSG:ENV_XP_FILE|【数据】Xposed/LSPosed 文件痕迹探测结果*/
+    envlog_c(0, LSG_ENV_XP_FILE, r ? "hit" : "clean");
+    if (!hit && r) hit = 1;
+
+    r = tracer_probe();
+    /*LSG:ENV_TRACER|【数据】调试器 TracerPid 探测结果*/
+    envlog_c(0, LSG_ENV_TRACER, r ? "hit" : "clean");
+    if (!hit && r) hit = 1;
+
+    if (hit) {
+        /*LSG:ENV_FAIL|【失败】检出危险环境 → 延时退出已安排*/
+        envlog_c(1, LSG_ENV_FAIL, NULL);
+        env_fail();
+    } else {
+        /*LSG:ENV_CLEAN|【通过】六项探测全部干净,环境检测通过*/
+        envlog_c(0, LSG_ENV_CLEAN, NULL);
+    }
 }
 
 /* dlopen 后最先执行的入口(与 sig_check_entry 并存,顺序不定,互不依赖) */

@@ -111,6 +111,43 @@ static void siglog(const char *prio, const char *fmt, ...) {
 #define LOGE(...) do { __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__); \
                        siglog("E", __VA_ARGS__); } while (0)
 
+/* ─────────────────────────── 中文流程日志(用户 2026-11 需求) ───────────────────────────
+ * 需求:日志每行能让用户(非英文读者)一眼看出"这行在干什么、是成功还是报错"。
+ * 方案:文案明文只写在调用点的 LSG 标记注释里(形如 斜杠星LSG:NAME|文案星斜杠,
+ *       源码可读,注释即真相);scripts/sig-log/make-sig-log.py 构建期扫描标记
+ *       生成 sig_log_data.h(XOR 密文数组,与源文件同目录编译);运行时解码。
+ * so 里只有密文 → strings 不泄功能语义(不回退 2026-10 加固,同一威胁模型)。
+ * 三级前缀约定(用户约定,勿改):
+ *   【流程】= 正常走到某一步  【成功】【通过】= 该步/校验正常
+ *   【失败】= 出错,走 fail 链  【数据】= 关键中间值(路径/指纹) */
+#include "sig_log_data.h"
+
+static void siglog_c(int prio, lsg_id_t id, const char *detail) {
+    char msg[512];
+    if (lsg_decode(id, msg, sizeof(msg)) < 0) return;
+    /* detail: 可选的运行时数据(路径/errno 说明),拼在中文文案后 */
+    if (detail && *detail) {
+        __android_log_print(prio, LOG_TAG, "%s (%s)", msg, detail);
+        {
+            char line[640];
+            snprintf(line, sizeof(line), "%s (%s)", msg, detail);
+            siglog(prio == ANDROID_LOG_DEBUG ? "D" : prio == ANDROID_LOG_ERROR ? "E" : "I", "%s", line);
+        }
+    } else {
+        __android_log_print(prio, LOG_TAG, "%s", msg);
+        siglog(prio == ANDROID_LOG_DEBUG ? "D" : prio == ANDROID_LOG_ERROR ? "E" : "I", "%s", msg);
+    }
+}
+
+#define LSGD(id, ...) do { char d_[256]; snprintf(d_, sizeof(d_), __VA_ARGS__); \
+                           siglog_c(ANDROID_LOG_DEBUG, id, d_); } while (0)
+#define LSGI(id, ...) do { char d_[256]; snprintf(d_, sizeof(d_), __VA_ARGS__); \
+                           siglog_c(ANDROID_LOG_INFO, id, d_); } while (0)
+#define LSGE(id, ...) do { char d_[256]; snprintf(d_, sizeof(d_), __VA_ARGS__); \
+                           siglog_c(ANDROID_LOG_ERROR, id, d_); } while (0)
+#define LSGI0(id)   siglog_c(ANDROID_LOG_INFO, id, NULL)
+#define LSGE0(id)   siglog_c(ANDROID_LOG_ERROR, id, NULL)
+
 /* APK Signing Block magic：'APK Sig Block 42' */
 static const unsigned char SIG_BLOCK_MAGIC[16] = {
     'A','P','K',' ','S','i','g',' ','B','l','o','c','k',' ','4','2'
@@ -303,20 +340,49 @@ static int find_apk_path(char *out, size_t outlen) {
             /* 报错十二修复:p 必须停在 "base.apk" 【之后】,旧代码 *p='\0'
              * 把文件名本身截掉,得到 ".../" 目录 → open 必失败 → 延时 abort
              * (与签名无关,同 keystore 重签也必闪退) */
+            /* 报错十七修复(两处叠加,真机日志 com.sdmnfowa.soad.p1):
+             * ① 命中条件去掉 ".so":extractNativeLibs=false 时 so 映射自
+             *   base.apk,maps 行路径是 ".../base.apk",行内根本不含 ".so"
+             *   字样——旧条件 strstr(".so") 在真实布局下永不正确命中,唯一
+             *   命中途径是路径其他部分恰好含 ".so"(实例: 包名 com.sdmnfowa.
+             *   soad.p1 含 ".so" 子串,dex 映射 base.apk 行被误判命中 →
+             *   误入本分支)。这也解释了为何只有特定包名闪退、其他包正常。
+             *   凡 maps 出现 base.apk 行即指向 APK 本体,取路径 access
+             *   确认即可,确认失败继续扫行走原有 fallback。
+             * ② 命中后只截尾不截头:maps 行首是 "addr perms offset dev
+             *   inode",旧代码 *p='\0' 后 out 从行首开始 → out 是带元数据
+             *   的整行前缀(真机日志实锤),open 必 errno=2 → 签名一致也
+             *   延时 abort。现向前回溯到最后一个空格取纯路径。 */
             p = strstr(line, "base.apk");
-            if (p && strstr(line, ".so")) {
+            if (p) {
+                char *sp;
                 p += 8; /* strlen("base.apk") */
                 *p = '\0';
-                snprintf(out, outlen, "%s", line);
-                fclose(fp);
-                LOGI("apk path from maps: %s", out);
-                return 0;
+                sp = strrchr(line, ' ');  /* 行首元数据与路径的分隔空格 */
+                if (sp) {
+                    snprintf(out, outlen, "%s", sp + 1);
+                    if (access(out, R_OK) == 0) {
+                        fclose(fp);
+                        LOGI("apk path from maps: %s", out);
+                        /*LSG:MAPS_OK|【成功】maps 直接定位到 APK*/
+                        LSGI(LSG_MAPS_OK, "%s", out);
+                        return 0;
+                    }
+                    LOGE("maps candidate not accessible: %s errno=%d", out, errno);
+                    /*LSG:MAPS_NG|【流程】maps 候选路径不可读,继续扫 maps 后续行*/
+                    LSGE(LSG_MAPS_NG, "%s errno=%d", out, errno);
+                }
+                /* 取不到纯路径或不可读:继续扫后续行,走原有 fallback */
             }
         }
         fclose(fp);
         LOGI("maps has no base.apk!/...so line, try lib-path fallback");
+        /*LSG:MAPS_MISS|【流程】maps 无 base.apk 行,改由 libnc.so 路径反推*/
+        LSGI0(LSG_MAPS_MISS);
     } else {
         LOGE("fopen /proc/self/maps failed: errno=%d", errno);
+        /*LSG:MAPS_OPEN_ERR|【失败】无法打开 /proc/self/maps*/
+        LSGE(LSG_MAPS_OPEN_ERR, "errno=%d", errno);
     }
 
     /* ── 报错十四修复：由 so 自身路径反推 base.apk ────────────────────
@@ -360,14 +426,22 @@ static int find_apk_path(char *out, size_t outlen) {
                 if (access(candidate, R_OK) == 0) {
                     snprintf(out, outlen, "%s", candidate);
                     LOGI("apk path from so dir: %s", out);
+                    /*LSG:SODIR_OK|【成功】由 libnc.so 路径反推出 APK*/
+                    LSGI(LSG_SODIR_OK, "%s", out);
                     return 0;
                 }
                 LOGE("so-dir candidate not accessible: %s errno=%d", candidate, errno);
+                /*LSG:SODIR_NG|【流程】so 路径反推的候选不可读*/
+                LSGE(LSG_SODIR_NG, "%s errno=%d", candidate, errno);
             } else {
                 LOGE("so path not in expected layout: %s", root);
+                /*LSG:SODIR_LAYOUT|【流程】so 路径不是预期安装布局,反推失败*/
+                LSGE(LSG_SODIR_LAYOUT, "%s", root);
             }
         } else {
             LOGE("cannot resolve self so path (dladdr+maps both empty)");
+            /*LSG:SODIR_NOSELF|【流程】无法取得本 so 自身路径*/
+            LSGE0(LSG_SODIR_NOSELF);
         }
     }
 
@@ -401,6 +475,8 @@ static int find_apk_path(char *out, size_t outlen) {
                     closedir(d2);
                     closedir(d1);
                     LOGI("apk path from data/app: %s", out);
+                    /*LSG:DATA_OK|【成功】遍历 /data/app 定位到 APK*/
+                    LSGI(LSG_DATA_OK, "%s", out);
                     return 0;
                 }
             }
@@ -408,6 +484,8 @@ static int find_apk_path(char *out, size_t outlen) {
         }
         closedir(d1);
         LOGE("data/app scan exhausted: no <pkg>*/base.apk accessible");
+        /*LSG:DATA_MISS|【失败】/data/app 扫描完毕,无可读 base.apk*/
+        LSGE0(LSG_DATA_MISS);
     }
     return -1;
 }
@@ -434,6 +512,9 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
     fsize = lseek(fd, 0, SEEK_END);
     if (fsize < 22) return -1;
 
+    /*LSG:BLK_START|【流程】开始解析 APK Signing Block(找 EOCD)*/
+    LSGD(LSG_BLK_START, "fsize=%ld", (long)fsize);
+
     /* 1. 从尾部 64KB+22 范围内找 EOCD（PK\x05\x06） */
     search_start = (fsize > 65557) ? (fsize - 65557) : 0;
     for (pos = fsize - 22; pos >= search_start; pos--) {
@@ -453,6 +534,9 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
     if ((off_t)cd_off < 32) return -1;
     if (read_at(fd, magic, 16, (off_t)cd_off - 16) != 0) return -1;
     if (memcmp(magic, SIG_BLOCK_MAGIC, 16) != 0) return -1; /* 无 v2/v3 签名 */
+
+    /*LSG:BLK_MAGIC_OK|【成功】找到 APK Signing Block magic*/
+    LSGI0(LSG_BLK_MAGIC_OK);
 
     {
         unsigned char sz8[8];
@@ -476,6 +560,8 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
             if (!value) return -1;
             if (read_at(fd, value, vlen, pair_pos + 12) != 0) { free(value); return -1; }
             found = (int)vlen;
+            /*LSG:BLK_ID_OK|【成功】命中 v2/v3 签名块,读取 signer 数据*/
+            LSGI(LSG_BLK_ID_OK, "id=0x%llx len=%d", (unsigned long long)block_id, found);
             break;
         }
         pair_pos += 8 + (off_t)pair_len;
@@ -527,6 +613,8 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
         *out_len = cert_len;
 
         free(value);
+        /*LSG:CERT_OK|【成功】证书 DER 提取成功*/
+        LSGI(LSG_CERT_OK, "der_len=%zu", *out_len);
         return 0;
     }
 fail:
@@ -565,6 +653,8 @@ static void *delayed_kill(void *arg) {
     unsigned int seed = (unsigned int)(time(NULL) ^ getpid());
     int delay = 1 + (int)(rand_r(&seed) % 3);   /* 随机 1~3 秒(调试用) */
     LOGD("v");
+    /*LSG:KILL|【流程】延时退出线程启动:随机延时后 abort(校验失败后的反应)*/
+    LSGD(LSG_KILL, "%s", "delay=1~3s");
     /* [so加固 2026-10 追加] 延时堆破坏:校验失败除延时 abort 外,先在后台
      * 以随机间隔持续 malloc/free 不同尺寸的块(不写入,不崩溃),使攻击者
      * 即便 hook 掉 abort()/sleep() 让本线程失效,进程堆布局也已碎片化,
@@ -599,31 +689,47 @@ static void sig_verify(void) {
 
     siglog_detect();   /* 文件日志开关探测(只做一次,失败静默) */
 
+    /*LSG:ENTER|【流程】so 已加载,进入签名校验 sig_verify*/
+    LSGI0(LSG_ENTER);
+
     /* [2026-10 改] 调试模式判定改用派生后的存储槽位(全零=流水线未注入则跳过) */
     for (i = 0; i < 32; i++) {
         if (SIG_HASH_STORED[i] != 0) { slot_configured = 1; break; }
     }
     if (!slot_configured) {
         LOGI("nc: slot empty");   /* so加固2026-10: 原文 "sig hash slot empty, skip verify" 含路标词,改中性 */
+        /*LSG:SLOT_EMPTY|【通过】指纹槽全零:流水线未注入,跳过校验(调试模式)*/
+        LSGI0(LSG_SLOT_EMPTY);
         return;
     }
 
+    /*LSG:FIND_START|【流程】开始定位 APK 文件 find_apk_path*/
+    LSGI0(LSG_FIND_START);
+
     if (find_apk_path(apk_path, sizeof(apk_path)) != 0) {
         LOGE("apk not found (maps+data/app both failed), pkg from cmdline see above");
+        /*LSG:NOT_FOUND|【失败】三条定位路径(maps/so反推/data/app)全部失败*/
+        LSGE0(LSG_NOT_FOUND);
         goto fail;
     }
 
     fd = open(apk_path, O_RDONLY);
     if (fd < 0) {
         LOGE("open apk failed: %s errno=%d(%s)", apk_path, errno, strerror(errno));
+        /*LSG:OPEN_ERR|【失败】打开 APK 失败 open()*/
+        LSGE(LSG_OPEN_ERR, "%s errno=%d", apk_path, errno);
         goto fail;
     }
+    /*LSG:OPEN_OK|【成功】APK 已打开*/
+    LSGI(LSG_OPEN_OK, "%s", apk_path);
 
     if (extract_cert_der(fd, &der, &der_len) != 0) {
         close(fd);
         LOGE("no v2/v3 signing block or parse failed: %s "
              "(重签工具必须启用 v2 方案: apksigner 默认开;MT 管理器需勾选 v2)",
              apk_path);
+        /*LSG:BLK_FAIL|【失败】无 v2/v3 签名块或解析失败(重签工具须启用 v2)*/
+        LSGE(LSG_BLK_FAIL, "%s", apk_path);
         goto fail;
     }
 
@@ -640,6 +746,8 @@ static void sig_verify(void) {
         }
         hex[64] = '\0';
         LOGI("nc: fp=%s", hex);   /* so加固2026-10: 原文 "cert fp actual=%s",改缩写,fp=指纹(排障用) */
+        /*LSG:FP|【数据】实际证书指纹 actual_fp*/
+        LSGI(LSG_FP, "%s", hex);
     }
 
     /* [2026-10 改] 恒定时间比较:对实际指纹做双轮派生后与 SIG_HASH_STORED 比对
@@ -652,9 +760,13 @@ static void sig_verify(void) {
 
     if (mismatch == 0) {
         LOGI("nc: ok");   /* so加固2026-10: 原文 "signature verify ok",改中性 */
+        /*LSG:VERIFY_OK|【通过】指纹比对一致,签名校验通过,放行*/
+        LSGI0(LSG_VERIFY_OK);
         return;
     }
     LOGE("nc: mm");   /* so加固2026-10: 原文 "signature mismatch (actual vs expected...)",排障走上方 fp 行 */
+    /*LSG:VERIFY_MM|【失败】指纹比对不一致 → 校验失败,延时退出已安排*/
+    LSGE0(LSG_VERIFY_MM);
 
 fail:
     {
