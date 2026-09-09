@@ -1,15 +1,21 @@
 /*
- * sig_hash.h — 期望证书指纹（SHA-256，32 字节）
+ * sig_hash.h — 期望证书指纹（双轮派生形态,2026-10 存储混淆方案）
  *
- * 此文件为模板占位，真实值由流水线脚本 scripts/gen_sig_hash.sh
- * 从用户上传的 APK 中提取证书指纹后生成覆盖。
- * 全零 = 调试模式，sig_check.c 会跳过校验。
+ * 此文件为模板占位,真实值由流水线脚本 scripts/sig-hash/make-sig-hash.sh
+ * 从用户上传的 APK 中提取证书指纹后生成覆盖（含随机 SIG_SALT 与
+ * 派生后的 SIG_HASH_STORED,明文指纹不落盘）。
+ * 全零（SIG_HASH_STORED 全零）= 调试模式,sig_check.c 会跳过校验。
  */
 #ifndef _SIG_HASH_H_
 #define _SIG_HASH_H_
 
 #define SIG_HASH_LEN 32
-static const unsigned char SIG_HASH[SIG_HASH_LEN] = {
+#define SIG_SALT_LEN 16
+static const unsigned char SIG_SALT[SIG_SALT_LEN] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const unsigned char SIG_HASH_STORED[SIG_HASH_LEN] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

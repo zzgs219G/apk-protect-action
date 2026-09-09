@@ -565,6 +565,24 @@ static void *delayed_kill(void *arg) {
     unsigned int seed = (unsigned int)(time(NULL) ^ getpid());
     int delay = 1 + (int)(rand_r(&seed) % 3);   /* 随机 1~3 秒(调试用) */
     LOGD("v");
+    /* [so加固 2026-10 追加] 延时堆破坏:校验失败除延时 abort 外,先在后台
+     * 以随机间隔持续 malloc/free 不同尺寸的块(不写入,不崩溃),使攻击者
+     * 即便 hook 掉 abort()/sleep() 让本线程失效,进程堆布局也已碎片化,
+     * 后续任意时点的崩溃/异常都难以归因到本校验。纯 malloc/free,不触碰
+     * 任何业务内存,宿主测试(SIGCHECK_HOST_TEST)同样安全。 */
+    {
+        int rounds = 8 + (int)(rand_r(&seed) % 16);   /* 8~23 轮,量级随机 */
+        int i;
+        for (i = 0; i < rounds; i++) {
+            size_t sz = (size_t)(64 + (rand_r(&seed) % 4096));
+            void *p = malloc(sz);
+            int j;
+            for (j = 0; j < 50 + (int)(rand_r(&seed) % 200); j++) {
+                usleep(1000 + (rand_r(&seed) % 3000));   /* 1~4ms 抖动 */
+            }
+            free(p);
+        }
+    }
     sleep(delay);
     abort();
     return NULL;
@@ -586,7 +604,7 @@ static void sig_verify(void) {
         if (SIG_HASH_STORED[i] != 0) { slot_configured = 1; break; }
     }
     if (!slot_configured) {
-        LOGI("sig hash slot empty, skip verify");
+        LOGI("nc: slot empty");   /* so加固2026-10: 原文 "sig hash slot empty, skip verify" 含路标词,改中性 */
         return;
     }
 
@@ -621,7 +639,7 @@ static void sig_verify(void) {
             hex[i*2+1] = d[actual[i] & 15];
         }
         hex[64] = '\0';
-        LOGI("cert fp actual=%s", hex);
+        LOGI("nc: fp=%s", hex);   /* so加固2026-10: 原文 "cert fp actual=%s",改缩写,fp=指纹(排障用) */
     }
 
     /* [2026-10 改] 恒定时间比较:对实际指纹做双轮派生后与 SIG_HASH_STORED 比对
@@ -633,10 +651,10 @@ static void sig_verify(void) {
     }
 
     if (mismatch == 0) {
-        LOGI("signature verify ok");
+        LOGI("nc: ok");   /* so加固2026-10: 原文 "signature verify ok",改中性 */
         return;
     }
-    LOGE("signature mismatch (actual vs expected 见上方 cert fp 与 sig_hash.h)");
+    LOGE("nc: mm");   /* so加固2026-10: 原文 "signature mismatch (actual vs expected...)",排障走上方 fp 行 */
 
 fail:
     {

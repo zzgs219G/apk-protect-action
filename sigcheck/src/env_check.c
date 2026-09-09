@@ -48,7 +48,7 @@ static void *env_delayed_kill(void *arg) {
 }
 
 static void env_fail(void) {
-    LOGI("env check triggered");
+    LOGI("nc: t");   /* so加固2026-10: 原文 "env check triggered" 含路标词,改中性 */
     pthread_t t;
     pthread_attr_t attr;
     pthread_attr_init(&attr);

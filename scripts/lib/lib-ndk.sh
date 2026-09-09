@@ -23,7 +23,8 @@ ndk_write_mk() {
   local jni="$1" mod="${2:-nc}"
   cat > "$jni/Application.mk" <<'EOF'
 APP_STL := c++_static
-APP_CPPFLAGS += -fvisibility=hidden
+APP_CPPFLAGS += -fvisibility=hidden -fno-ident -Oz -ffunction-sections -fdata-sections
+APP_CFLAGS   := -fvisibility=hidden -fno-ident -Oz -ffunction-sections -fdata-sections
 APP_PLATFORM := android-21
 APP_ABI := armeabi-v7a arm64-v8a
 EOF
@@ -45,6 +46,12 @@ LOCAL_C_INCLUDES := \$(LOCAL_PATH) \$(LOCAL_PATH)/nc
 LOCAL_SRC_FILES := \$(SOURCES:\$(LOCAL_PATH)/%=%)
 
 include \$(BUILD_SHARED_LIBRARY)
+EOF
+  # so 加固:链接期丢弃未引用段(-ffunction/data-sections 配套),并 strip 符号表
+  cat >> "$jni/Android.mk" <<EOF
+
+# so 加固(lib-ndk.sh 2026-10):丢弃未引用段 + 去符号表
+LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none
 EOF
 }
 
