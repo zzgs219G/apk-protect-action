@@ -28,7 +28,13 @@ runs:
           *)    VER="" ;;
         esac
 
-        # 1) 首选：GitHub ubuntu runner 预装的 NDK（ANDROID_NDK_HOME 或标准 SDK 目录）
+        # 1) 首选：GitHub ubuntu runner 预装的 NDK（零下载）——但必须先校验版本。
+        #    报错十六（2026-09）: GitHub 把 runner 预装 NDK 升到 r27 后，ANDROID_NDK_HOME
+        #    未经版本校验就抢先命中 → dcc 生成的 C（jobject 寄存器收 int 赋值）在
+        #    r27 的 clang 18 下从 warning 升级为 error → NDK 编译失败。
+        #    修法：预装候选逐个提取版本号（目录名形如 26.3.11579264 / 27.x.x），
+        #    只认主版本号与指定版本一致的候选；都不匹配则回退下载。
+        want_major="${VER%%.*}"   # r26d → 26
         CANDIDATES=()
         [[ -n "${ANDROID_NDK_HOME:-}" ]] && CANDIDATES+=("$ANDROID_NDK_HOME")
         if [[ -n "${ANDROID_HOME:-}" ]]; then
@@ -37,10 +43,16 @@ runs:
         fi
         for c in "${CANDIDATES[@]}"; do
           if [[ -d "$c" && -x "$c/ndk-build" ]]; then
-            echo "ndk-path=$c" >> "$GITHUB_OUTPUT"
-            echo "source=preinstalled" >> "$GITHUB_OUTPUT"
-            echo "✅ 使用 runner 预装 NDK（零下载）: $c"
-            exit 0
+            cdir="$(basename "$c")"
+            cmajor="${cdir%%.*}"
+            if [[ -z "$VER" || "$cmajor" == "$want_major" ]]; then
+              echo "ndk-path=$c" >> "$GITHUB_OUTPUT"
+              echo "source=preinstalled" >> "$GITHUB_OUTPUT"
+              echo "✅ 使用 runner 预装 NDK（零下载）: $c"
+              exit 0
+            else
+              echo "⚠️ 跳过预装 NDK（版本不匹配，报错十六）: $c（需要 $NDK_R）"
+            fi
           fi
         done
 
