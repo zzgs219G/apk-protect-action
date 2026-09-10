@@ -529,10 +529,13 @@ def class_desc_of(content: str):
 
 STUB_DOT = STUB_DESC[1:-1].replace('/', '.')
 
-# 已加密条目的形态:const-string 紧跟本桩的 invoke-static(用于续跑时续 idx)
+# 已加密条目的形态:const-string 紧跟本桩的 invoke-static(用于续跑时续 idx)。
+# 必须同时认 `invoke-static {..}` 与 `invoke-static/range {.. .. ..}` 两种形态
+# (报错二十一改注入形态后,/range 是新产物;若这里只认旧形态,max_existing_idx
+# 会漏算 → 续跑 idx 从 0 重来 → salt+idx 相同 → keystream 复用)
 _PAYLOAD_RE = re.compile(
     r'const-string(?:/jumbo)?[ \t]+(?:v\d+|p\d+)[ \t]*,[ \t]*"([^"\n]*)"\n'
-    r'[ \t]*invoke-static \{[^}\n]*\}, ' + re.escape(STUB_DESC) + r'->d\(')
+    r'[ \t]*invoke-static(?:/range)? \{[^}\n]*\}, ' + re.escape(STUB_DESC) + r'->d\(')
 
 # 字段常量加密形态:.field ... = 本桩的 F\d+ 引用(报错二十式:续跑时字段 idx
 # 也要计入,否则新字段编号从 0 重来 → 相同 salt+idx → keystream 复用)
@@ -849,8 +852,16 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         indent = m.group('indent')
         dst = m.group('dst')
         out.append(f'{indent}const-string{jumbo} {dst}, "{payload}"{tail}')
-        out.append(f'{indent}invoke-static {{{dst}}}, {STUB_DESC}'
-                   f'->d(Ljava/lang/String;)Ljava/lang/String;')
+        # 寄存器宽度陷阱(报错二十一):const-string 是 21c 格式(8 位寄存器,
+        # v0–v255),而 invoke-* 是 35c 格式(寄存器列表仅 4 位,上限 v15)。
+        # 原 const-string 的目标寄存器可合法取到 v16+(大方法/Compose),或写成
+        # pN 而换算后编号 ≥16 → 直接 {dst} 会被 smali 汇编器拒绝,整个重打包
+        # 失败("Invalid register: vNN. Must be between v0 and v15" /
+        # "The maximum allowed register in this context is list of registers is v15")。
+        # 统一用 /range:单寄存器 range 恒连续、dex 中同为 3 个 code unit(无体积
+        # 代价),且对 v/p 两种写法都合法 → 无需解析 .registers/.locals 做换算。
+        out.append(f'{indent}invoke-static/range {{{dst} .. {dst}}}, '
+                   f'{STUB_DESC}->d(Ljava/lang/String;)Ljava/lang/String;')
         out.append(f'{indent}move-result-object {dst}')
         idx += 1
         hits += 1
