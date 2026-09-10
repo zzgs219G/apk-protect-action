@@ -35,6 +35,8 @@ repack_require_tools() {
 repack_unpack() {
   local out="$1" apk="$2"
   java -jar "$APKTOOL_JAR" d -r -f --no-debug-info -o "$out" "$apk"
+  # 报错十八: 回编会把各 dex 版本全部降成 035(原始信息丢失),解包后先记录
+  python3 "$ROOT/scripts/repack/patch-dex-version.py" save "$apk" "$out"
 }
 
 # repack_install_so <解包目录> <libs根目录> — 把编译产物里所有 ABI 的 .so 拷进解包目录
@@ -59,4 +61,7 @@ repack_force_extractnativelibs() {
 repack_build() {
   local decompiled="$1" out="$2"
   java -jar "$APKTOOL_JAR" b -o "$out" "$decompiled"
+  # 报错十八: 回编后按解包时记录的原始版本逐 dex 恢复(只升不降,
+  # max(原版本, minSdk 推导下限)),对任意 App/minSdk 组合通用
+  python3 "$ROOT/scripts/repack/patch-dex-version.py" restore "$out" "$decompiled"
 }
