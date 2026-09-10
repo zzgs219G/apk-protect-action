@@ -26,7 +26,8 @@
   android. androidx. android.support. com.android. com.google.android.
   dalvik. java. javax. kotlin. kotlinx. org.jetbrains.
   org.apache. org.json. org.w3c. org.xml. sun.
-外加解密桩自身。用户 `!` 排除行优先级最高。
+外加解密桩自身。`!` 排除行在非系统类范围内优先级最高;
+命中系统前缀的类无条件硬排除(与 classify 的实际判定顺序一致)。
 
 【算法(与 stub 里的 Java 实现必须逐字节一致,靠对拍测试锁定)】
   salt        : 16 字节随机(os.urandom / secrets),构建期生成
@@ -112,13 +113,13 @@ STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
 # direct methods
 .method static constructor <clinit>()V
     .registers 2
-%CLINIT_FILL%
     new-instance v0, Ljava/util/concurrent/ConcurrentHashMap;
 
     invoke-direct {v0}, Ljava/util/concurrent/ConcurrentHashMap;-><init>()V
 
     sput-object v0, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
 
+%CLINIT_FILL%
     return-void
 .end method
 
@@ -356,8 +357,29 @@ def smali_unescape(text: str) -> str:
             hexs = text[i + 1:i + 5]
             if len(hexs) != 4 or any(c not in _HEX for c in hexs):
                 raise ValueError('\\u 转义非 4 位十六进制')
-            out.append(chr(int(hexs, 16)))
+            cp = int(hexs, 16)
             i += 5
+            # baksmali 按 UTF-16 code unit 逐个转义:非 BMP 字符(emoji 等)
+            # 输出成 \uD83D\uDE00 代理对。必须在这里合并成单个码点,
+            # 否则 chr() 产生的孤立代理项后续 .encode('utf-8') 直接炸
+            # (报错十九: UnicodeEncodeError: surrogates not allowed)。
+            if 0xD800 <= cp <= 0xDBFF:                       # 高代理 → 必须跟低代理
+                if i + 1 < n and text[i] == '\\' and text[i + 1] == 'u' \
+                        and i + 6 <= n:
+                    lo_hexs = text[i + 2:i + 6]
+                    if len(lo_hexs) != 4 or any(c not in _HEX for c in lo_hexs):
+                        raise ValueError('代理对低半 \\u 转义非法')
+                    lo = int(lo_hexs, 16)
+                    if not (0xDC00 <= lo <= 0xDFFF):
+                        raise ValueError(f'高代理 \\u{cp:04X} 后未跟低代理(孤立代理项)')
+                    out.append(chr(0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)))
+                    i += 6
+                else:
+                    raise ValueError(f'高代理 \\u{cp:04X} 后未跟低代理(孤立代理项)')
+            elif 0xDC00 <= cp <= 0xDFFF:
+                raise ValueError(f'孤立低代理 \\u{cp:04X}')
+            else:
+                out.append(chr(cp))
         elif esc in _UNESCAPE:
             out.append(_UNESCAPE[esc])
             i += 1
@@ -408,11 +430,6 @@ def parse_field_string(line: str):
     else:
         return None
     return m, rest[:i], rest[i + 1:]
-
-
-def field_to_java_code(field_type: str, literal: str) -> str:
-    """把字段字面量转成等价的 Java 源码字符串(用于转义)。"""
-    return '"' + literal + '"'
 
 
 def keystream(salt: bytes, idx: int, length: int) -> bytes:
@@ -517,6 +534,11 @@ _PAYLOAD_RE = re.compile(
     r'const-string(?:/jumbo)?[ \t]+(?:v\d+|p\d+)[ \t]*,[ \t]*"([^"\n]*)"\n'
     r'[ \t]*invoke-static \{[^}\n]*\}, ' + re.escape(STUB_DESC) + r'->d\(')
 
+# 字段常量加密形态:.field ... = 本桩的 F\d+ 引用(报错二十式:续跑时字段 idx
+# 也要计入,否则新字段编号从 0 重来 → 相同 salt+idx → keystream 复用)
+_FIELD_REF_RE = re.compile(
+    r'= ' + re.escape(STUB_DESC) + r'->F(\d+):')
+
 
 def is_system_class(cls_dot: str) -> bool:
     """系统类/框架依赖前缀判定(带点号前缀,不误伤 androidXxx 这种同前缀类)。"""
@@ -525,7 +547,10 @@ def is_system_class(cls_dot: str) -> bool:
 
 def classify(cls_dot: str, cls_desc: str, includes, excludes) -> str:
     """给类定性:no-match / system / excluded / stub / target。
-    排除优先级最高(用户 ! 行 + 系统前缀 + 桩自身),再看 include。"""
+    判定顺序:未命中 include → system(硬排除,规则层不可突破)→ stub →
+    用户 ! 排除 → target。system 与 excluded 结果同为不加密,仅日志统计
+    口径不同:命中系统前缀的类计入 skipped_system(即使用户 ! 排除行也
+    拦不住硬排除的优先地位)。"""
     if not any(r.search(cls_desc) for r in includes):
         return 'no-match'
     if is_system_class(cls_dot):
@@ -538,7 +563,8 @@ def classify(cls_dot: str, cls_desc: str, includes, excludes) -> str:
 
 
 def max_existing_idx(content: str) -> int:
-    """已加密类里出现过的最大 idx(续跑时接着编号,避免 keystream 复用)。"""
+    """已加密类里出现过的最大 idx(续跑时接着编号,避免 keystream 复用)。
+    同时扫两类形态:指令密文(_PAYLOAD_RE)与字段引用(_FIELD_REF_RE)。"""
     biggest = -1
     for m in _PAYLOAD_RE.finditer(content):
         try:
@@ -547,6 +573,8 @@ def max_existing_idx(content: str) -> int:
             continue
         if len(raw) >= 3:
             biggest = max(biggest, int.from_bytes(raw[:3], 'big'))
+    for m in _FIELD_REF_RE.finditer(content):
+        biggest = max(biggest, int(m.group(1), 10))
     return biggest
 
 
@@ -576,6 +604,26 @@ def read_existing_salt(decompiled_dir: str):
     if not m:
         raise SystemExit(f'❌ 桩文件缺少 SALT_B64,无法复用: {stub_path}')
     return base64.b64decode(m.group(1)), False
+
+
+def read_existing_stub_fields(decompiled_dir: str):
+    """读回已存在桩里登记的字段常量 [(name, payload)](报错二十式:
+    复用桩时本次产生新字段,必须把旧字段一并带上重写桩,否则类里引用了
+    F000005 而桩里没有声明 → 汇编 NoSuchFieldError / 运行期 null)。"""
+    stub_path = find_stub_path(decompiled_dir)
+    if not stub_path:
+        return []
+    with open(stub_path, encoding='utf-8') as fp:
+        content = fp.read()
+    if STUB_GEN_MARK not in content:
+        return []                                     # 调用方已 fail-fast,防御性兜底
+    fields = []
+    for m in re.finditer(
+            r'\.field public static final (F\d+):Ljava/lang/String;\n'
+            r'\.field private static final C_\1:Ljava/lang/String; = "'
+            r'([A-Za-z0-9+/=]+)"', content):
+        fields.append((m.group(1), m.group(2)))
+    return fields
 
 
 def _pick_smali_root(decompiled_dir: str) -> str:
@@ -616,10 +664,32 @@ def clean_components(decompiled_dir: str) -> int:
     """按组件标记删除残留的注入物(解密桩)。幂等,清完删标记文件。
 
     只删标记里登记的路径,且要求两者同时满足「路径在本解包目录内」+
-    「文件内容带本工具生成标记」—— 绝不误删用户自己的类。"""
+    「文件内容带本工具生成标记」—— 绝不误删用户自己的类。
+
+    fail-fast(报错二十):删桩前先扫全解包目录,若存在仍引用桩的已加密类
+    (CLASS_MARK + ->d( / ->F\\d+: 引用),说明上一轮加密产物没被恢复/重建,
+    此时删桩会留下半加密目录 → 汇编失败或运行期 NoClassDefFoundError。
+    正常流水线每次全新解包不会触发;本地反复调试会踩,拒绝优于静默坏产物。"""
     path = os.path.join(decompiled_dir, COMPONENTS_FILE)
     if not os.path.isfile(path):
         return 0
+    # 半加密目录探测:带 CLASS_MARK 且引用本桩的类
+    tainted = []
+    for cls_path in iter_smali_files(decompiled_dir):
+        try:
+            with open(cls_path, encoding='utf-8') as fp:
+                content = fp.read()
+        except OSError:
+            continue
+        if CLASS_MARK in content and (STUB_DESC + '->d(' in content
+                                      or _FIELD_REF_RE.search(content)):
+            tainted.append(cls_path)
+    if tainted:
+        sample = os.path.relpath(tainted[0], decompiled_dir)
+        raise SystemExit(
+            f'❌ 解包目录存在仍引用解密桩的已加密类({len(tainted)} 个,如 {sample}),\n'
+            f'   删除桩会留下半加密目录。请重新解包(全新 mktemp 目录)或先用 git '
+            f'恢复原始 smali,\n   再跑本命令。加密类必须在桩存在的前提下进产物。')
     with open(path, encoding='utf-8') as fp:
         payload = json.load(fp)
     root_abs = os.path.abspath(decompiled_dir)
@@ -688,7 +758,11 @@ def process_file(path: str, cls_desc: str, includes, excludes,
     hits = 0
     idx = next_idx
     stub_fields = []          # 需要生成的桩字段: [(字段名, 密文)]
-    for line in lines:
+    li = 0
+    n_lines = len(lines)
+    while li < n_lines:
+        line = lines[li]
+        li += 1
         stripped = line.strip()
         if stripped.startswith('.method'):
             # 同 mark-native.py:名字取括号前紧邻一段,防参数里嵌方法引用的贪婪误判
@@ -746,6 +820,15 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         if not parsed:
             out.append(line)
             continue
+        # 逐行前瞻防二次加密(报错二十式双保险):即使类标记被外部工具删掉,
+        # 密文 const-string 的下一行必是本桩的 invoke-static ...->d(...),
+        # 命中即连同密文行原样保留(与上方 ->d( 分支同样的续 idx 语义)
+        if li < n_lines and STUB_DESC + '->d(' in lines[li]:
+            out.append(line)
+            midx = max_existing_idx(line + '\n' + lines[li] + '\n')
+            if midx >= 0:
+                idx = max(idx, midx + 1)
+            continue
         if excluded_by_dex2c:
             out.append(line)                            # 该方法将被 dex2c 抽走 → 不浪费体积
             continue
@@ -773,7 +856,10 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         hits += 1
 
     if hits == 0:
-        return 0, next_idx, []
+        # 没有新加密,但可能只命中了"已加密条目跳过"分支(类标记丢失 +
+        # 三行形态)—— 此时 idx 已被续到旧密文之后,必须带回去,
+        # 否则续跑时新条目从 0 编号 → keystream 复用(报错二十式)
+        return 0, max(next_idx, idx), []
 
     # 插幂等标记注释(注释不进 dex)
     final = []
@@ -878,6 +964,22 @@ def main() -> int:
             print(f'  🔧 注入解密桩: {os.path.relpath(stub_path, args.decompiled)}'
                   f' (组件标记 {os.path.basename(stamp)}'
                   f'{f", 字段常量 {len(all_stub_fields)} 个" if all_stub_fields else ""})')
+    elif total_str > 0 and all_stub_fields:
+        # 复用已有桩但本次产生了新字段(报错二十式):旧字段+新字段合并重写桩。
+        # 旧桩若缺字段声明,类里的 ->F\d+: 引用会汇编失败/运行期取到 null。
+        old_fields = read_existing_stub_fields(args.decompiled)
+        merged = {name: payload for name, payload in old_fields}
+        for name, payload in all_stub_fields:
+            if name in merged and merged[name] != payload:
+                raise SystemExit(
+                    f'❌ 字段 {name} 与旧桩密文不一致(盐复用冲突),请清理解包目录后重跑')
+        merged.update({name: payload for name, payload in all_stub_fields})
+        combined = sorted(merged.items())              # 按字段名(=idx)稳定排序
+        write_stub(args.decompiled, salt, combined)
+        write_components_stamp(args.decompiled, STUB_DESC)
+        if not args.quiet:
+            print(f'  🔧 重写解密桩(合并字段): 新 {len(all_stub_fields)} 个,'
+                  f' 保留旧 {len(old_fields)} 个, 共 {len(combined)} 个')
     # need_write_stub 但一条都没加密 → 不注入桩(不给产物塞无用类,且省掉 dex 内新类)
 
     if not args.quiet:
