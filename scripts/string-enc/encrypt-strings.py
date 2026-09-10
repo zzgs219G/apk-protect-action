@@ -101,6 +101,31 @@ SYSTEM_CLASS_PREFIXES = (
 
 IDX_MAX = (1 << 24) - 1                      # idx 占 3 字节
 
+# ── 无价值串跳过:编译器生成的调试/内联标记(对比实验定性,2026-09) ────
+# 背景:用户全量规则加密 3438 类后 app"进不去且无日志",而第三方字符串加密
+# 工具同规则正常。解剖两产物发现关键差异:第三方工具内置"跳过名单",保留
+# Kotlin/Compose/R8 desugar 编译器自动生成的调试标记串明文(仅 classes15 一个
+# dex 就保留 1637 条 $i$f$ + 450 条 $this$ + 87 条 $changed);本工具此前
+# 一个不漏全加密。这些串对 app 运行毫无作用(纯编译器/调试器记号),却让
+# 解密桩为它们白付一份 keystream 成本与体积。跳过它们:体积更小、启动解密
+# 更少,且不存在任何行为风险(没有人会依赖调试标记做业务判断)。
+# 命中规则(逐明文串前缀判断,非类名):
+#   $i$f$    — Kotlin inline 函数标记($i$f$functionName)
+#   $i$a$    — Kotlin inline 匿名对象标记
+#   $this$   — Kotlin 扩展/接收者标记($this$forEach 等)
+#   $changed — Compose Composable 形参记号($changed / $changed\N 转义形态)
+#   $stable  — Compose 稳定性记号
+#   $-       — R8/D8 desugaring 合成 lambda 标记($-feat-$-lambda-... 形态)
+_SKIP_STRING_PREFIXES = (
+    '$i$f$', '$i$a$', '$this$', '$changed', '$stable', '$-',
+)
+
+
+def is_instrumentation_string(plain: str) -> bool:
+    """编译器调试/内联标记串判定:命中即跳过加密(保留明文,不占 idx)。"""
+    return plain.startswith(_SKIP_STRING_PREFIXES)
+
+
 # ── 解密桩模板(纯 Java,无 so 依赖,无 <clinit> 外部依赖) ─────────────
 STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
 .super Ljava/lang/Object;
@@ -111,19 +136,51 @@ STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
 # payload  : Base64( idx_be24 || cipher ); decrypt at runtime and intern()
 
 .field private static final SALT_B64:Ljava/lang/String; = "%SALT%"
+# 性能优化(2026-09 对比实验):旧版每解一条字符串都重新
+# MessageDigest.getInstance("SHA-256")(JCA Provider 查找)+ Base64.decode(SALT),
+# 全量规则下首次解密风暴被放大数十倍。改为 <clinit> 初始化一次、全场复用:
+#   SALT    — SALT_B64 解出的字节数组(xor() 直接 sget)
+#   DIGEST  — 复用的 MessageDigest 实例(digest() 完成后自动 reset,可连续用)
+# 算法与密钥流不变:ks_block(j) = SHA-256( SALT || idx_be24 || byte(j) ),旧密文
+# 与新密文(同一 SALT)全部可解。注意 <clinit> 顺序:必须先初始化 SALT/DIGEST
+# 再执行 %CLINIT_FILL%(回填链会立刻调用 d() → xor() 消费这两个字段)。
+.field private static final SALT:[B
+.field private static final DIGEST:Ljava/security/MessageDigest;
 %FIELDS%
 .field private static final CACHE:Ljava/util/concurrent/ConcurrentHashMap;
 
 
 # direct methods
 .method static constructor <clinit>()V
-    .registers 2
+    .registers 3
+
     new-instance v0, Ljava/util/concurrent/ConcurrentHashMap;
 
     invoke-direct {v0}, Ljava/util/concurrent/ConcurrentHashMap;-><init>()V
 
     sput-object v0, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
 
+    # SALT = Base64.decode(SALT_B64) —— 一次性初始化(见字段区性能注释)
+    sget-object v0, Lcom/nc/strdec/StrDec;->SALT_B64:Ljava/lang/String;
+
+    const/4 v1, 0x2
+
+    invoke-static {v0, v1}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B
+
+    move-result-object v0
+
+    sput-object v0, Lcom/nc/strdec/StrDec;->SALT:[B
+
+    # DIGEST = MessageDigest.getInstance("SHA-256") —— 一次性初始化
+    const-string v0, "SHA-256"
+
+    invoke-static {v0}, Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;
+
+    move-result-object v0
+
+    sput-object v0, Lcom/nc/strdec/StrDec;->DIGEST:Ljava/security/MessageDigest;
+
+    # 必须在 SALT/DIGEST 就绪之后再执行回填链(它们会立刻触发 d()→xor())
 %CLINIT_FILL%
     return-void
 .end method
@@ -232,19 +289,11 @@ STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
 
     new-array v2, v1, [B
 
-    const-string v3, "SHA-256"
+    # 复用 <clinit> 初始化的实例/字段(性能优化,见字段区注释)。
+    # digest() 返回后内部自动 reset,下一次 update 系列调用即干净状态。
+    sget-object v3, Lcom/nc/strdec/StrDec;->DIGEST:Ljava/security/MessageDigest;
 
-    invoke-static {v3}, Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;
-
-    move-result-object v3
-
-    sget-object v4, Lcom/nc/strdec/StrDec;->SALT_B64:Ljava/lang/String;
-
-    const/4 v5, 0x2
-
-    invoke-static {v4, v5}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B
-
-    move-result-object v4
+    sget-object v4, Lcom/nc/strdec/StrDec;->SALT:[B
 
     const/4 v5, 0x0
 
@@ -954,6 +1003,10 @@ def process_file(path: str, cls_desc: str, includes, excludes,
                 continue
             if idx > IDX_MAX:
                 raise SystemExit(f'❌ 加密字符串数超过 {IDX_MAX}(idx 3 字节上限),请缩小规则范围')
+            if is_instrumentation_string(fplain):
+                # 编译器调试/内联标记:保留明文字面量,不登记回填(见常量区说明)
+                out.append(line)
+                continue
             field_name = f'F{idx:06d}'          # 用全局 idx 命名,跨类天然唯一
             stub_fields.append((field_name, encrypt_payload(salt, idx,
                                                             fplain.encode('utf-8'))))
@@ -1009,6 +1062,10 @@ def process_file(path: str, cls_desc: str, includes, excludes,
 
         if idx > IDX_MAX:
             raise SystemExit(f'❌ 加密字符串数超过 {IDX_MAX}(idx 3 字节上限),请缩小规则范围')
+        if is_instrumentation_string(plain):
+            # 编译器调试/内联标记:保留明文 const-string(见常量区说明)
+            out.append(line)
+            continue
 
         payload = encrypt_payload(salt, idx, plain.encode('utf-8'))
         jumbo = m.group('jumbo') or ''
