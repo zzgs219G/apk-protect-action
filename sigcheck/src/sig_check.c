@@ -41,7 +41,9 @@
  * 方案:LOGD/LOGI/LOGE 在原 logcat 输出之外,同步追加写入应用外部目录文件。
  *
  * 开关(哨兵文件,运行时生效,无需重编译/重装):
- *   /storage/emulated/0/sigcheck_debug   存在 → 写文件日志
+ *   /storage/emulated/0/xixin_debug   存在 → 写文件日志
+ *   (2026-xx 用户要求统一改名:原 sigcheck_debug → xixin_debug,与 jian_box
+ *    普通 App 的崩溃日志开关共用同一文件名,用户只记一个开关)
  *   (放 sdcard 根而非 Android/data:MT 管理器等工具在 Android 11+ 也能直接建)
  * 日志输出:
  *   /storage/emulated/0/Android/data/<包名>/files/sigcheck_log.txt
@@ -54,7 +56,7 @@
 #include <sys/stat.h>
 #include <dlfcn.h>     /* 报错十四: dladdr/dlsym 定位本 so 真实路径 */
 
-#define SIGLOG_SENTINEL "/storage/emulated/0/sigcheck_debug"
+#define SIGLOG_SENTINEL "/storage/emulated/0/xixin_debug"
 
 static char siglog_path[512];   /* 日志文件完整路径,'' = 未探测 */
 static int  siglog_ready = -1;  /* -1 未探测, 0 开关关/不可用, 1 可写 */

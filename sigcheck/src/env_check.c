@@ -61,8 +61,8 @@ static void envlog_detect(void) {
     envlog_ready = 1;
     return;
 #endif
-    /* 哨兵与 sig_check 同一个:用户只建一个开关文件 */
-    if (access("/storage/emulated/0/sigcheck_debug", F_OK) != 0) return;
+    /* 哨兵与 sig_check 同一个:用户只建一个开关文件(2026-xx 改名 xixin_debug) */
+    if (access("/storage/emulated/0/xixin_debug", F_OK) != 0) return;
     {
         FILE *c = fopen("/proc/self/cmdline", "r");
         if (!c) return;
