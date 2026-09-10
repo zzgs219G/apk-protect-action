@@ -166,6 +166,12 @@ if [[ $WANT_DEX2C -eq 1 ]]; then
 fi
 
 # ── STEP 3: 组装 NDK 工程 → 编译 libnc.so ───────────────────────────
+# 报错二十三:stringenc 是纯 dex 层模块,不产出/不依赖任何 so。
+# 只勾 stringenc(或未来其它纯 dex 组合)时,STEP 3/4 必须整体跳过 ——
+# 否则 ndk_write_mk 会往一个从未创建的 jni/ 目录里 cat > Application.mk,
+# 报 "No such file or directory"(报错信息里的 tmp.XXX/project/jni 路径即此)。
+# 有 so 需求的组合:sigcheck / dex2c / envcheck 任一勾选。
+if [[ $WANT_SIGCHECK -eq 1 || $WANT_DEX2C -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
 log_step 3 6 "组装 NDK 工程"
 mkdir -p "$WORK/project"
 
@@ -218,6 +224,7 @@ ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一）�
 
 log_step 4 6 "NDK 编译"
 ndk_build "$WORK/project"
+fi   # 有 so 需求的组合才执行 STEP 3/4(报错二十三:纯 stringenc 组合跳过)
 
 # ── STEP 5: 解包 → smali 处理 → 放 so → 回编（全组合只做这一次） ────
 log_step 5 6 "解包注入重打包"
@@ -271,9 +278,12 @@ if [[ $WANT_STRINGENC -eq 1 ]]; then
     "$WORK/decompiled" "$STRING_RULES" "${STRING_ENC_ARGS[@]}"
 fi
 
-repack_install_so "$WORK/decompiled" "$WORK/project/libs"
-# 强制解压 so 加载（本方案唯一允许的 Manifest 修改）
-repack_force_extractnativelibs "$WORK/decompiled"
+if [[ $WANT_SIGCHECK -eq 1 || $WANT_DEX2C -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
+  repack_install_so "$WORK/decompiled" "$WORK/project/libs"
+  # 强制解压 so 加载（本方案唯一允许的 Manifest 修改）——只在有 so 的组合执行;
+  # 纯 dex 组合(仅 stringenc)没有 libnc.so,manifest 无需改写(报错二十三)
+  repack_force_extractnativelibs "$WORK/decompiled"
+fi
 repack_build "$WORK/decompiled" "$WORK/unsigned.apk"
 
 # ── 输出: zipalign（不签名！签名由开发者自行完成） ───────────────────
