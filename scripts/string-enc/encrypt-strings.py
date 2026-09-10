@@ -92,6 +92,11 @@ SYSTEM_CLASS_PREFIXES = (
     'com.google.android.', 'dalvik.', 'java.', 'javax.',
     'kotlin.', 'kotlinx.', 'org.jetbrains.',
     'org.apache.', 'org.json.', 'org.w3c.', 'org.xml.', 'sun.',
+    # xCrash(爱奇艺 native 崩溃/ANR 捕获库):其 Java 层与 native 层通过 JNI 回调
+    # 互相绑定(xcrash.NativeCrashHandler 的 native 方法 + callback),字符串或
+    # 类/方法名一旦被加密/改写 → 崩溃捕获失效甚至自身崩溃。属"框架依赖",必须在
+    # 规则层之上硬排除(与 kotlin./androidx. 同型)。前缀 'xcrash.' 覆盖其主包。
+    'xcrash.',
 )
 
 IDX_MAX = (1 << 24) - 1                      # idx 占 3 字节
@@ -285,15 +290,25 @@ STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
 
     add-int/lit8 v13, v5, 0x3
 
-    aget-byte v14, p0, v13
+    # ⚠️ 临时寄存器必须是【内层循环期间无依赖】的槽位,绝不能用 v14/v15:
+    #    `.registers 16` + 双参 `([BI)` ⇒ 参数固定落在末尾寄存器 p0=v14、p1=v15
+    #    (smali 规则:参数占最后 N 个寄存器)。旧版此处写 v14/v15 等价于直接改写
+    #    形参本身 —— 第 1 轮把数组引用 p0 覆盖成刚读出的字节(int),第 2 轮
+    #    `aget-byte v14, v14, v13` 就把这个 int 当数组引用解引用 ⇒ ART 只在
+    #    null 时抛 NPE、非 null 非法引用直接 SIGSEGV(原生崩溃,Java catch 不住)
+    #    ⇒ 任何 ≥2 字节的字符串解密即在 <clinit> 崩 → 闪退且无 FATAL 日志。
+    #    v7/v8 是安全槽:外层循环里它们只做 MessageDigest.update 的临时值,
+    #    进入内层时已死值,且每轮 `goto :loop_outer` 都会无条件重新赋值,
+    #    不存在读到上一轮残留的风险(v7/v8 在内层循环期间无人读)。
+    aget-byte v7, p0, v13
 
-    aget-byte v15, v10, v11
+    aget-byte v8, v10, v11
 
-    xor-int v14, v14, v15
+    xor-int v7, v7, v8
 
-    int-to-byte v14, v14
+    int-to-byte v7, v7
 
-    aput-byte v14, v2, v5
+    aput-byte v7, v2, v5
 
     add-int/lit8 v5, v5, 0x1
 
@@ -310,6 +325,134 @@ STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
     return-object v2
 .end method
 '''
+
+
+# ── 解密桩自检:参数寄存器不得被当临时槽覆盖(报错二十二) ──────────────
+#
+# 为什么需要它:桩的 xor 曾把内层循环临时寄存器写成 v14/v15,而 `.registers 16`
+# + 双参 `([BI)` 让 p0 恰好落在 v14、p1 落在 v15 ⇒ 指令静默改写形参本身,
+# 汇编通过、静态对拍也过(算法对),只有运行期才崩(SIGSEGV/无 FATAL 日志)。
+# "文字警告防不住文本级重写,只有机制能"——故把这条不变量做成构建期断言:
+# 桩模板展开后,任何一条【写】指令的目标寄存器都不得落在参数寄存器区间内。
+_NO_DEST_OPCODES = (
+    'invoke-', 'if-', 'goto', 'return', 'throw', 'nop', 'move-exception',
+    'monitor-', 'check-cast',          # check-cast 目标即源,不产生新值
+)
+_DEST_FIRST_RE = re.compile(
+    r'^(?P<op>[a-z][a-z0-9/\-]*)'
+    r'(?:\s+(?P<first>v\d+|p\d+))?')
+_METHOD_HDR_RE = re.compile(
+    r'^\.method\b[^\n]*?\b([A-Za-z_$][\w$]*|<init>|<clinit>)?\s*'
+    r'\((?P<args>[^)]*)\)[^\n]*$')
+_REGS_RE = re.compile(r'^[ \t]*\.(?P<kind>registers|locals)[ \t]+(?P<n>\d+)[ \t]*$')
+
+
+def _param_reg_count(arg_desc: str, is_static: bool) -> int:
+    """方法形参占用的寄存器数(J/D 占 2 个,this 占 1 个)。"""
+    n = 0 if is_static else 1
+    i = 0
+    while i < len(arg_desc):
+        c = arg_desc[i]
+        if c == 'L':
+            end = arg_desc.find(';', i)
+            if end < 0:
+                return -1
+            i = end + 1
+            n += 1
+        elif c == '[':
+            while i < len(arg_desc) and arg_desc[i] == '[':
+                i += 1
+            if i < len(arg_desc) and arg_desc[i] == 'L':
+                end = arg_desc.find(';', i)
+                if end < 0:
+                    return -1
+                i = end + 1
+            else:
+                i += 1
+            n += 1
+        elif c in 'JD':
+            n += 2
+            i += 1
+        elif c in 'ZBSCIF':
+            n += 1
+            i += 1
+        else:
+            return -1
+    return n
+
+
+def _check_stub_registers(smali_text: str) -> None:
+    """构建期断言:桩内无指令把参数寄存器当目标覆盖。违反即 fail-fast。"""
+    lines = smali_text.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        hdr = _METHOD_HDR_RE.match(line.strip()) if line.strip().startswith('.method') else None
+        if not hdr:
+            i += 1
+            continue
+        method = hdr.group(1) or '(anonymous)'
+        args = hdr.group('args')
+        is_static = bool(re.search(r'\bstatic\b', line))
+        nparams = _param_reg_count(args, is_static)
+        # 收集方法体到 .end method
+        j = i + 1
+        body = []
+        while j < n and not lines[j].strip() == '.end method':
+            body.append(lines[j])
+            j += 1
+        # 找 .registers / .locals
+        total = None
+        for bl in body:
+            m = _REGS_RE.match(bl)
+            if m:
+                total = int(m.group('n'))
+                break
+        if total is None or nparams < 0:
+            i = j + 1
+            continue
+        # 参数寄存器编号(限于 v 编号):p0..pK 映射到 v(total-nparams)..v(total-1)
+        param_lo = total - nparams        # 参数起始 v 编号
+        for bl in body:
+            s = bl.strip()
+            # 显示跳过:空行 / 指令外元素(.directive)/ label(:x)/ 注释(#)—— 注释里
+            # 出现 "aget-byte v14" 这类说明文字不得被当真实指令(否则说明文案会误伤自检)
+            if not s or s.startswith(('.', ':', '#')):
+                continue
+            op = s.split()[0]
+            if op.startswith(_NO_DEST_OPCODES):
+                continue
+            m = _DEST_FIRST_RE.match(s)
+            if not m:
+                continue
+            dst = m.group('first')
+            if not dst:
+                continue
+            if dst.startswith('p'):
+                raise SystemExit(
+                    f'❌ 解密桩自检失败:{method} 里 `{s}` 以参数寄存器 {dst} 为目标,\n'
+                    f'   汇编/运行期会静默覆盖形参(报错二十二:闪退且无 FATAL 日志)。\n'
+                    f'   请改用方法内确无依赖的局部寄存器槽。')
+            vnum = int(dst[1:])
+            if vnum >= param_lo:
+                raise SystemExit(
+                    f'❌ 解密桩自检失败:{method}(.registers {total}, 形参 {nparams} 个)里\n'
+                    f'   `{s}` 以 {dst} 为目标,而参数寄存器是 v{param_lo}..v{total-1}'
+                    f'(p0=v{param_lo})—— 相当于覆盖形参(报错二十二)。\n'
+                    f'   请改用方法内确无依赖的局部寄存器槽。')
+        i = j + 1
+
+
+def _render_stub(salt_b64: str, field_decls: str, clinit_fill: str) -> str:
+    """展开桩模板 + 自检。write_stub 走这里,保证任何路径都过校验。"""
+    content = (STUB_TEMPLATE
+               .replace('%GEN_MARK%', STUB_GEN_MARK)
+               .replace('%SALT%', salt_b64)
+               .replace('%FIELDS%', field_decls)
+               .replace('%CLINIT_FILL%', clinit_fill))
+    _check_stub_registers(content)
+    return content
+
 
 # ── smali 字符串字面量转义表(与 smali 汇编器的 unescape 对齐) ──────────
 _UNESCAPE = {
@@ -733,14 +876,11 @@ def write_stub(decompiled_dir: str, salt: bytes, stub_fields) -> str:
         f'\n    sput-object v0, {STUB_DESC}->{name}:Ljava/lang/String;\n'
         for name, _payload in stub_fields)
 
-    content = STUB_TEMPLATE.replace('%GEN_MARK%', STUB_GEN_MARK).replace(
-        '%SALT%', base64.b64encode(salt).decode('ascii'))
-    if stub_fields:
-        content = content.replace('%FIELDS%', field_decls)
-        content = content.replace('%CLINIT_FILL%', clinit_fill)
-    else:
-        content = content.replace('%FIELDS%', '')
-        content = content.replace('%CLINIT_FILL%', '')
+    # 走 _render_stub(内含寄存器自检,报错二十二):任何写桩路径都过校验
+    content = _render_stub(
+        base64.b64encode(salt).decode('ascii'),
+        field_decls if stub_fields else '',
+        clinit_fill if stub_fields else '')
     with open(stub_path, 'w', encoding='utf-8') as fp:
         fp.write(content)
     return stub_path
