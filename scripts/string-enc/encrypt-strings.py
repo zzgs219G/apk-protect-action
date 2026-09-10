@@ -680,10 +680,20 @@ _PAYLOAD_RE = re.compile(
     r'const-string(?:/jumbo)?[ \t]+(?:v\d+|p\d+)[ \t]*,[ \t]*"([^"\n]*)"\n'
     r'[ \t]*invoke-static(?:/range)? \{[^}\n]*\}, ' + re.escape(STUB_DESC) + r'->d\(')
 
-# 字段常量加密形态:.field ... = 本桩的 F\d+ 引用(报错二十式:续跑时字段 idx
-# 也要计入,否则新字段编号从 0 重来 → 相同 salt+idx → keystream 复用)
+# 字段常量回填引用(报错二十四改形态后):<clinit> 里的
+#   sget-object vX, 本桩 ->F\d+
+# (续跑时字段 idx 也要计入,否则新字段编号从 0 重来 → 相同 salt+idx →
+# keystream 复用。旧形态 `= StrDec;->F\d+:` 是报错二十四的非法 FIELD 型
+# static_value,已废弃,且被 _ILLEGAL_FIELD_INIT_RE 构建期断言拦截)
 _FIELD_REF_RE = re.compile(
-    r'= ' + re.escape(STUB_DESC) + r'->F(\d+):')
+    # 回填引用形态(报错二十四):<clinit> 里的 sget-object vX, StrDec;->FNNNNNN
+    r'sget-object[ \t]+(?:v\d+|p\d+),[ \t]*' + re.escape(STUB_DESC) + r'->F(\d+):')
+
+# 非法形态断言(报错二十四):.field 初值绝不允许是 StrDec 字段引用。
+# 该形态会被 smali 汇编成 FIELD 型(0x19) encoded static_value —— dex 规范
+# 不允许的初值类型,ART 类初始化阶段(字节码执行之前)即失败 → 秒闪退且无日志。
+_ILLEGAL_FIELD_INIT_RE = re.compile(
+    r'^[ \t]*\.field[^\n]*=[ \t]*' + re.escape(STUB_DESC) + r'->F\d+:', re.M)
 
 
 def is_system_class(cls_dot: str) -> bool:
@@ -710,7 +720,7 @@ def classify(cls_dot: str, cls_desc: str, includes, excludes) -> str:
 
 def max_existing_idx(content: str) -> int:
     """已加密类里出现过的最大 idx(续跑时接着编号,避免 keystream 复用)。
-    同时扫两类形态:指令密文(_PAYLOAD_RE)与字段引用(_FIELD_REF_RE)。"""
+    同时扫两类形态:指令密文(_PAYLOAD_RE)与回填引用(_FIELD_REF_RE)。"""
     biggest = -1
     for m in _PAYLOAD_RE.finditer(content):
         try:
@@ -888,12 +898,14 @@ def write_stub(decompiled_dir: str, salt: bytes, stub_fields) -> str:
 
 def process_file(path: str, cls_desc: str, includes, excludes,
                  exclude_methods, salt: bytes, next_idx: int):
-    """就地加密一个 .smali 文件。返回 (改动字符串数, 新 next_idx)。"""
+    """就地加密一个 .smali 文件。返回 (改动字符串数, 新 next_idx, stub_fields, field_backfills)。
+    stub_fields: [(桩字段名, 密文)](写进桩 <clinit> 的密文常量);
+    field_backfills: [{stub_field, owner_cls, field, type}](需要回填的目标字段)。"""
     with open(path, encoding='utf-8') as fp:
         content = fp.read()
     if CLASS_MARK in content:
         # 幂等:整类已处理。但仍要把它用过的 idx 计入,续跑时不重复编号
-        return 0, max(next_idx, max_existing_idx(content) + 1), []
+        return 0, max(next_idx, max_existing_idx(content) + 1), [], []
 
     lines = content.split('\n')
     out = []
@@ -901,6 +913,7 @@ def process_file(path: str, cls_desc: str, includes, excludes,
     hits = 0
     idx = next_idx
     stub_fields = []          # 需要生成的桩字段: [(字段名, 密文)]
+    field_backfills = []      # 报错二十四:<clinit> 回填登记
     li = 0
     n_lines = len(lines)
     while li < n_lines:
@@ -923,8 +936,13 @@ def process_file(path: str, cls_desc: str, includes, excludes,
             continue
 
         # R8 折叠的 static final String 常量: .field ... = "明文"
-        # 改为引用解密桩的静态字段,桩的 <clinit> 运行期解密。
-        # (这类字面量不在 const-string 指令里,必须单独处理)
+        # (报错二十四)字段初值【保持原字面量不动】—— 绝不允许改成
+        # `= StrDec;->FNNNNNN` 引用形态:那会被汇编成 FIELD 型(0x19)
+        # encoded static_value,dex 规范不允许 → ART 类初始化阶段
+        # (字节码执行之前)即失败,秒闪退且无任何日志。
+        # 明文的"隐藏"改由回填实现:在所属类 <clinit> 里注入
+        # sget-object(桩字段) + sput-object(本字段),运行期用解密结果
+        # 覆盖字面量初值。桩自身 <clinit> 填 F 字段用的就是同一套合法形态。
         fparsed = parse_field_string(line)
         if fparsed and cur_method is None:
             fm, fliteral, ftail = fparsed
@@ -939,10 +957,15 @@ def process_file(path: str, cls_desc: str, includes, excludes,
             field_name = f'F{idx:06d}'          # 用全局 idx 命名,跨类天然唯一
             stub_fields.append((field_name, encrypt_payload(salt, idx,
                                                             fplain.encode('utf-8'))))
-            # 保留 .field 声明与修饰符,把初值换成桩字段引用
-            out.append(f'{fm.group("indent")}.field{fm.group("mid")}'
-                       f'{fm.group("name")}:{fm.group("type")} = '
-                       f'{STUB_DESC}->{field_name}:{fm.group("type")}{ftail}')
+            # 原字段行原样保留(初值仍是明文字面量,产物形态合法);
+            # 回填信息交给 main() 在 <clinit> 注入时消费
+            out.append(line)
+            field_backfills.append({
+                'stub_field': field_name,
+                'owner_cls': cls_desc,           # Lcom/x/Y; 形式
+                'field': fm.group('name'),
+                'type': fm.group('type'),
+            })
             idx += 1
             hits += 1
             continue
@@ -1010,7 +1033,7 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         # 没有新加密,但可能只命中了"已加密条目跳过"分支(类标记丢失 +
         # 三行形态)—— 此时 idx 已被续到旧密文之后,必须带回去,
         # 否则续跑时新条目从 0 编号 → keystream 复用(报错二十式)
-        return 0, max(next_idx, idx), []
+        return 0, max(next_idx, idx), [], []
 
     # 插幂等标记注释(注释不进 dex)
     final = []
@@ -1022,7 +1045,79 @@ def process_file(path: str, cls_desc: str, includes, excludes,
             marked = True
     with open(path, 'w', encoding='utf-8') as fp:
         fp.write('\n'.join(final))
-    return hits, idx, stub_fields
+    return hits, idx, stub_fields, field_backfills
+
+
+def inject_clinit_backfills(path: str, backfills) -> bool:
+    """报错二十四:在 path 所属类的 <clinit> 末尾(return-void 之前)注入回填链:
+
+        sget-object vX, Lcom/nc/strdec/StrDec;->FNNNNNN:Ljava/lang/String;
+        sput-object vX, <owner>;-><field>:<type>
+
+    运行期类初始化时用解密结果覆盖字面量初值 —— 这是 dex 规范允许的唯一
+    "运行期算字段值"形态(桩自身 <clinit> 填 F 字段即此形态)。
+    <clinit> 不存在则新建(.locals 1,寄存器只占 v0,恒在 35c/21c 上限内)。
+    返回是否发生了注入。"""
+    with open(path, encoding='utf-8') as fp:
+        content = fp.read()
+
+    # 组装注入体(全部走 v0 —— 回填链内部自依赖,任何 <clinit> 都容得下一个 v0;
+    # 已有 <clinit> 的 .locals 可能是 0,新建时用 1,已有时若 .locals 0 需抬到 1)
+    lines = content.split('\n')
+    clinit_idx = None          # '.method static constructor <clinit>()V' 行号
+    clinit_end = None          # 对应 '.end method' 行号
+    clinit_locals = None
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith('.method') and 'constructor' in s and '<clinit>' in s:
+            clinit_idx = i
+            # 找 .locals / .registers 与方法结束
+            for j in range(i + 1, len(lines)):
+                sj = lines[j].strip()
+                mloc = re.match(r'\.(?:registers|locals)[ \t]+(\d+)$', sj)
+                if mloc and clinit_locals is None:
+                    clinit_locals = int(mloc.group(1))
+                if sj == '.end method':
+                    clinit_end = j
+                    break
+            break
+    has_clinit = clinit_idx is not None and clinit_end is not None
+
+    fill_lines = []
+    for bf in backfills:
+        fill_lines.append(
+            f'    sget-object v0, {STUB_DESC}->{bf["stub_field"]}:{bf["type"]}')
+        fill_lines.append(
+            f'    sput-object v0, {bf["owner_cls"]}->{bf["field"]}:{bf["type"]}')
+
+    if has_clinit:
+        if clinit_locals is not None and clinit_locals < 1:
+            # <clinit> .locals 0 也要用 v0 → 抬到 1
+            for j in range(clinit_idx, clinit_end):
+                if re.match(r'[ \t]*\.(?:registers|locals)[ \t]+0[ \t]*$', lines[j]):
+                    lines[j] = lines[j].replace('0', '1', 1)
+                    break
+        # 找 <clinit> 里的 return-void,插到它之前(若无 return-void 则插到末尾)
+        insert_at = clinit_end
+        for j in range(clinit_end - 1, clinit_idx, -1):
+            if lines[j].strip() == 'return-void':
+                insert_at = j
+                break
+        lines[insert_at:insert_at] = fill_lines
+    else:
+        # 无 <clinit> → 在类体末尾追加一个最小的
+        lines.append('')
+        lines.append('.method static constructor <clinit>()V')
+        lines.append('    .locals 1')
+        lines.append('')
+        lines.extend(fill_lines)
+        lines.append('')
+        lines.append('    return-void')
+        lines.append('.end method')
+
+    with open(path, 'w', encoding='utf-8') as fp:
+        fp.write('\n'.join(lines))
+    return True
 
 
 def main() -> int:
@@ -1082,6 +1177,7 @@ def main() -> int:
     total_str, total_cls, idx = 0, 0, 0
     skipped_system = skipped_excluded = skipped_stub = 0
     all_stub_fields = []
+    all_backfills = []
     for path in sorted(iter_smali_files(args.decompiled)):
         with open(path, encoding='utf-8') as fp:
             content = fp.read()
@@ -1101,12 +1197,18 @@ def main() -> int:
         if verdict == 'stub':
             skipped_stub += 1
             continue
-        n, idx, fields = process_file(path, cls_desc, includes, excludes,
-                                     exclude_methods, salt, idx)
+        n, idx, fields, backfills = process_file(path, cls_desc, includes, excludes,
+                                                 exclude_methods, salt, idx)
         if n:
             total_str += n
             total_cls += 1
             all_stub_fields.extend(fields)
+            if backfills:
+                all_backfills.extend(backfills)
+                # 报错二十四:字段初值已是合法明文字面量,回填走 <clinit>
+                # (同文件立即注入 —— process_file 已重写并加幂等标记,
+                #  这里重读注入,两条链互不干扰)
+                inject_clinit_backfills(path, backfills)
 
     if need_write_stub and total_str > 0:
         stub_path = write_stub(args.decompiled, salt, all_stub_fields)
@@ -1117,7 +1219,7 @@ def main() -> int:
                   f'{f", 字段常量 {len(all_stub_fields)} 个" if all_stub_fields else ""})')
     elif total_str > 0 and all_stub_fields:
         # 复用已有桩但本次产生了新字段(报错二十式):旧字段+新字段合并重写桩。
-        # 旧桩若缺字段声明,类里的 ->F\d+: 引用会汇编失败/运行期取到 null。
+        # 旧桩若缺字段声明,类里 <clinit> 的 sget-object ->F\d+: 引用会汇编失败/运行期取到 null。
         old_fields = read_existing_stub_fields(args.decompiled)
         merged = {name: payload for name, payload in old_fields}
         for name, payload in all_stub_fields:
@@ -1132,6 +1234,27 @@ def main() -> int:
             print(f'  🔧 重写解密桩(合并字段): 新 {len(all_stub_fields)} 个,'
                   f' 保留旧 {len(old_fields)} 个, 共 {len(combined)} 个')
     # need_write_stub 但一条都没加密 → 不注入桩(不给产物塞无用类,且省掉 dex 内新类)
+
+    # 报错二十四 构建期防线:任何产物 .field 初值都不允许是 StrDec 字段引用
+    # (FIELD 型 0x19 encoded static_value,ART 类初始化即失败 → 秒闪退无日志)。
+    # 此前版本曾把字段初值改写成该形态且 apktool 编译器宽容放行,教训:
+    # 汇编器宽容 ≠ 产物合法。每次跑完都复读全包做硬断言,违反即 fail-fast。
+    illegal = []
+    for cls_path in iter_smali_files(args.decompiled):
+        try:
+            with open(cls_path, encoding='utf-8') as fp:
+                c = fp.read()
+        except OSError:
+            continue
+        if _ILLEGAL_FIELD_INIT_RE.search(c):
+            illegal.append(cls_path)
+    if illegal:
+        sample = os.path.relpath(illegal[0], args.decompiled)
+        raise SystemExit(
+            f'❌ 构建期断言失败:{len(illegal)} 个文件出现非法字段初值形态 '
+            f'(.field ... = {STUB_DESC}->F...):\n   {sample}\n'
+            f'   该形态会被汇编成 FIELD 型(0x19) static_value,ART 类初始化即闪退'
+            f'(报错二十四)。字段常量回填必须走 <clinit> 的 sget/sput 链。')
 
     if not args.quiet:
         if activity_mode:
