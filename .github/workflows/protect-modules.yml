@@ -1,7 +1,7 @@
 name: APK加固-模块勾选
 
 # 勾选式统一入口：想加固哪些模块就勾选哪些，执行顺序由 protect.sh 固定为
-#   签名校验 → Dex2C → 基础加壳（加壳必须最后，加了壳其它模块改不动）
+#   签名校验 → Dex2C → 字符串加密 → 基础加壳（加壳必须最后，加了壳其它模块改不动）
 # 旧 workflow（签名校验/签名校验-单独/dex2c/APK加固）已移除，本入口为唯一入口。
 
 on:
@@ -20,6 +20,14 @@ on:
         default: false
       dex2c_rules:
         description: 'Dex2C 类名规则(每行一条,支持 com.test.** / activity*;联合签名校验时可留空)'
+        required: false
+        default: ''
+      stringenc:
+        description: '勾选: 字符串加密(dex 层,与 so 无关;必须填规则)'
+        type: boolean
+        default: false
+      string_rules:
+        description: '字符串加密类名规则(每行一条,语法同 dex2c_rules;勾选 stringenc 时必填)'
         required: false
         default: ''
       envcheck:
@@ -75,7 +83,12 @@ jobs:
             echo "❌ 单独勾选 Dex2C 必须提供类名规则(dex2c_rules);或同时勾选签名校验以自动抽取主类"
             ok=0
           fi
-          if [[ "${{ inputs.sigcheck }}" != "true" && "${{ inputs.dex2c }}" != "true" && "${{ inputs.packer }}" != "true" && "${{ inputs.envcheck }}" != "true" ]]; then
+          # 字符串加密必须显式给出范围(没有"自动抽主类"的兜底)
+          if [[ "${{ inputs.stringenc }}" == "true" && -z "${{ inputs.string_rules }}" ]]; then
+            echo "❌ 勾选字符串加密必须填写类名规则(string_rules)"
+            ok=0
+          fi
+          if [[ "${{ inputs.sigcheck }}" != "true" && "${{ inputs.dex2c }}" != "true" && "${{ inputs.packer }}" != "true" && "${{ inputs.envcheck }}" != "true" && "${{ inputs.stringenc }}" != "true" ]]; then
             echo "❌ 至少勾选一个模块"
             ok=0
           fi
@@ -97,7 +110,17 @@ jobs:
           printf '%s\n' "$RULES" > dex2c_rules.txt
           cat dex2c_rules.txt | tee -a build.log
 
-      - name: 执行模块编排（固定顺序-签名校验-Dex2C-加壳）
+      - name: 生成字符串加密规则文件
+        if: ${{ inputs.stringenc && inputs.string_rules != '' }}
+        env:
+          # 同样经 env 中转(命令注入面)
+          RULES: ${{ inputs.string_rules }}
+        run: |
+          printf '%s\n' "$RULES" > string_rules.txt
+          echo "=== 字符串加密规则 ===" | tee -a build.log
+          cat string_rules.txt | tee -a build.log
+
+      - name: 执行模块编排（固定顺序-签名校验-Dex2C-字符串加密-加壳）
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
@@ -111,6 +134,7 @@ jobs:
               ARGS="$ARGS --dex2c"   # 联合 sigcheck,protect.sh 内自动抽主类
             fi
           fi
+          if [[ "${{ inputs.stringenc }}" == "true" ]]; then ARGS="$ARGS --stringenc string_rules.txt"; fi
           if [[ "${{ inputs.envcheck }}" == "true" ]]; then ARGS="$ARGS --envcheck"; fi
           if [[ "${{ inputs.packer }}" == "true" ]]; then ARGS="$ARGS --packer"; fi
           set -o pipefail
