@@ -9,11 +9,17 @@
 #   ⑤ 幂等: 再跑一次,产物字节完全一致
 #   ⑥ 种子复用: 第二次跑读回第一次的种子(不重新生成)
 #   ⑦ 解密正确性: 用编译桩解真实产物里的密文, 还原出原文
+#   ⑧ 桩【真过 apktool 汇编】(报错二十七): 注入后的 smali 必须能被 apktool
+#      真正汇编成 dex —— 文本断言(含真种子/零哨兵)拦不住"文件被腰斩"这类
+#      结构损坏, 只有真汇编才暴露(历史: mismatched input '' expecting
+#      END_METHOD_DIRECTIVE)
 set -euo pipefail
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _ENC="$(dirname "$_HERE")/encrypt-strings.py"
 _BUILD="$(dirname "$_HERE")/build-stub.sh"
+_ROOT="$(dirname "$(dirname "$(dirname "$_HERE")")")"   # tests → string-enc → scripts → 仓库根
+APKTOOL="${_ROOT}/build/dcc/dcc/tools/apktool.jar"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -71,6 +77,32 @@ chk "桩含真种子" "grep -q 'SEED:J = 0x${SEED}L' '$STUB'"
 chk "桩零哨兵残留" "! grep -qi '5eed' '$STUB'"
 chk "桩无 .line/.source" "! grep -qE '^\s*\.(line|source)' '$STUB'"
 chk "桩无占位符残留" "! grep -q '%' '$STUB'"
+# ⑧ 结构完整性(报错二十七): 注入是逐值替换, 桩的 .method / .end method 必须成对。
+# 历史缺陷把文件腰斩到方法中途(EOF), 上面那些"含真种子/零哨兵"断言照样通过 ——
+# 只有结构断言与真汇编能拦住。
+chk "桩方法区间闭合(.method/.end method 成对)" \
+    "[ \"\$(grep -c '^\s*\.method' '$STUB')\" = \"\$(grep -c '^\s*\.end method' '$STUB')\" ]"
+chk "桩含 d()/keyByte()/mix64() 三个方法(S2 骨架未被截断)" \
+    "[ \"\$(grep -c '^\s*\.method' '$STUB')\" -ge 4 ]"
+chk "桩不含内联哨兵变体(high16 低 48 位约束)" \
+    "! grep -qE 'const-wide/high16\s+v[0-9]+, 0x${SEED}L' '$STUB'"
+
+# ⑨ 真汇编闭环(报错二十七): 把桩所在目录交给 apktool 汇编。
+# apktool 缺失(如精简环境)则明确 skip, 不伪绿。
+if [ -f "$APKTOOL" ]; then
+  mkdir -p "$WORK/assemble/smali"
+  cp -r "$WORK/decompiled/smali/." "$WORK/assemble/smali/"
+  printf 'version: 2.9.3\n' > "$WORK/assemble/apktool.yml"
+  if java -jar "$APKTOOL" b "$WORK/assemble" -o "$WORK/assemble.apk" >"$WORK/assemble.log" 2>&1; then
+    chk "桩真过 apktool 汇编(报错二十七)" "true"
+  else
+    echo "  ❌ 桩真过 apktool 汇编(报错二十七) —— apktool 报错:"
+    grep -vE '^I:' "$WORK/assemble.log" | head -5 | sed 's/^/     /'
+    fail=$((fail+1))
+  fi
+else
+  echo "  ⏭  跳过 apktool 真汇编(未找到 $APKTOOL)"
+fi
 
 echo
 echo "══ 第 2 次运行(幂等: 不指定种子)══"
