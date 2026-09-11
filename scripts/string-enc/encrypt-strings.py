@@ -236,39 +236,75 @@ def inject_stub_seed(skeleton: str, seed_word: str) -> str:
     """把骨架里的哨兵种子【双锚点同时】改写为真种子。
 
     seed_word: smali 长整型字面量(如 '0x1a2b3c4d5e6f7a8bL')。
-    改写后再次自检:两处锚点都等于真种子、内联锚点数量守恒 —— 任一不满足即
-    fail-fast,绝不让"半注入"的桩进产物(那是静默乱码,不是崩溃,更难查)。
+    改写后再次自检:两处锚点都等于真种子、内联锚点数量守恒、骨架行数守恒 ——
+    任一不满足即 fail-fast,绝不让"半注入/被截断"的桩进产物(那是静默乱码、
+    或下游 apktool 汇编失败,都不在当场暴露,更难查;见报错二十七)。
     """
     fm, inlines = find_stub_seed_anchors(skeleton)
     n_inline = len(inlines)
+    n_lines = len(skeleton.split('\n'))
     sentinel = SENTINEL_SEED.rstrip('Ll').lower()
+    seed_int = int(seed_word.rstrip('Ll'), 16)
 
     # 锚点 1:字段初值行(保留缩进,只换值)
     skeleton = skeleton[:fm.start('val')] + seed_word + skeleton[fm.end('val'):]
 
     # 锚点 2:全部内联常量。d8 可能内联到多处,按其实际出现次数全改。
     # 倒序替换,避免前面的替换使后面的 offset 失效。
-    # 同时丢弃行尾的十进制浮点注释(那是 d8 为旧值生成的,值变了即无意义)。
+    #
+    # 【必须整行重建,不能只换字面量 —— 两个坑都在这里(报错二十七)】
+    # 坑 A(指令变体):d8 为哨兵种子 0x5eed000000000000 选的变体是
+    #   `const-wide/high16`,该形态只接受"低 48 位全为 0"的字面量;真种子是任意
+    #   64 位随机数,只换数字会让这条指令非法(smali: Invalid literal value:
+    #   Low 48 bits must be zeroed out)。故按新值重选变体:装不下即折回无后缀
+    #   `const-wide`(可编码任意 64 位)。
+    # 坑 B(文件截断):替换范围只能到【行尾】。m.start()..m.end() 不含换行,
+    #   行尾之后的内容必须原样保留 —— 曾经把 m.end() 之后的文本整段丢弃,骨架
+    #   被腰斩成 92 行(方法中途 EOF),下游 apktool 报
+    #   `mismatched input '' expecting END_METHOD_DIRECTIVE`。
+    #   顺带:m.end() 覆盖了行尾的十进制浮点注释(d8 为旧值生成的),它随整段
+    #   一起被丢弃,无需单独判断。
+    def _fits(variant, value):
+        """该指令变体能否编码 value(无后缀 const-wide 恒可)。"""
+        if variant == '/high16':
+            return (value & 0x0000FFFFFFFFFFFF) == 0
+        if variant == '/16':
+            return -0x8000 <= value <= 0xFFFF
+        return True
+
     for m in reversed(list(_INLINE_SEED_RE.finditer(skeleton))):
         if m.group('val').rstrip('Ll').lower() != sentinel:
             continue
-        keep_tail = '' if m.group('tail') is None else skeleton[m.end():]
-        if m.group('tail') is not None:
-            keep_tail = ''                       # d8 的浮点注释已失效 → 丢弃
-        skeleton = skeleton[:m.start('val')] + seed_word + keep_tail
+        variant = m.group('variant') or ''
+        op = 'const-wide' if not _fits(variant, seed_int) else 'const-wide' + variant
+        line = f"{m.group('indent')}{op} {m.group('reg')}, {seed_word}"
+        skeleton = skeleton[:m.start('indent')] + line + skeleton[m.end():]
 
     # 终检 1:哨兵种子必须一处不剩(残留 = 漏改,运行期会用到旧种子)
     if sentinel in skeleton.lower():
         raise SystemExit(
             f'❌ 桩种子注入终检失败:骨架里仍残留哨兵种子 {SENTINEL_SEED}\n'
             f'   (说明有锚点未被改写;绝不能带着哨兵进产物)')
-    # 终检 2:改后锚点数量与改写前一致(注入不得改变骨架结构)
-    _, inl2 = find_stub_seed_anchors(skeleton, expect_sentinel=False)
-    if len(inl2) != n_inline:
+    # 终检 2:改写前"值等于哨兵的锚点数"必须等于改写后"值等于真种子的锚点数"。
+    # 必须用同一个口径(按值数)对比:若拿"所有 const-wide 行数"去数,会把 GAMMA
+    # 等无关常量算进来 —— 旧实现在这里恰好与截断互相抵消(截断吃掉 3 条无关
+    # const-wide/16 后,1 == 1 照样通过),破损桩因此静默进了产物(报错二十七)。
+    _, all_after = find_stub_seed_anchors(skeleton, expect_sentinel=False)
+    n_after = sum(1 for m in all_after
+                  if m.group('val').rstrip('Ll').lower() == seed_word.rstrip('Ll').lower())
+    if n_after != n_inline:
         raise SystemExit(
-            f'❌ 桩种子注入终检失败:内联锚点数量从 {n_inline} 变为 {len(inl2)}\n'
+            f'❌ 桩种子注入终检失败:内联锚点数量从 {n_inline} 变为 {n_after}\n'
             f'   (注入改坏了骨架结构,拒绝写入产物)')
-    # 终检 3:字段初值必须确已变为真种子
+    # 终检 3:结构完整性 —— 注入是逐值替换,骨架行数必须严格守恒。
+    # 这一条直接拦住"替换范围越界把文件吞掉"的形态(报错二十七):截断后的骨架
+    # 仍能通过锚点/哨兵残留检查,却能通过汇编阶段才炸(方法中途 EOF)。
+    if len(skeleton.split('\n')) != n_lines:
+        raise SystemExit(
+            f'❌ 桩种子注入终检失败:骨架行数从 {n_lines} 变为 '
+            f'{len(skeleton.split(chr(10)))} —— 注入吞掉了骨架内容(截断)。\n'
+            f'   检查内联锚点的替换范围是否只覆盖到行尾。')
+    # 终检 4:字段初值必须确已变为真种子
     fm3, _ = find_stub_seed_anchors(skeleton, expect_sentinel=False)
     if fm3.group('val').rstrip('Ll').lower() != seed_word.rstrip('Ll').lower():
         raise SystemExit(
