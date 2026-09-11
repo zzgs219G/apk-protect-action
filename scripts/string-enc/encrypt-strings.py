@@ -143,7 +143,7 @@ STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
 #   DIGEST  — 复用的 MessageDigest 实例(digest() 完成后自动 reset,可连续用)
 # 算法与密钥流不变:ks_block(j) = SHA-256( SALT || idx_be24 || byte(j) ),旧密文
 # 与新密文(同一 SALT)全部可解。注意 <clinit> 顺序:必须先初始化 SALT/DIGEST
-# 再执行 %CLINIT_FILL%(回填链会立刻调用 d() → xor() 消费这两个字段)。
+# 再执行回填链(回填链会立刻调用 d() → xor() 消费这两个字段,见 <clinit> 内标记)。
 .field private static final SALT:[B
 .field private static final DIGEST:Ljava/security/MessageDigest;
 %FIELDS%
@@ -181,6 +181,10 @@ STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
     sput-object v0, Lcom/nc/strdec/StrDec;->DIGEST:Ljava/security/MessageDigest;
 
     # 必须在 SALT/DIGEST 就绪之后再执行回填链(它们会立刻触发 d()→xor())
+    # ⚠️ 报错二十五防线:上面这行注释绝不许再写 CLINIT_FILL 的 %占位符% 形态 ——
+    #    %占位符% 只能出现在【非注释行】的独立占位行;曾因注释里出现该占位符
+    #    被 replace() 替换成真实指令,注入到类体顶层(非方法区)→ smali
+    #    `no viable alternative at input 'sget-object'` → 整个重打包失败。
 %CLINIT_FILL%
     return-void
 .end method
@@ -494,11 +498,41 @@ def _check_stub_registers(smali_text: str) -> None:
 
 def _render_stub(salt_b64: str, field_decls: str, clinit_fill: str) -> str:
     """展开桩模板 + 自检。write_stub 走这里,保证任何路径都过校验。"""
+    placeholders = ('%GEN_MARK%', '%SALT%', '%FIELDS%', '%CLINIT_FILL%')
+    # 防线 1(报错二十五):模板的注释行里绝不许出现占位符 —— replace() 不认
+    # 上下文,注释里的 %CLINIT_FILL% 会被替换成真实指令并注入类体顶层
+    # (非方法区)→ smali `no viable alternative at input 'sget-object'`。
+    for line in STUB_TEMPLATE.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('#') and any(p in line for p in placeholders):
+            raise SystemExit(
+                f'❌ 解密桩模板自检失败:注释行含占位符(报错二十五)——\n   {line}\n'
+                f'   占位符只允许出现在非注释行;注释里的占位符会被 replace() '
+                f'替换成真实指令并注入类体顶层,导致 smali 汇编失败。')
     content = (STUB_TEMPLATE
                .replace('%GEN_MARK%', STUB_GEN_MARK)
                .replace('%SALT%', salt_b64)
                .replace('%FIELDS%', field_decls)
                .replace('%CLINIT_FILL%', clinit_fill))
+    # 防线 2:渲染后不许残留任何占位符(placeholder 漏替换/多写一样拦)
+    for p in placeholders:
+        if p in content:
+            raise SystemExit(f'❌ 解密桩模板渲染后残留占位符 {p}(漏配 .replace?)')
+    # 防线 3(报错二十五):类体顶层(非 .method 区)不许出现真实指令。
+    # 走到这里说明占位符层面已干净,这条兜底拦住任何把指令注入非方法区的回归。
+    in_method = False
+    for line in content.split('\n'):
+        s = line.strip()
+        if s.startswith('.method'):
+            in_method = True
+        elif s == '.end method':
+            in_method = False
+        elif (in_method is False and s and not s.startswith(('.', '#'))
+              and not s.startswith(':')):
+            raise SystemExit(
+                f'❌ 解密桩自检失败:类体顶层出现非指令行外的裸指令 ——\n   {line}\n'
+                f'   指令只允许出现在 .method .. .end method 之间(报错二十五: '
+                f'%CLINIT_FILL% 曾被替换进类体顶层 → no viable alternative)。')
     _check_stub_registers(content)
     return content
 
