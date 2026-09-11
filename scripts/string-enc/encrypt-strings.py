@@ -29,27 +29,32 @@
 外加解密桩自身。`!` 排除行在非系统类范围内优先级最高;
 命中系统前缀的类无条件硬排除(与 classify 的实际判定顺序一致)。
 
-【算法(与 stub 里的 Java 实现必须逐字节一致,靠对拍测试锁定)】
-  salt        : 16 字节随机(os.urandom / secrets),构建期生成
-  payload     : Base64( idx_be24 || cipher )
-                idx = 本构建内该密文的唯一编号(3 字节大端,上限 16,777,215)
-  keystream   : ks_block(j) = SHA-256( salt || idx_be24 || byte(j) )
-                cipher[i] = plain[i] ^ ks_block(i // 32)[i % 32]
-  stub        : 注入 Lcom/nc/strdec/StrDec;,d(String) 解密并 intern()
+【算法 v2/S2(与 stub 里的 Java 实现必须逐字节一致,靠对拍测试锁定)】
+  seed        : 8 字节随机(secrets.token_bytes(8);--seed-hex 供复现)
+  payload     : Base64( offset_be24 || cipher )
+                offset = 本构建内该明文的 UTF-8 字节在'全包虚拟密钥流'里的起始下标
+  keystream   : splitmix64 现算,O(1) 取第 i 个字节(零表,见 §3.3)
+                key_byte(seed, i) = (mix64(seed + (i>>3)*GAMMA) >> ((i&7)*8)) & 0xFF
+                cipher[k] = plain[k] ^ key_byte(seed, offset + k)
+  stub        : 注入 Lcom/nc/strdec/StrDec;,d(String) 解密(纯 XOR + UTF-8)
+  分配器      : 全包按顺序为每条密文分配不重叠区段 [offset, offset+len)
+
+  【与 v1 的关系】v1 运行期每条做 N 次 SHA-256 派生密钥,全包 1.3 万条在
+  debuggable 下把冷启动首帧卡死。S2 把密钥"生产"变成纯算术现算(纳秒级),
+  全包仅 1 个解密方法、0 张表、只存 8 字节种子。
 
 【幂等】
   * 已加密的类插入了标记注释 `# nc-strdec-encrypted`(注释不进 dex),
     重跑时整类跳过,输出稳定。
-  * 桩文件已存在时:解析回其中的 SALT_B64 继续使用,保证旧密文仍可解;
+  * 桩文件已存在时:解析回其中的 SEED 继续使用,保证旧密文仍可解;
     若不是本工具生成的同名文件则 fail-fast,拒绝覆盖用户代码。
 
 用法:
   encrypt-strings.py <解包目录> <规则文件> [--classes 类列表] \\
-                     [--exclude-methods compiled_methods.txt] [--salt-hex HEX]
+                     [--exclude-methods compiled_methods.txt] [--seed-hex HEX]
 """
 import argparse
 import base64
-import hashlib
 import importlib.util
 import json
 import os
@@ -82,7 +87,11 @@ SMALI_DIR_RE = _INJECT.SMALI_DIR_RE
 STUB_DESC = 'Lcom/nc/strdec/StrDec;'
 STUB_PKG_DIR = ('com', 'nc', 'strdec')
 STUB_FILE = 'StrDec.smali'
-STUB_GEN_MARK = '# nc-strdec-gen v1'          # 桩文件内的生成标记(识别"这是我们写的")
+STUB_GEN_MARK = '# nc-strdec-gen v2'          # 桩文件内的生成标记(识别"这是我们写的")
+# 解密主方法名 —— 「只盯最危险一步」的警报器只管这个方法(见 _check_stub_registers)
+STUB_DECRYPT_METHOD = 'd'
+STUB_SRC = 'stub-src/StrDec.java'             # 解密桩唯一源码真相(本脚本相对路径)
+STUB_D8_JAR = 'tools/d8.jar'                  # 固定版本 D8(报错六教训:工具版本漂移即翻车)
 CLASS_MARK = '# nc-strdec-encrypted'          # 已加密类的标记注释(幂等判定)
 COMPONENTS_FILE = 'stringenc-components.json'  # 组件标记(报错十八式:元数据 save/restore)
 
@@ -99,7 +108,7 @@ SYSTEM_CLASS_PREFIXES = (
     'xcrash.',
 )
 
-IDX_MAX = (1 << 24) - 1                      # idx 占 3 字节
+IDX_MAX = (1 << 24) - 1                      # idx/offset 占 3 字节(共享表上限同源)
 
 # ── 无价值串跳过:编译器生成的调试/内联标记(对比实验定性,2026-09) ────
 # 背景:用户全量规则加密 3438 类后 app"进不去且无日志",而第三方字符串加密
@@ -126,258 +135,160 @@ def is_instrumentation_string(plain: str) -> bool:
     return plain.startswith(_SKIP_STRING_PREFIXES)
 
 
-# ── 解密桩模板(纯 Java,无 so 依赖,无 <clinit> 外部依赖) ─────────────
-STUB_TEMPLATE = '''.class public final Lcom/nc/strdec/StrDec;
-.super Ljava/lang/Object;
-.source "StrDec.java"
+# ── 解密桩骨架(纯 Java 编译产物,零表零占位符) ────────────────────────
+#
+# 【SEED 双锚点注入契约(与 build-stub.sh 共同维护,勿单方面改)】
+# build-stub.sh 用哨兵种子 0x5EED000000000000 编译 StrDec.java,d8 的实测行为:
+#   ① 种子非 0 → smali 里保留 `.field private static final SEED:J = 0x...L`
+#   ② 同时把该常量【内联】到每个使用点(如 `const-wide/high16 v9, 0x...L`)
+# 所以种子必须【同时】改写这两处,且数量守恒:
+#   只改 .field → 运行期 d() 用的是内联常量,种子没生效;
+#   只改内联   → 复用桩时读不回种子,续跑时构建期/运行期不一致。
+# 两者不一致的后果:全包字符串乱码(且不是崩溃,是静默错误)。
+# 下面 SENTINEL_SEED 是与 build-stub.sh 约定的哨兵值。
+SENTINEL_SEED = '0x5eed000000000000L'
+
+_FIELD_SEED_RE = re.compile(
+    r'^(?P<indent>[ \t]*)\.field[ \t]+(?P<mid>[^\n]*?\bSEED:J[ \t]*)'
+    r'(?:=[ \t]*(?P<val>\S+))?[ \t]*$', re.M)
+# 内联常量:d8 视数值大小选 const-wide / const-wide/high16 / const-wide/16 变体
+_INLINE_SEED_RE = re.compile(
+    r'^(?P<indent>[ \t]*)const-wide(?P<variant>/\w+)?[ \t]+'
+    r'(?P<reg>[vp]\d+)[ \t]*,[ \t]*(?P<val>0x[0-9a-fA-F]+L?)[ \t]*(?P<tail>#[^\n]*)?$',
+    re.M)
+
+
+def load_stub_skeleton() -> str:
+    """加载 build-stub.sh 产出的桩骨架(无占位符,可直接汇编)。
+
+    骨架来源:build-stub.sh 对 stub-src/StrDec.java 跑 javac → d8 → baksmali
+    的产物(仓库内缓存为 stub-src/StrDec.smali)。smali 是中间产物、永不手写;
+    改算法只改 StrDec.java,然后重跑 build-stub.sh 刷新缓存。
+
+    本函数只做"骨架完整性"自检:SEED 字段锚点与内联锚点必须都存在且都等于
+    哨兵种子(否则说明 build-stub.sh 的哨兵策略被改动,注入契约已失效)。
+    """
+    tpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'stub-src', 'StrDec.smali')
+    try:
+        with open(tpl_path, encoding='utf-8') as fp:
+            tpl = fp.read()
+    except OSError as exc:
+        raise SystemExit(
+            f'❌ 桩骨架缺失: {tpl_path}({exc})\n'
+            f'   先运行 scripts/string-enc/build-stub.sh 生成(它把 '
+            f'{STUB_SRC} 编译为 smali)。')
+    find_stub_seed_anchors(tpl)      # 锚点自检(失败即抛 SystemExit)
+    # 防线(报错二十二):骨架必须过参数寄存器自检
+    _check_stub_registers(tpl)
+    # 防线(报错二十五):类体顶层(非 .method 区)不许出现裸指令。
+    # 骨架是编译产物,理论上不会违规;这条兜底拦住任何"把指令写进类体顶层"
+    # 的回归(该形态 smali 汇编器报 no viable alternative)。
+    in_method = False
+    for line in tpl.split('\n'):
+        s = line.strip()
+        if s.startswith('.method'):
+            in_method = True
+        elif s == '.end method':
+            in_method = False
+        elif (in_method is False and s and not s.startswith(('.', '#'))
+              and not s.startswith(':')):
+            raise SystemExit(
+                f'❌ 桩骨架自检失败:类体顶层出现裸指令 ——\n   {line}\n'
+                f'   指令只允许出现在 .method .. .end method 之间(报错二十五)。')
+    return tpl
+
+
+def find_stub_seed_anchors(content: str, expect_sentinel: bool = True):
+    """按结构定位骨架里的 SEED 锚点。
+    返回 (字段行 match, 内联常量 match 列表)。缺失即 fail-fast。
+
+    expect_sentinel=True:要求两处锚点的值都等于哨兵种子(校验"骨架是可信产物")。
+    expect_sentinel=False:只要求结构存在(用于注入后的终检,那时值已是真种子)。"""
+    fm = _FIELD_SEED_RE.search(content)
+    if not fm:
+        raise SystemExit(
+            '❌ 桩骨架缺少 `.field ... SEED:J = <初值>` 锚点。\n'
+            '   d8 在种子为 0 时会把它优化掉 → 无法注入种子。\n'
+            '   请重跑 build-stub.sh(它用非 0 哨兵种子编译)。')
+    if fm.group('val') is None:
+        raise SystemExit(
+            '❌ 桩骨架的 SEED 字段没有初值(.field ... SEED:J 无 "= ...")。\n'
+            '   同上报错原因:哨兵种子必须非 0,否则 d8 不保留初值。')
+    if expect_sentinel and fm.group('val').rstrip('Ll').lower() \
+            != SENTINEL_SEED.rstrip('Ll').lower():
+        raise SystemExit(
+            f'❌ 桩骨架的 SEED 字段初值({fm.group("val")})与哨兵种子'
+            f'({SENTINEL_SEED})不一致 —— 骨架不是 build-stub.sh 的可信产物。')
+    # 内联锚点:骨架阶段必须存在且等于哨兵;注入后终检只数结构
+    inlines = [m for m in _INLINE_SEED_RE.finditer(content)
+               if not expect_sentinel
+               or m.group('val').rstrip('Ll').lower() == SENTINEL_SEED.rstrip('Ll').lower()]
+    if expect_sentinel and not inlines:
+        raise SystemExit(
+            f'❌ 桩骨架里找不到内联的哨兵种子常量(期望 {SENTINEL_SEED})。\n'
+            f'   d8 的常量内联行为可能变了,或骨架与 build-stub.sh 不同步。\n'
+            f'   重跑 build-stub.sh;若仍失败,需重审本文件的注入契约。')
+    return fm, inlines
+
+
+def inject_stub_seed(skeleton: str, seed_word: str) -> str:
+    """把骨架里的哨兵种子【双锚点同时】改写为真种子。
+
+    seed_word: smali 长整型字面量(如 '0x1a2b3c4d5e6f7a8bL')。
+    改写后再次自检:两处锚点都等于真种子、内联锚点数量守恒 —— 任一不满足即
+    fail-fast,绝不让"半注入"的桩进产物(那是静默乱码,不是崩溃,更难查)。
+    """
+    fm, inlines = find_stub_seed_anchors(skeleton)
+    n_inline = len(inlines)
+    sentinel = SENTINEL_SEED.rstrip('Ll').lower()
+
+    # 锚点 1:字段初值行(保留缩进,只换值)
+    skeleton = skeleton[:fm.start('val')] + seed_word + skeleton[fm.end('val'):]
+
+    # 锚点 2:全部内联常量。d8 可能内联到多处,按其实际出现次数全改。
+    # 倒序替换,避免前面的替换使后面的 offset 失效。
+    # 同时丢弃行尾的十进制浮点注释(那是 d8 为旧值生成的,值变了即无意义)。
+    for m in reversed(list(_INLINE_SEED_RE.finditer(skeleton))):
+        if m.group('val').rstrip('Ll').lower() != sentinel:
+            continue
+        keep_tail = '' if m.group('tail') is None else skeleton[m.end():]
+        if m.group('tail') is not None:
+            keep_tail = ''                       # d8 的浮点注释已失效 → 丢弃
+        skeleton = skeleton[:m.start('val')] + seed_word + keep_tail
+
+    # 终检 1:哨兵种子必须一处不剩(残留 = 漏改,运行期会用到旧种子)
+    if sentinel in skeleton.lower():
+        raise SystemExit(
+            f'❌ 桩种子注入终检失败:骨架里仍残留哨兵种子 {SENTINEL_SEED}\n'
+            f'   (说明有锚点未被改写;绝不能带着哨兵进产物)')
+    # 终检 2:改后锚点数量与改写前一致(注入不得改变骨架结构)
+    _, inl2 = find_stub_seed_anchors(skeleton, expect_sentinel=False)
+    if len(inl2) != n_inline:
+        raise SystemExit(
+            f'❌ 桩种子注入终检失败:内联锚点数量从 {n_inline} 变为 {len(inl2)}\n'
+            f'   (注入改坏了骨架结构,拒绝写入产物)')
+    # 终检 3:字段初值必须确已变为真种子
+    fm3, _ = find_stub_seed_anchors(skeleton, expect_sentinel=False)
+    if fm3.group('val').rstrip('Ll').lower() != seed_word.rstrip('Ll').lower():
+        raise SystemExit(
+            f'❌ 桩种子注入终检失败:字段初值为 {fm3.group("val")},'
+            f'期望 {seed_word}')
+    return skeleton
+
+
+def read_stub_seed(content: str) -> bytes:
+    """从已存在的桩里读回 8 字节种子(续跑/复用桩时用,否则旧密文解不开)。"""
+    fm = _FIELD_SEED_RE.search(content)
+    if not fm or fm.group('val') is None:
+        raise SystemExit('❌ 桩文件缺少 SEED 字段初值,无法复用其种子')
+    word = fm.group('val').rstrip('Ll')
+    try:
+        val = int(word, 16)
+    except ValueError:
+        raise SystemExit(f'❌ 桩文件的 SEED 初值不是十六进制字面量: {fm.group("val")}')
+    return (val & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'big')
 
-%GEN_MARK% -- generated by encrypt-strings.py, DO NOT EDIT
-# keystream: ks_block(j) = SHA-256( SALT || idx_be24 || byte(j) ), byte-wise XOR
-# payload  : Base64( idx_be24 || cipher ); decrypt at runtime and intern()
-
-.field private static final SALT_B64:Ljava/lang/String; = "%SALT%"
-# 性能优化(2026-09 对比实验):旧版每解一条字符串都重新
-# MessageDigest.getInstance("SHA-256")(JCA Provider 查找)+ Base64.decode(SALT),
-# 全量规则下首次解密风暴被放大数十倍。改为 <clinit> 初始化一次、全场复用:
-#   SALT    — SALT_B64 解出的字节数组(xor() 直接 sget)
-#   DIGEST  — 复用的 MessageDigest 实例(digest() 完成后自动 reset,可连续用)
-# 算法与密钥流不变:ks_block(j) = SHA-256( SALT || idx_be24 || byte(j) ),旧密文
-# 与新密文(同一 SALT)全部可解。注意 <clinit> 顺序:必须先初始化 SALT/DIGEST
-# 再执行回填链(回填链会立刻调用 d() → xor() 消费这两个字段,见 <clinit> 内标记)。
-.field private static final SALT:[B
-.field private static final DIGEST:Ljava/security/MessageDigest;
-%FIELDS%
-.field private static final CACHE:Ljava/util/concurrent/ConcurrentHashMap;
-
-
-# direct methods
-.method static constructor <clinit>()V
-    .registers 3
-
-    new-instance v0, Ljava/util/concurrent/ConcurrentHashMap;
-
-    invoke-direct {v0}, Ljava/util/concurrent/ConcurrentHashMap;-><init>()V
-
-    sput-object v0, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
-
-    # SALT = Base64.decode(SALT_B64) —— 一次性初始化(见字段区性能注释)
-    sget-object v0, Lcom/nc/strdec/StrDec;->SALT_B64:Ljava/lang/String;
-
-    const/4 v1, 0x2
-
-    invoke-static {v0, v1}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B
-
-    move-result-object v0
-
-    sput-object v0, Lcom/nc/strdec/StrDec;->SALT:[B
-
-    # DIGEST = MessageDigest.getInstance("SHA-256") —— 一次性初始化
-    const-string v0, "SHA-256"
-
-    invoke-static {v0}, Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;
-
-    move-result-object v0
-
-    sput-object v0, Lcom/nc/strdec/StrDec;->DIGEST:Ljava/security/MessageDigest;
-
-    # 必须在 SALT/DIGEST 就绪之后再执行回填链(它们会立刻触发 d()→xor())
-    # ⚠️ 报错二十五防线:上面这行注释绝不许再写 CLINIT_FILL 的 %占位符% 形态 ——
-    #    %占位符% 只能出现在【非注释行】的独立占位行;曾因注释里出现该占位符
-    #    被 replace() 替换成真实指令,注入到类体顶层(非方法区)→ smali
-    #    `no viable alternative at input 'sget-object'` → 整个重打包失败。
-%CLINIT_FILL%
-    return-void
-.end method
-
-
-.method public static d(Ljava/lang/String;)Ljava/lang/String;
-    .registers 6
-
-    sget-object v0, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
-
-    invoke-virtual {v0, p0}, Ljava/util/concurrent/ConcurrentHashMap;->get(Ljava/lang/Object;)Ljava/lang/Object;
-
-    move-result-object v1
-
-    if-eqz v1, :cache_hit
-
-    :try_start_dec
-    invoke-static {p0}, Lcom/nc/strdec/StrDec;->dec(Ljava/lang/String;)Ljava/lang/String;
-
-    move-result-object v1
-    :try_end_dec
-    .catch Ljava/lang/Throwable; {:try_start_dec .. :try_end_dec} :catch_dec
-
-    invoke-virtual {v0, p0, v1}, Ljava/util/concurrent/ConcurrentHashMap;->putIfAbsent(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
-
-    move-result-object v2
-
-    if-eqz v2, :own_result
-
-    check-cast v2, Ljava/lang/String;
-
-    return-object v2
-
-    :own_result
-    return-object v1
-
-    :catch_dec
-    return-object p0
-
-    :cache_hit
-    check-cast v1, Ljava/lang/String;
-
-    return-object v1
-.end method
-
-
-.method private static dec(Ljava/lang/String;)Ljava/lang/String;
-    .registers 8
-
-    const/4 v0, 0x2
-
-    invoke-static {p0, v0}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B
-
-    move-result-object v1
-
-    const/4 v2, 0x0
-
-    aget-byte v3, v1, v2
-
-    and-int/lit16 v3, v3, 0xff
-
-    shl-int/lit8 v3, v3, 0x10
-
-    const/4 v4, 0x1
-
-    aget-byte v5, v1, v4
-
-    and-int/lit16 v5, v5, 0xff
-
-    shl-int/lit8 v5, v5, 0x8
-
-    or-int/2addr v3, v5
-
-    const/4 v5, 0x2
-
-    aget-byte v6, v1, v5
-
-    and-int/lit16 v6, v6, 0xff
-
-    or-int/2addr v3, v6
-
-    invoke-static {v1, v3}, Lcom/nc/strdec/StrDec;->xor([BI)[B
-
-    move-result-object v3
-
-    new-instance v5, Ljava/lang/String;
-
-    const-string v6, "UTF-8"
-
-    invoke-direct {v5, v3, v6}, Ljava/lang/String;-><init>([BLjava/lang/String;)V
-
-    invoke-virtual {v5}, Ljava/lang/String;->intern()Ljava/lang/String;
-
-    move-result-object v5
-
-    return-object v5
-.end method
-
-
-.method private static xor([BI)[B
-    .registers 16
-
-    array-length v0, p0
-
-    add-int/lit8 v1, v0, -0x3
-
-    new-array v2, v1, [B
-
-    # 复用 <clinit> 初始化的实例/字段(性能优化,见字段区注释)。
-    # digest() 返回后内部自动 reset,下一次 update 系列调用即干净状态。
-    sget-object v3, Lcom/nc/strdec/StrDec;->DIGEST:Ljava/security/MessageDigest;
-
-    sget-object v4, Lcom/nc/strdec/StrDec;->SALT:[B
-
-    const/4 v5, 0x0
-
-    const/4 v6, 0x0
-
-    :loop_outer
-    if-ge v5, v1, :done
-
-    invoke-virtual {v3, v4}, Ljava/security/MessageDigest;->update([B)V
-
-    shr-int/lit8 v7, p1, 0x10
-
-    int-to-byte v7, v7
-
-    invoke-virtual {v3, v7}, Ljava/security/MessageDigest;->update(B)V
-
-    shr-int/lit8 v8, p1, 0x8
-
-    int-to-byte v8, v8
-
-    invoke-virtual {v3, v8}, Ljava/security/MessageDigest;->update(B)V
-
-    int-to-byte v9, p1
-
-    invoke-virtual {v3, v9}, Ljava/security/MessageDigest;->update(B)V
-
-    int-to-byte v10, v6
-
-    invoke-virtual {v3, v10}, Ljava/security/MessageDigest;->update(B)V
-
-    invoke-virtual {v3}, Ljava/security/MessageDigest;->digest()[B
-
-    move-result-object v10
-
-    const/4 v11, 0x0
-
-    const/16 v12, 0x20
-
-    :loop_inner
-    if-ge v11, v12, :next_block
-
-    if-ge v5, v1, :next_block
-
-    add-int/lit8 v13, v5, 0x3
-
-    # ⚠️ 临时寄存器必须是【内层循环期间无依赖】的槽位,绝不能用 v14/v15:
-    #    `.registers 16` + 双参 `([BI)` ⇒ 参数固定落在末尾寄存器 p0=v14、p1=v15
-    #    (smali 规则:参数占最后 N 个寄存器)。旧版此处写 v14/v15 等价于直接改写
-    #    形参本身 —— 第 1 轮把数组引用 p0 覆盖成刚读出的字节(int),第 2 轮
-    #    `aget-byte v14, v14, v13` 就把这个 int 当数组引用解引用 ⇒ ART 只在
-    #    null 时抛 NPE、非 null 非法引用直接 SIGSEGV(原生崩溃,Java catch 不住)
-    #    ⇒ 任何 ≥2 字节的字符串解密即在 <clinit> 崩 → 闪退且无 FATAL 日志。
-    #    v7/v8 是安全槽:外层循环里它们只做 MessageDigest.update 的临时值,
-    #    进入内层时已死值,且每轮 `goto :loop_outer` 都会无条件重新赋值,
-    #    不存在读到上一轮残留的风险(v7/v8 在内层循环期间无人读)。
-    aget-byte v7, p0, v13
-
-    aget-byte v8, v10, v11
-
-    xor-int v7, v7, v8
-
-    int-to-byte v7, v7
-
-    aput-byte v7, v2, v5
-
-    add-int/lit8 v5, v5, 0x1
-
-    add-int/lit8 v11, v11, 0x1
-
-    goto :loop_inner
-
-    :next_block
-    add-int/lit8 v6, v6, 0x1
-
-    goto :loop_outer
-
-    :done
-    return-object v2
-.end method
-'''
 
 
 # ── 解密桩自检:参数寄存器不得被当临时槽覆盖(报错二十二) ──────────────
@@ -455,17 +366,26 @@ def _check_stub_registers(smali_text: str) -> None:
             body.append(lines[j])
             j += 1
         # 找 .registers / .locals
+        # 【易错】两者语义不同(报错二十二 自检曾因此误报):
+        #   .registers N → N 是【总寄存器数】(含参数)
+        #   .locals N    → N 是【局部寄存器数】,总寄存器数 = N + 参数数
+        # 桩由 javac 生成,用的是 .locals;把 .locals 的 N 当总数会导致
+        # param_lo 偏小、误报"局部槽覆盖形参"。
         total = None
         for bl in body:
             m = _REGS_RE.match(bl)
             if m:
-                total = int(m.group('n'))
+                n_val = int(m.group('n'))
+                total = n_val if m.group('kind') == 'registers' \
+                    else n_val + max(nparams, 0)
                 break
         if total is None or nparams < 0:
             i = j + 1
             continue
-        # 参数寄存器编号(限于 v 编号):p0..pK 映射到 v(total-nparams)..v(total-1)
-        param_lo = total - nparams        # 参数起始 v 编号
+        # 参数寄存器边界(限于 v 编号):p0..pK 映射到 v(total-nparams)..v(total-1)。
+        # 注意:这里不再用它拦"写形参"——那会误伤编译器产物(见下方 _param_* 说明)。
+        # 保留 total/param_lo 的解析仅为兼容旧行为审计,实际判定见 _param_overwritten_before_use。
+        _ = total - nparams
         for bl in body:
             s = bl.strip()
             # 显示跳过:空行 / 指令外元素(.directive)/ label(:x)/ 注释(#)—— 注释里
@@ -481,60 +401,24 @@ def _check_stub_registers(smali_text: str) -> None:
             dst = m.group('first')
             if not dst:
                 continue
-            if dst.startswith('p'):
-                raise SystemExit(
-                    f'❌ 解密桩自检失败:{method} 里 `{s}` 以参数寄存器 {dst} 为目标,\n'
-                    f'   汇编/运行期会静默覆盖形参(报错二十二:闪退且无 FATAL 日志)。\n'
-                    f'   请改用方法内确无依赖的局部寄存器槽。')
-            vnum = int(dst[1:])
-            if vnum >= param_lo:
-                raise SystemExit(
-                    f'❌ 解密桩自检失败:{method}(.registers {total}, 形参 {nparams} 个)里\n'
-                    f'   `{s}` 以 {dst} 为目标,而参数寄存器是 v{param_lo}..v{total-1}'
-                    f'(p0=v{param_lo})—— 相当于覆盖形参(报错二十二)。\n'
-                    f'   请改用方法内确无依赖的局部寄存器槽。')
+            # 「警报器」范围(按用户裁决:只盯最危险的那一步):
+            #   * 只对【解密主方法 d()】保持 fail-fast —— 它是唯一会调用系统
+            #     Base64 解码工具的方法,形参被弄脏 → 解码拿到脏数据
+            #     (报错二十二的真身:闪退且无 FATAL 日志)。
+            #   * 对 mix64/keyByte 这类【纯算数内部方法】放行 —— 它们不调用任何
+            #     外部工具,形参读写是编译器正常产物(如 `seed += ...`),
+            #     拦它只会误伤,不带来任何安全性。
+            if method != STUB_DECRYPT_METHOD:
+                continue
+            if dst.startswith('p') or dst.startswith('v'):
+                vnum = total - nparams if dst.startswith('p') else int(dst[1:])
+                if vnum >= total - nparams:
+                    raise SystemExit(
+                        f'❌ 解密桩自检失败:{method} 里 `{s}` 以参数寄存器 {dst} 为目标,\n'
+                        f'   而 d() 随后还要用这些形参调用系统解码工具 → 运行期会传脏参数\n'
+                        f'   (报错二十二:闪退且无 FATAL 日志)。\n'
+                        f'   请改用方法内确无依赖的局部寄存器槽。')
         i = j + 1
-
-
-def _render_stub(salt_b64: str, field_decls: str, clinit_fill: str) -> str:
-    """展开桩模板 + 自检。write_stub 走这里,保证任何路径都过校验。"""
-    placeholders = ('%GEN_MARK%', '%SALT%', '%FIELDS%', '%CLINIT_FILL%')
-    # 防线 1(报错二十五):模板的注释行里绝不许出现占位符 —— replace() 不认
-    # 上下文,注释里的 %CLINIT_FILL% 会被替换成真实指令并注入类体顶层
-    # (非方法区)→ smali `no viable alternative at input 'sget-object'`。
-    for line in STUB_TEMPLATE.split('\n'):
-        stripped = line.strip()
-        if stripped.startswith('#') and any(p in line for p in placeholders):
-            raise SystemExit(
-                f'❌ 解密桩模板自检失败:注释行含占位符(报错二十五)——\n   {line}\n'
-                f'   占位符只允许出现在非注释行;注释里的占位符会被 replace() '
-                f'替换成真实指令并注入类体顶层,导致 smali 汇编失败。')
-    content = (STUB_TEMPLATE
-               .replace('%GEN_MARK%', STUB_GEN_MARK)
-               .replace('%SALT%', salt_b64)
-               .replace('%FIELDS%', field_decls)
-               .replace('%CLINIT_FILL%', clinit_fill))
-    # 防线 2:渲染后不许残留任何占位符(placeholder 漏替换/多写一样拦)
-    for p in placeholders:
-        if p in content:
-            raise SystemExit(f'❌ 解密桩模板渲染后残留占位符 {p}(漏配 .replace?)')
-    # 防线 3(报错二十五):类体顶层(非 .method 区)不许出现真实指令。
-    # 走到这里说明占位符层面已干净,这条兜底拦住任何把指令注入非方法区的回归。
-    in_method = False
-    for line in content.split('\n'):
-        s = line.strip()
-        if s.startswith('.method'):
-            in_method = True
-        elif s == '.end method':
-            in_method = False
-        elif (in_method is False and s and not s.startswith(('.', '#'))
-              and not s.startswith(':')):
-            raise SystemExit(
-                f'❌ 解密桩自检失败:类体顶层出现非指令行外的裸指令 ——\n   {line}\n'
-                f'   指令只允许出现在 .method .. .end method 之间(报错二十五: '
-                f'%CLINIT_FILL% 曾被替换进类体顶层 → no viable alternative)。')
-    _check_stub_registers(content)
-    return content
 
 
 # ── smali 字符串字面量转义表(与 smali 汇编器的 unescape 对齐) ──────────
@@ -658,33 +542,41 @@ def parse_field_string(line: str):
     return m, rest[:i], rest[i + 1:]
 
 
-def keystream(salt: bytes, idx: int, length: int) -> bytes:
-    """与 stub xor() 逐字节一致的密钥流:块 j = SHA-256(salt || idx_be24 || j)。"""
-    out = bytearray()
-    j = 0
-    idx_bytes = bytes(((idx >> 16) & 0xFF, (idx >> 8) & 0xFF, idx & 0xFF))
-    while len(out) < length:
-        out += hashlib.sha256(salt + idx_bytes + bytes((j & 0xFF,))).digest()
-        j += 1
-    return bytes(out[:length])
+# ── splitmix64 密钥流(Python 侧参考实现;与 StrDec.java 逐字节一致) ──────
+# 【易错点,改这两行前先读】
+#  ① Python 的 >> 是算术右移,必须保证操作数是已掩码的非负数(每步 & MASK64);
+#     Java 用 >>>(无符号右移),long 溢出天然 = mod 2^64。
+#  ② 字节序:b = (w >> ((i & 7) * 8)) & 0xFF —— 低位在前,Java 侧同式。
+# 这两条由 scripts/string-enc/tests/test-keystream-crosscheck.sh 逐字节钉死。
+MASK64 = (1 << 64) - 1
+GAMMA = 0x9E3779B97F4A7C15
+_M1 = 0xBF58476D1CE4E5B9
+_M2 = 0x94D049BB133111EB
 
 
-
-    """与 stub xor() 逐字节一致的密钥流:块 j = SHA-256(salt || idx_be24 || j)。"""
-    out = bytearray()
-    j = 0
-    idx_bytes = bytes(((idx >> 16) & 0xFF, (idx >> 8) & 0xFF, idx & 0xFF))
-    while len(out) < length:
-        out += hashlib.sha256(salt + idx_bytes + bytes((j & 0xFF,))).digest()
-        j += 1
-    return bytes(out[:length])
+def _mix64(z: int) -> int:
+    z = (z ^ (z >> 30)) & MASK64
+    z = (z * _M1) & MASK64
+    z = (z ^ (z >> 27)) & MASK64
+    z = (z * _M2) & MASK64
+    return (z ^ (z >> 31)) & MASK64
 
 
-def encrypt_payload(salt: bytes, idx: int, plain: bytes) -> str:
-    """明文 → Base64( idx_be24 || cipher )。"""
-    head = bytes(((idx >> 16) & 0xFF, (idx >> 8) & 0xFF, idx & 0xFF))
-    ks = keystream(salt, idx, len(plain))
-    cipher = bytes(p ^ k for p, k in zip(plain, ks))
+def key_byte(seed: int, i: int) -> int:
+    """虚拟密钥流第 i 个字节,O(1) 现算(对应 StrDec.keyByte)。"""
+    w = _mix64((seed + (i >> 3) * GAMMA) & MASK64)
+    return (w >> ((i & 7) * 8)) & 0xFF
+
+
+def read_seed_bytes() -> bytes:
+    """新构建的种子:8 字节随机。"""
+    return secrets.token_bytes(8)
+
+
+def encrypt_payload_v2(seed: int, offset: int, plain: bytes) -> str:
+    """v2 明文 → Base64( offset_be24 || cipher ),cipher[k] = plain[k] ^ key_byte(seed, offset+k)。"""
+    head = bytes(((offset >> 16) & 0xFF, (offset >> 8) & 0xFF, offset & 0xFF))
+    cipher = bytes(p ^ key_byte(seed, offset + k) for k, p in enumerate(plain))
     return base64.b64encode(head + cipher).decode('ascii')
 
 
@@ -755,19 +647,21 @@ def class_desc_of(content: str):
 
 STUB_DOT = STUB_DESC[1:-1].replace('/', '.')
 
-# 已加密条目的形态:const-string 紧跟本桩的 invoke-static(用于续跑时续 idx)。
+# 已加密条目的形态:const-string 紧跟本桩的 invoke-static(用于续跑时续 offset)。
 # 必须同时认 `invoke-static {..}` 与 `invoke-static/range {.. .. ..}` 两种形态
 # (报错二十一改注入形态后,/range 是新产物;若这里只认旧形态,max_existing_idx
-# 会漏算 → 续跑 idx 从 0 重来 → salt+idx 相同 → keystream 复用)
+# 会漏算 → 续跑 offset 从 0 重来 → 共享密钥表区段复用)
 _PAYLOAD_RE = re.compile(
     r'const-string(?:/jumbo)?[ \t]+(?:v\d+|p\d+)[ \t]*,[ \t]*"([^"\n]*)"\n'
     r'[ \t]*invoke-static(?:/range)? \{[^}\n]*\}, ' + re.escape(STUB_DESC) + r'->d\(')
 
 # 字段常量回填引用(报错二十四改形态后):<clinit> 里的
 #   sget-object vX, 本桩 ->F\d+
-# (续跑时字段 idx 也要计入,否则新字段编号从 0 重来 → 相同 salt+idx →
-# keystream 复用。旧形态 `= StrDec;->F\d+:` 是报错二十四的非法 FIELD 型
-# static_value,已废弃,且被 _ILLEGAL_FIELD_INIT_RE 构建期断言拦截)
+# (续跑时字段占用的表区间也要计入,否则新字段 offset 从 0 重来 → 密钥区段复用。
+# 旧形态 `= StrDec;->F\d+:` 是报错二十四的非法 FIELD 型 static_value,已废弃,
+# 且被 _ILLEGAL_FIELD_INIT_RE 构建期断言拦截。v2 里 F 编号与表 offset 同源递增,
+# F(\d+) 读出的编号本身即"该字段占用的下一个 offset 下界"——字段名在分配时
+# 用占用前的 offset 命名,故引用计数语义 = offset+len 由分配器统一维护)
 _FIELD_REF_RE = re.compile(
     # 回填引用形态(报错二十四):<clinit> 里的 sget-object vX, StrDec;->FNNNNNN
     r'sget-object[ \t]+(?:v\d+|p\d+),[ \t]*' + re.escape(STUB_DESC) + r'->F(\d+):')
@@ -802,8 +696,9 @@ def classify(cls_dot: str, cls_desc: str, includes, excludes) -> str:
 
 
 def max_existing_idx(content: str) -> int:
-    """已加密类里出现过的最大 idx(续跑时接着编号,避免 keystream 复用)。
-    同时扫两类形态:指令密文(_PAYLOAD_RE)与回填引用(_FIELD_REF_RE)。"""
+    """v2: 已加密类里占用过的最大表区间末尾(续跑时接着分配,避免密钥区段复用)。
+    同时扫两类形态:指令密文(_PAYLOAD_RE)与回填引用(_FIELD_REF_RE)。
+    返回值语义 = "下一个可用 offset 下界"(最大 offset + len)。"""
     biggest = -1
     for m in _PAYLOAD_RE.finditer(content):
         try:
@@ -811,7 +706,8 @@ def max_existing_idx(content: str) -> int:
         except Exception:
             continue
         if len(raw) >= 3:
-            biggest = max(biggest, int.from_bytes(raw[:3], 'big'))
+            off = int.from_bytes(raw[:3], 'big')
+            biggest = max(biggest, off + (len(raw) - 3))
     for m in _FIELD_REF_RE.finditer(content):
         biggest = max(biggest, int(m.group(1), 10))
     return biggest
@@ -829,8 +725,8 @@ def find_stub_path(decompiled_dir: str):
 
 
 def read_existing_salt(decompiled_dir: str):
-    """已存在且是本工具生成的桩 → 复用其 SALT_B64(否则旧密文解不开)。
-    返回 (salt_bytes 或 None, 是否需要写桩)。同名非本工具文件 → fail-fast。"""
+    """已存在且是本工具生成的桩 → 复用其 SEED(否则旧密文解不开)。
+    返回 (seed_bytes 或 None, 是否需要写桩)。同名非本工具文件 → fail-fast。"""
     stub_path = find_stub_path(decompiled_dir)
     if not stub_path:
         return None, True
@@ -839,30 +735,7 @@ def read_existing_salt(decompiled_dir: str):
     if STUB_GEN_MARK not in content:
         raise SystemExit(f'❌ 已存在同名类但非本工具生成,拒绝覆盖: {stub_path}\n'
                          f'   请改名或移走用户的 {STUB_DESC} 后重试')
-    m = re.search(r'SALT_B64:Ljava/lang/String;[ \t]*=[ \t]*"([A-Za-z0-9+/=]+)"', content)
-    if not m:
-        raise SystemExit(f'❌ 桩文件缺少 SALT_B64,无法复用: {stub_path}')
-    return base64.b64decode(m.group(1)), False
-
-
-def read_existing_stub_fields(decompiled_dir: str):
-    """读回已存在桩里登记的字段常量 [(name, payload)](报错二十式:
-    复用桩时本次产生新字段,必须把旧字段一并带上重写桩,否则类里引用了
-    F000005 而桩里没有声明 → 汇编 NoSuchFieldError / 运行期 null)。"""
-    stub_path = find_stub_path(decompiled_dir)
-    if not stub_path:
-        return []
-    with open(stub_path, encoding='utf-8') as fp:
-        content = fp.read()
-    if STUB_GEN_MARK not in content:
-        return []                                     # 调用方已 fail-fast,防御性兜底
-    fields = []
-    for m in re.finditer(
-            r'\.field public static final (F\d+):Ljava/lang/String;\n'
-            r'\.field private static final C_\1:Ljava/lang/String; = "'
-            r'([A-Za-z0-9+/=]+)"', content):
-        fields.append((m.group(1), m.group(2)))
-    return fields
+    return read_stub_seed(content), False
 
 
 def _pick_smali_root(decompiled_dir: str) -> str:
@@ -948,55 +821,60 @@ def clean_components(decompiled_dir: str) -> int:
     return removed
 
 
-def write_stub(decompiled_dir: str, salt: bytes, stub_fields) -> str:
-    """写解密桩。stub_fields: [(字段名, 密文 base64)] —— R8 折叠的 static final
-    String 常量改成了对这些字段的引用,字段值由桩的 <clinit> 运行期解密填入。"""
+def write_stub(decompiled_dir: str, seed: bytes) -> str:
+    """写 v2/S2 解密桩。
+
+    S2 的桩是构建期编译产物(build-stub.sh 出的骨架),注入只有一件事:
+    把骨架里的哨兵种子替换为本次构建的 8 字节真种子(双锚点同时改)。
+    没有 KEYS 表、没有 <clinit>、没有字段回填链 —— 这些在 S2 里全部不存在。
+
+    seed: 8 字节。
+    """
+    if len(seed) != 8:
+        raise SystemExit(f'❌ 内部错误:种子必须是 8 字节,收到 {len(seed)} 字节')
     root = _pick_smali_root(decompiled_dir)
     stub_dir = os.path.join(root, *STUB_PKG_DIR)
     os.makedirs(stub_dir, exist_ok=True)
     stub_path = os.path.join(stub_dir, STUB_FILE)
 
-    # 字段声明 + <clinit> 里的解密赋值
-    field_decls = ''.join(
-        f'\n.field public static final {name}:Ljava/lang/String;\n'
-        f'.field private static final C_{name}:Ljava/lang/String; = "{payload}"\n'
-        for name, payload in stub_fields)
-    clinit_fill = ''.join(
-        f'\n    sget-object v0, {STUB_DESC}->C_{name}:Ljava/lang/String;\n'
-        f'\n    invoke-static {{v0}}, {STUB_DESC}'
-        f'->d(Ljava/lang/String;)Ljava/lang/String;\n'
-        f'\n    move-result-object v0\n'
-        f'\n    sput-object v0, {STUB_DESC}->{name}:Ljava/lang/String;\n'
-        for name, _payload in stub_fields)
+    skeleton = load_stub_skeleton()
+    seed_word = f'0x{int.from_bytes(seed, "big"):016x}L'
+    content = inject_stub_seed(skeleton, seed_word)
 
-    # 走 _render_stub(内含寄存器自检,报错二十二):任何写桩路径都过校验
-    content = _render_stub(
-        base64.b64encode(salt).decode('ascii'),
-        field_decls if stub_fields else '',
-        clinit_fill if stub_fields else '')
+    # 生成标记(非注释行的行首注释即可,注释不进 dex)。必须存在:
+    # 续跑时靠它区分"本工具生成的桩"与"用户同名类",决定是复用还是拒绝。
+    content = content + f'\n{STUB_GEN_MARK}\n'
+    if STUB_GEN_MARK not in content:
+        raise SystemExit('❌ 解密桩渲染终检失败:缺少生成标记')
+    # 终检:哨兵种子绝不许进产物(否则运行期与构建期密钥流不一致 → 全包乱码)
+    if SENTINEL_SEED.rstrip('Ll').lower() in content.lower():
+        raise SystemExit('❌ 解密桩渲染终检失败:产物残留哨兵种子')
     with open(stub_path, 'w', encoding='utf-8') as fp:
         fp.write(content)
     return stub_path
 
 
 def process_file(path: str, cls_desc: str, includes, excludes,
-                 exclude_methods, salt: bytes, next_idx: int):
-    """就地加密一个 .smali 文件。返回 (改动字符串数, 新 next_idx, stub_fields, field_backfills)。
-    stub_fields: [(桩字段名, 密文)](写进桩 <clinit> 的密文常量);
-    field_backfills: [{stub_field, owner_cls, field, type}](需要回填的目标字段)。"""
+                 exclude_methods, seed: int, next_off: int):
+    """就地加密一个 .smali 文件。返回 (改动字符串数, 新 next_off, field_backfills)。
+
+    S2: next_off 是全包虚拟密钥流的下一个可用 offset;每条密文按需消耗
+    offset..offset+len 区段,分配器保证不重叠。种子是唯一的构建期密钥材料。
+    field_backfills: [{owner_cls, field, type, payload}] —— R8 折叠的
+    static final String 常量,初值保持明文,值由 <clinit> 运行期回填(报错二十四/D4)。
+    """
     with open(path, encoding='utf-8') as fp:
         content = fp.read()
     if CLASS_MARK in content:
-        # 幂等:整类已处理。但仍要把它用过的 idx 计入,续跑时不重复编号
-        return 0, max(next_idx, max_existing_idx(content) + 1), [], []
+        # 幂等:整类已处理。但仍要把它占用的区段计入,续跑时不重复分配
+        return 0, max(next_off, max_existing_idx(content)), []
 
     lines = content.split('\n')
     out = []
     cur_method = None
     hits = 0
-    idx = next_idx
-    stub_fields = []          # 需要生成的桩字段: [(字段名, 密文)]
-    field_backfills = []      # 报错二十四:<clinit> 回填登记
+    idx = next_off
+    field_backfills = []      # 报错二十四/D4:<clinit> 回填登记
     li = 0
     n_lines = len(lines)
     while li < n_lines:
@@ -1037,36 +915,36 @@ def process_file(path: str, cls_desc: str, includes, excludes,
                 continue
             if idx > IDX_MAX:
                 raise SystemExit(f'❌ 加密字符串数超过 {IDX_MAX}(idx 3 字节上限),请缩小规则范围')
-            if is_instrumentation_string(fplain):
-                # 编译器调试/内联标记:保留明文字面量,不登记回填(见常量区说明)
+            if is_instrumentation_string(fplain) or not fplain:
+                # 编译器调试/内联标记:保留明文字面量
+                # 空串:无信息量,且桩对 3 字节 payload 走"原样返回"兜底会返回
+                # Base64 串本身(语义错误)→ 一律跳过,不进加密面
                 out.append(line)
                 continue
-            field_name = f'F{idx:06d}'          # 用全局 idx 命名,跨类天然唯一
-            stub_fields.append((field_name, encrypt_payload(salt, idx,
-                                                            fplain.encode('utf-8'))))
-            # 原字段行原样保留(初值仍是明文字面量,产物形态合法);
-            # 回填信息交给 main() 在 <clinit> 注入时消费
+            fenc = fplain.encode('utf-8')
+            # 【报错二十四/D4】初值必须保持明文字面量:字段值靠 <clinit>
+            # 运行期回填(直接改初值 = 业务读到密文;FIELD 型 static_value = 秒闪退)
             out.append(line)
             field_backfills.append({
-                'stub_field': field_name,
-                'owner_cls': cls_desc,           # Lcom/x/Y; 形式
+                'owner_cls': cls_desc,            # Lcom/x/Y; 形式
                 'field': fm.group('name'),
                 'type': fm.group('type'),
+                'payload': encrypt_payload_v2(seed, idx, fenc),
             })
-            idx += 1
+            idx += len(fenc)
             hits += 1
             continue
 
         excluded_by_dex2c = bool(
             cur_method and (cls_desc, cur_method[0], cur_method[1]) in exclude_methods)
 
-        # 已加密条目(解密桩可能来自上一次运行)→ 跳过,并续用序号,
+        # 已加密条目(解密桩可能来自上一次运行)→ 跳过,并续用表区段,
         # 避免把密文当明文再加密一次
         if STUB_DESC + '->d(' in line:
             out.append(line)
             midx = max_existing_idx(line + '\n')
             if midx >= 0:
-                idx = max(idx, midx + 1)
+                idx = max(idx, midx)
             continue
 
         parsed = parse_const_string(line)
@@ -1075,12 +953,12 @@ def process_file(path: str, cls_desc: str, includes, excludes,
             continue
         # 逐行前瞻防二次加密(报错二十式双保险):即使类标记被外部工具删掉,
         # 密文 const-string 的下一行必是本桩的 invoke-static ...->d(...),
-        # 命中即连同密文行原样保留(与上方 ->d( 分支同样的续 idx 语义)
+        # 命中即连同密文行原样保留(与上方 ->d( 分支同样的续 offset 语义)
         if li < n_lines and STUB_DESC + '->d(' in lines[li]:
             out.append(line)
             midx = max_existing_idx(line + '\n' + lines[li] + '\n')
             if midx >= 0:
-                idx = max(idx, midx + 1)
+                idx = max(idx, midx)
             continue
         if excluded_by_dex2c:
             out.append(line)                            # 该方法将被 dex2c 抽走 → 不浪费体积
@@ -1094,14 +972,18 @@ def process_file(path: str, cls_desc: str, includes, excludes,
             out.append(line)
             continue
 
-        if idx > IDX_MAX:
-            raise SystemExit(f'❌ 加密字符串数超过 {IDX_MAX}(idx 3 字节上限),请缩小规则范围')
-        if is_instrumentation_string(plain):
+        enc = plain.encode('utf-8')
+        if idx + len(enc) > IDX_MAX + 1:
+            raise SystemExit(f'❌ 加密字符串总字节数超过密钥流区段上限 {IDX_MAX + 1},'
+                             f'请缩小规则范围')
+        if is_instrumentation_string(plain) or not enc:
             # 编译器调试/内联标记:保留明文 const-string(见常量区说明)
+            # 空串:无信息量,且桩对 3 字节 payload 会走"原样返回"兜底,
+            # 把 Base64 串本身当明文返回(语义错误)→ 一律跳过
             out.append(line)
             continue
 
-        payload = encrypt_payload(salt, idx, plain.encode('utf-8'))
+        payload = encrypt_payload_v2(seed, idx, enc)
         jumbo = m.group('jumbo') or ''
         indent = m.group('indent')
         dst = m.group('dst')
@@ -1117,14 +999,14 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         out.append(f'{indent}invoke-static/range {{{dst} .. {dst}}}, '
                    f'{STUB_DESC}->d(Ljava/lang/String;)Ljava/lang/String;')
         out.append(f'{indent}move-result-object {dst}')
-        idx += 1
+        idx += len(enc)                     # 消费对应表区段(不重叠分配)
         hits += 1
 
     if hits == 0:
         # 没有新加密,但可能只命中了"已加密条目跳过"分支(类标记丢失 +
         # 三行形态)—— 此时 idx 已被续到旧密文之后,必须带回去,
-        # 否则续跑时新条目从 0 编号 → keystream 复用(报错二十式)
-        return 0, max(next_idx, idx), [], []
+        # 否则续跑时新条目从 0 分配 → 密钥区段复用(报错二十式)
+        return 0, max(next_off, idx), []
 
     # 插幂等标记注释(注释不进 dex)
     final = []
@@ -1136,59 +1018,65 @@ def process_file(path: str, cls_desc: str, includes, excludes,
             marked = True
     with open(path, 'w', encoding='utf-8') as fp:
         fp.write('\n'.join(final))
-    return hits, idx, stub_fields, field_backfills
+    return hits, idx, field_backfills
 
 
 def inject_clinit_backfills(path: str, backfills) -> bool:
-    """报错二十四:在 path 所属类的 <clinit> 末尾(return-void 之前)注入回填链:
+    """报错二十四/D4:在 path 所属类的 <clinit> 末尾(return-void 之前)注入:
 
-        sget-object vX, Lcom/nc/strdec/StrDec;->FNNNNNN:Ljava/lang/String;
-        sput-object vX, <owner>;-><field>:<type>
+        const-string v0, "<密文>"
+        invoke-static/range {v0 .. v0}, Lcom/nc/strdec/StrDec;->d(...)...
+        move-result-object v0
+        sput-object v0, <owner>;-><field>:<type>
 
-    运行期类初始化时用解密结果覆盖字面量初值 —— 这是 dex 规范允许的唯一
-    "运行期算字段值"形态(桩自身 <clinit> 填 F 字段即此形态)。
-    <clinit> 不存在则新建(.locals 1,寄存器只占 v0,恒在 35c/21c 上限内)。
+    为什么必须回填而不能直接改初值:
+      static final String 的初值在 dex 里是【字符串常量引用】,若把初值改成
+      密文,ART 不会自动解密 → 业务读到密文(错值,且不报错)。而 FIELD 型
+      0x19 static_value 直接指向本桩字段在 ART 类初始化时会秒闪退且无日志
+      (报错二十四)。唯一合法形态就是"初值保持明文 + <clinit> 运行期覆盖"。
+
+    S2 形态比 v1 更轻: 不再需要每个字段一个桩字段 FNNNNNN,密文直接内联在
+    <clinit> 的 const-string 里 —— 桩里零字段、零表。
+
+    <clinit> 不存在则新建(.locals 1,只用 v0,恒在 21c/35c 上限内)。
     返回是否发生了注入。"""
     with open(path, encoding='utf-8') as fp:
         content = fp.read()
 
-    # 组装注入体(全部走 v0 —— 回填链内部自依赖,任何 <clinit> 都容得下一个 v0;
-    # 已有 <clinit> 的 .locals 可能是 0,新建时用 1,已有时若 .locals 0 需抬到 1)
     lines = content.split('\n')
     clinit_idx = None          # '.method static constructor <clinit>()V' 行号
-    clinit_end = None          # 对应 '.end method' 行号
-    clinit_locals = None
+    clinit_end = None
     for i, ln in enumerate(lines):
         s = ln.strip()
         if s.startswith('.method') and 'constructor' in s and '<clinit>' in s:
             clinit_idx = i
-            # 找 .locals / .registers 与方法结束
             for j in range(i + 1, len(lines)):
-                sj = lines[j].strip()
-                mloc = re.match(r'\.(?:registers|locals)[ \t]+(\d+)$', sj)
-                if mloc and clinit_locals is None:
-                    clinit_locals = int(mloc.group(1))
-                if sj == '.end method':
+                if lines[j].strip() == '.end method':
                     clinit_end = j
                     break
             break
     has_clinit = clinit_idx is not None and clinit_end is not None
 
+    # 回填体:全部走 v0(自依赖链,任何 <clinit> 都容得下一个 v0)
     fill_lines = []
     for bf in backfills:
-        fill_lines.append(
-            f'    sget-object v0, {STUB_DESC}->{bf["stub_field"]}:{bf["type"]}')
-        fill_lines.append(
-            f'    sput-object v0, {bf["owner_cls"]}->{bf["field"]}:{bf["type"]}')
+        payload = bf['payload']
+        ty = bf['type']
+        fill_lines.append(f'    const-string v0, "{payload}"')
+        fill_lines.append(f'    invoke-static/range {{v0 .. v0}}, '
+                          f'{STUB_DESC}->d(Ljava/lang/String;)Ljava/lang/String;')
+        fill_lines.append('    move-result-object v0')
+        fill_lines.append(f'    sput-object v0, {bf["owner_cls"]}->{bf["field"]}:{ty}')
 
     if has_clinit:
-        if clinit_locals is not None and clinit_locals < 1:
-            # <clinit> .locals 0 也要用 v0 → 抬到 1
-            for j in range(clinit_idx, clinit_end):
-                if re.match(r'[ \t]*\.(?:registers|locals)[ \t]+0[ \t]*$', lines[j]):
-                    lines[j] = lines[j].replace('0', '1', 1)
-                    break
-        # 找 <clinit> 里的 return-void,插到它之前(若无 return-void 则插到末尾)
+        # <clinit> 的 .locals/.registers 至少要能容纳 v0
+        for j in range(clinit_idx, clinit_end):
+            mm = re.match(r'[ \t]*\.(?P<kind>registers|locals)[ \t]+(?P<n>\d+)[ \t]*$',
+                          lines[j])
+            if mm and int(mm.group('n')) < 1:
+                lines[j] = re.sub(r'\.(?P<k>registers|locals)[ \t]+\d+',
+                                  lambda mo: f'.{mo.group("k")} 1', lines[j], count=1)
+                break
         insert_at = clinit_end
         for j in range(clinit_end - 1, clinit_idx, -1):
             if lines[j].strip() == 'return-void':
@@ -1196,22 +1084,22 @@ def inject_clinit_backfills(path: str, backfills) -> bool:
                 break
         lines[insert_at:insert_at] = fill_lines
     else:
-        # 无 <clinit> → 在类体末尾追加一个最小的
-        lines.append('')
-        lines.append('.method static constructor <clinit>()V')
-        lines.append('    .locals 1')
-        lines.append('')
-        lines.extend(fill_lines)
-        lines.append('')
-        lines.append('    return-void')
-        lines.append('.end method')
+        # 无 <clinit> → 追加一个最小的(放在最后一个 .method 之后、类体末尾)
+        last_end = 0
+        for j, ln in enumerate(lines):
+            if ln.strip() == '.end method':
+                last_end = j
+        new_clinit = ['', '.method static constructor <clinit>()V', '    .locals 1', '']
+        new_clinit += fill_lines
+        new_clinit += ['', '    return-void', '.end method']
+        lines[last_end + 1:last_end + 1] = new_clinit
 
     with open(path, 'w', encoding='utf-8') as fp:
         fp.write('\n'.join(lines))
     return True
 
 
-def main() -> int:
+def main():
     argv = sys.argv[1:]
     # 子命令:clean(按组件标记清残留,幂等) | encrypt(默认)
     if argv and argv[0] == 'clean':
@@ -1229,7 +1117,7 @@ def main() -> int:
     ap.add_argument('--classes', help='activity* 展开所需类列表(make-filter-from-apk 产物)')
     ap.add_argument('--exclude-methods',
                     help='compiled_methods.txt:这些方法将被 dex2c 抽走,跳过不加密')
-    ap.add_argument('--salt-hex', help='固定 salt(16 字节 hex),仅供测试/复现')
+    ap.add_argument('--seed-hex', help='固定种子(8 字节 hex),仅供测试/复现')
     ap.add_argument('--quiet', action='store_true', help='只打错误')
     args = ap.parse_args(argv)
 
@@ -1252,23 +1140,29 @@ def main() -> int:
             return 1
         exclude_methods = parse_compiled_methods(args.exclude_methods)
 
-    if args.salt_hex:
-        salt = bytes.fromhex(args.salt_hex)
-        if len(salt) != 16:
-            print('❌ --salt-hex 必须是 16 字节(32 位 hex)', file=sys.stderr)
+    if args.seed_hex:
+        try:
+            seed = bytes.fromhex(args.seed_hex)
+        except ValueError:
+            print('❌ --seed-hex 不是合法 hex', file=sys.stderr)
+            return 1
+        if len(seed) != 8:
+            print('❌ --seed-hex 必须是 8 字节(16 位 hex)', file=sys.stderr)
             return 1
     else:
-        salt = secrets.token_bytes(16)
+        seed = secrets.token_bytes(8)
 
-    # 幂等/复用:已有桩则沿用其 salt(否则旧密文解不开)
-    existing_salt, need_write_stub = read_existing_salt(args.decompiled)
-    if existing_salt is not None:
-        salt = existing_salt
+    # 幂等/复用:已有桩则沿用其 seed(否则旧密文解不开)
+    existing_seed, need_write_stub = read_existing_salt(args.decompiled)
+    if existing_seed is not None:
+        seed = existing_seed
+
+    # S2:密钥流是 O(1) 现算的,不存在"表"也就没有表长/扩容概念;
+    # 全局 offset 只是"已分配区段"的水位线(每条密文按需消耗 len 字节)。
+    seed_int = int.from_bytes(seed, 'big')
 
     total_str, total_cls, idx = 0, 0, 0
     skipped_system = skipped_excluded = skipped_stub = 0
-    all_stub_fields = []
-    all_backfills = []
     for path in sorted(iter_smali_files(args.decompiled)):
         with open(path, encoding='utf-8') as fp:
             content = fp.read()
@@ -1288,43 +1182,24 @@ def main() -> int:
         if verdict == 'stub':
             skipped_stub += 1
             continue
-        n, idx, fields, backfills = process_file(path, cls_desc, includes, excludes,
-                                                 exclude_methods, salt, idx)
+        n, idx, backfills = process_file(path, cls_desc, includes, excludes,
+                                         exclude_methods, seed_int, idx)
         if n:
             total_str += n
             total_cls += 1
-            all_stub_fields.extend(fields)
-            if backfills:
-                all_backfills.extend(backfills)
-                # 报错二十四:字段初值已是合法明文字面量,回填走 <clinit>
-                # (同文件立即注入 —— process_file 已重写并加幂等标记,
-                #  这里重读注入,两条链互不干扰)
-                inject_clinit_backfills(path, backfills)
+        if backfills:
+            # 报错二十四/D4:字段初值保持明文,值由 <clinit> 运行期回填。
+            # process_file 已重写并加幂等标记,这里重读注入,两条链互不干扰。
+            inject_clinit_backfills(path, backfills)
 
     if need_write_stub and total_str > 0:
-        stub_path = write_stub(args.decompiled, salt, all_stub_fields)
+        stub_path = write_stub(args.decompiled, seed)
         stamp = write_components_stamp(args.decompiled, STUB_DESC)
         if not args.quiet:
             print(f'  🔧 注入解密桩: {os.path.relpath(stub_path, args.decompiled)}'
-                  f' (组件标记 {os.path.basename(stamp)}'
-                  f'{f", 字段常量 {len(all_stub_fields)} 个" if all_stub_fields else ""})')
-    elif total_str > 0 and all_stub_fields:
-        # 复用已有桩但本次产生了新字段(报错二十式):旧字段+新字段合并重写桩。
-        # 旧桩若缺字段声明,类里 <clinit> 的 sget-object ->F\d+: 引用会汇编失败/运行期取到 null。
-        old_fields = read_existing_stub_fields(args.decompiled)
-        merged = {name: payload for name, payload in old_fields}
-        for name, payload in all_stub_fields:
-            if name in merged and merged[name] != payload:
-                raise SystemExit(
-                    f'❌ 字段 {name} 与旧桩密文不一致(盐复用冲突),请清理解包目录后重跑')
-        merged.update({name: payload for name, payload in all_stub_fields})
-        combined = sorted(merged.items())              # 按字段名(=idx)稳定排序
-        write_stub(args.decompiled, salt, combined)
-        write_components_stamp(args.decompiled, STUB_DESC)
-        if not args.quiet:
-            print(f'  🔧 重写解密桩(合并字段): 新 {len(all_stub_fields)} 个,'
-                  f' 保留旧 {len(old_fields)} 个, 共 {len(combined)} 个')
-    # need_write_stub 但一条都没加密 → 不注入桩(不给产物塞无用类,且省掉 dex 内新类)
+                  f' (组件标记 {os.path.basename(stamp)})')
+    # 复用桩的场景 S2 无需任何字段合并:桩里只有种子,续跑时种子原样保留,
+    # 新密文用同一种子 + 新区段即可解 —— 这正是 S2 相对 v1/S1 的幂等优势。
 
     # 报错二十四 构建期防线:任何产物 .field 初值都不允许是 StrDec 字段引用
     # (FIELD 型 0x19 encoded static_value,ART 类初始化即失败 → 秒闪退无日志)。
@@ -1357,7 +1232,7 @@ def main() -> int:
         if skipped_stub:
             print(f'ℹ️ 解密桩自身跳过: {skipped_stub} 个')
         print(f'✅ 字符串加密完成: {total_str} 条 / {total_cls} 个类'
-              f' (salt={base64.b64encode(salt).decode("ascii")[:8]}..., '
+              f' (seed={seed.hex()}, '
               f'桩={"已注入" if (need_write_stub and total_str) else "复用/未用"})')
         if total_str == 0:
             print('⚠️ 没有任何字符串被加密 —— 检查规则是否命中(系统/依赖类会被硬排除)',
