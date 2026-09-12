@@ -745,14 +745,87 @@ _ILLEGAL_FIELD_INIT_RE = re.compile(
 # 只扫"我们处理过的类"(含 CLASS_MARK)与解密桩自身:没被规则命中的类(硬排除的
 # androidx/kotlin 等)本就不归本模块管,不能拿它们的字段去 fail 构建。
 # 桩自身的 `.field ... SEED:J` 是 long,不在扫描面内。
-_ILLEGAL_FIELD_LITERAL_RE = re.compile(
+_FIELD_STRING_LITERAL_RE = re.compile(
     r'^[ \t]*\.field[^\n]*[A-Za-z_$][\w$]*:(?:Ljava/lang/String;|\[Ljava/lang/String;)'
-    r'[ \t]*=[ \t]*"', re.M)
+    r'[ \t]*=[ \t]*"')
 
 
 def _scope_allows_field_scan(content: str) -> bool:
     """该文件是否属于"本模块的加密面"(据此决定字段初值断言是否适用)。"""
     return CLASS_MARK in content or STUB_DESC in content
+
+
+def field_literal_is_skipped(plain: str) -> bool:
+    """字段分支【按设计保留明文初值、不进加密面】的判定(只看已解析出的明文值)。
+    值解析失败(孤立代理项等)另属一类,由 `_scan_illegal_field_literals` 放行。
+
+    ⚠️ 这是字段分支与构建期断言【唯一共享】的真相来源,两处必须调用同一函数 ——
+    任何一边单独改判定,都会让断言把"设计内跳过"判成"去初值漏改"而 fail-fast
+    (2026-09-12 云端事故:`**` 全量规则下 okhttp3/HttpUrl 的 FRAGMENT_ENCODE_SET=""
+    → 整包构建被误拦),或反过来让真漏改逃过断言。
+
+    两类跳过(与 process_file 字段分支逐条对应):
+      ① 空串 —— 无信息量;桩对 3 字节 payload 走"原样返回"兜底会把 Base64 串
+         本身当明文返回(语义错误),故不能加密
+      ② 编译器调试/内联标记串($i$f$/$changed/…)—— 见 _SKIP_STRING_PREFIXES
+
+    本函数【只判值本身】,"值解析不出来"的情况见 `_field_literal_parse_failed`。
+    """
+    return (not plain) or is_instrumentation_string(plain)
+
+
+def _scan_illegal_field_literals(content: str):
+    """加密面内的"去初值漏改"字段行(逐行判定,与字段分支同源)。
+
+    为什么不能直接用 `_FIELD_STRING_LITERAL_RE.search(content)` 一票否决:
+    字段分支有【按设计保留明文初值】的类别,全文件粗扫会把它们一起判成漏改 →
+    误拦整包构建(2026-09-12 云端事故,`**` 规则命中 okhttp3/HttpUrl、
+    guava CharMatcher$Invisible 时必现)。
+
+    三类"设计内保留"(与 process_file 字段分支逐条对应):
+      ① 空串、② 编译器调试/内联标记串   → field_literal_is_skipped()
+      ③ 解析失败(孤立代理项等 ValueError)→ 本函数单独放行,见下方注释
+
+    返回 [(行文本, 命中正则), ...];命中即"该去掉的初值还在",调用方 fail-fast。
+    判定流程与 process_file 字段分支逐条对齐:
+      解析不出字面量      → 不是本断言的管辖对象(字段分支同样不处理)
+      值解析失败          → 设计内保留(跳过),见下方【决策 A】
+      值被跳过类别命中    → 设计内保留(跳过)
+      其余一律算漏改
+    """
+    hits = []
+    for line in content.split('\n'):
+        m = _FIELD_STRING_LITERAL_RE.match(line)
+        if not m:
+            continue
+        fparsed = parse_field_string(line)
+        if not fparsed:
+            # 引号不闭合等异常形态 —— 字段分支也不会去初值,不算漏改
+            continue
+        _fm, fliteral, _ftail = fparsed
+        try:
+            fplain = smali_unescape(fliteral)
+        except (ValueError, UnicodeDecodeError):
+            # 【决策 A(2026-09-12,用户拍板)】无法安全解析(孤立代理项等)
+            # → 字段分支跳过并保留明文初值,断言【同样放行】,判定与实现同源。
+            #
+            # 为什么这一类就该放行(而非"漏改"):
+            #   与 ①② 同源 —— 加密这条路对它是【走不通】而不是【没走】:
+            #   smali_unescape 确定性拒绝,去初值后无法构造回填链(回填链要先
+            #   把明文加密成 Base64,前提是能拿到明文),强行处理只会更糟。
+            #   已知实例 guava `CharMatcher$Invisible.RANGE_STARTS` 含 \ud800,
+            #   值是字符区间查表用的控制字符,非敏感数据,留明文无风险。
+            #
+            # ⚠️ 此前这里【刻意判为漏改】以防"本该处理却因解析失败留下明文"
+            # 被静默放掉。改为放行后,该风险由 process_file 的告警行兜底:
+            # 解析失败时字段分支会打印
+            # `⚠️ 跳过无法安全解析的字段字面量(...)`(见该分支),
+            # 产物里出现该类明文【必定伴随告警】,不是静默失败。
+            continue
+        if field_literal_is_skipped(fplain):
+            continue
+        hits.append((line, m))
+    return hits
 
 
 def is_system_class(cls_dot: str) -> bool:
@@ -997,10 +1070,12 @@ def process_file(path: str, cls_desc: str, includes, excludes,
                 continue
             if idx > IDX_MAX:
                 raise SystemExit(f'❌ 加密字符串数超过 {IDX_MAX}(idx 3 字节上限),请缩小规则范围')
-            if is_instrumentation_string(fplain) or not fplain:
-                # 编译器调试/内联标记:保留明文字面量
-                # 空串:无信息量,且桩对 3 字节 payload 走"原样返回"兜底会返回
-                # Base64 串本身(语义错误)→ 一律跳过,不进加密面
+            if field_literal_is_skipped(fplain):
+                # ① 空串:无信息量,且桩对 3 字节 payload 走"原样返回"兜底会返回
+                #    Base64 串本身(语义错误)
+                # ② 编译器调试/内联标记串:保留明文,不占 idx
+                # 两类都【按设计】保留明文初值,断言侧靠同一函数识别(见
+                # field_literal_is_skipped 的说明),不会被判成"去初值漏改"。
                 out.append(line)
                 continue
             fenc = fplain.encode('utf-8')
@@ -1322,8 +1397,13 @@ def main():
             continue
         if _ILLEGAL_FIELD_INIT_RE.search(c):
             illegal.append(cls_path)
-        elif _scope_allows_field_scan(c) and _ILLEGAL_FIELD_LITERAL_RE.search(c):
-            literal.append(cls_path)
+        elif _scope_allows_field_scan(c):
+            # 【与字段分支同源判定】逐行过滤"按设计保留明文初值"的类别
+            # (空串 / 编译器调试标记串),只把真漏改算进来 —— 见
+            # _scan_illegal_field_literals 的说明(2026-09-12 云端误拦事故)。
+            for line, _m in _scan_illegal_field_literals(c):
+                literal.append((cls_path, line))
+                break
     if illegal:
         sample = os.path.relpath(illegal[0], args.decompiled)
         raise SystemExit(
@@ -1332,14 +1412,16 @@ def main():
             f'   该形态会被汇编成 FIELD 型(0x19) static_value,ART 类初始化即闪退'
             f'(报错二十四)。字段常量回填必须走 <clinit> 的 sget/sput 链。')
     if literal:
-        sample = os.path.relpath(literal[0], args.decompiled)
-        with open(literal[0], encoding='utf-8') as fp:
-            hit = _ILLEGAL_FIELD_LITERAL_RE.search(fp.read())
+        cls_path, line = literal[0]
+        sample = os.path.relpath(cls_path, args.decompiled)
         raise SystemExit(
             f'❌ 构建期断言失败:{len(literal)} 个文件的 String 字段初值仍是字面量 '
-            f'(去初值漏改):\n   {sample}\n   {hit.group(0).strip() if hit else ""}\n'
+            f'(去初值漏改):\n   {sample}\n   {line.strip()}\n'
             f'   该初值会原样进 dex 字符串池,`strings` 一扫即命中字段值明文 —— '
-            f'字段分支必须走 _strip_field_literal 去掉初值 + <clinit> 回填。')
+            f'字段分支必须走 _strip_field_literal 去掉初值 + <clinit> 回填。\n'
+            f'   (注:空串、编译器调试标记串、解析失败(孤立代理项)三类属设计内保留,'
+            f'由 field_literal_is_skipped()/_scan_illegal_field_literals() 识别,'
+            f'不会触发本断言)')
 
     if not args.quiet:
         if activity_mode:

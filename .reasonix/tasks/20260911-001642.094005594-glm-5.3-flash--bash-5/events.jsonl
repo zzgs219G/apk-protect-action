@@ -1,2 +1,0 @@
-{"sequence":1,"timestamp":"2026-09-11T00:38:58.558426597Z","event_type":"state_change","task_id":"20260911-001642.094005594-glm-5.3-flash--bash-5","session_id":"20260911-001642.094005594-glm-5.3-flash","state":"running","runtime_state":"alive"}
-{"sequence":2,"timestamp":"2026-09-11T00:41:42.434594068Z","event_type":"state_change","task_id":"20260911-001642.094005594-glm-5.3-flash--bash-5","session_id":"20260911-001642.094005594-glm-5.3-flash","state":"succeeded","runtime_state":"exited"}
