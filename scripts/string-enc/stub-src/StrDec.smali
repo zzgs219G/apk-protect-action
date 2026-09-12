@@ -18,7 +18,7 @@
 .end method
 
 .method public static d(Ljava/lang/String;)Ljava/lang/String;
-    .locals 11
+    .locals 14
 
     const/4 v0, 0x2
 
@@ -72,45 +72,76 @@
 
     array-length v0, v1
 
-    add-int/lit8 v0, v0, -0x3
+    const/4 v5, 0x3
 
-    new-array v5, v0, [B
+    sub-int/2addr v0, v5
+
+    new-array v6, v0, [B
+
+    :cond_1
+    if-ge v2, v0, :cond_2
+
+    int-to-long v8, v2
+
+    add-long/2addr v8, v3
+
+    ushr-long v10, v8, v5
+
+    const-wide v12, -0x61c8864680b583ebL
+
+    mul-long/2addr v10, v12
+
+    const-wide/high16 v12, 0x5eed000000000000L    # 1.854068899003674E149
+
+    add-long/2addr v10, v12
+
+    invoke-static {v10, v11}, Lcom/nc/strdec/StrDec;->mix64(J)J
+
+    move-result-wide v10
+
+    const-wide/16 v12, 0x7
+
+    and-long/2addr v8, v12
+
+    long-to-int v8, v8
 
     :goto_0
+    if-ge v8, v7, :cond_1
+
     if-ge v2, v0, :cond_1
 
-    add-int/lit8 v6, v2, 0x3
+    mul-int/lit8 v9, v8, 0x8
 
-    aget-byte v6, v1, v6
+    ushr-long v12, v10, v9
 
-    and-int/lit16 v6, v6, 0xff
+    long-to-int v9, v12
 
-    int-to-long v7, v2
+    add-int/lit8 v12, v2, 0x3
 
-    add-long/2addr v7, v3
+    aget-byte v12, v1, v12
 
-    const-wide/high16 v9, 0x5eed000000000000L    # 1.854068899003674E149
+    and-int/lit16 v12, v12, 0xff
 
-    invoke-static {v9, v10, v7, v8}, Lcom/nc/strdec/StrDec;->keyByte(JJ)I
+    and-int/lit16 v9, v9, 0xff
 
-    move-result v7
+    xor-int/2addr v9, v12
 
-    xor-int/2addr v6, v7
+    int-to-byte v9, v9
 
-    int-to-byte v6, v6
+    aput-byte v9, v6, v2
 
-    aput-byte v6, v5, v2
+    add-int/lit8 v8, v8, 0x1
 
     add-int/lit8 v2, v2, 0x1
 
     goto :goto_0
 
-    :cond_1
+    :cond_2
     new-instance v0, Ljava/lang/String;
 
     const-string v1, "UTF-8"
 
-    invoke-direct {v0, v5, v1}, Ljava/lang/String;-><init>([BLjava/lang/String;)V
+    invoke-direct {v0, v6, v1}, Ljava/lang/String;-><init>([BLjava/lang/String;)V
     :try_end_0
     .catchall {:try_start_0 .. :try_end_0} :catchall_0
 

@@ -74,8 +74,25 @@ public final class StrDec {
             // 必须用 byte[] + new String(byte[], "UTF-8"):v1/S1 草稿用 char[] +
             // new String(char[]) 的语义是 Latin-1,中文/emoji 多字节 UTF-8 会乱码。
             byte[] out = new byte[len];
-            for (int k = 0; k < len; k++) {
-                out[k] = (byte) ((raw[k + 3] & 0xFF) ^ keyByte(SEED, offset + k));
+            // 【块展开 (2026-09-12)】一个 mix64 产出 8 字节密钥流(w 的 j*8 位起),
+            // 旧写法每字节调一次 keyByte → 同一块被重算 8 次。这里按块算一次、
+            // 块内取 8 个字节,调用次数 len → ceil(len/8)。
+            //
+            // 【对齐(易错点)】内层 j 绝不能固定从 0 开始:offset 未必是 8 的倍数,
+            // 而块索引按 offset+k 算,块内起始位是 (offset+k)&7 而非 0 —— j 从 0
+            // 起会让 offset%8!=0 的每条字符串全部解错(计划书 §2.3 原样代码的缺陷)。
+            // 同理该块内密钥最多覆盖 len 的头部;尾部不足 8 字节时多余的位丢弃。
+            for (int k = 0; k < len; ) {
+                long w = mix64(SEED + ((offset + k) >>> 3) * GAMMA);
+                for (int j = (int) ((offset + k) & 7L); j < 8 && k < len; j++, k++) {
+                    // 【优化① (2026-09-12)】原写法 (int)((w >>> (j*8)) & 0xFFL) 会让
+                    // d8 在循环体里留一条 const-wide/16 v,0xff + and-long,每字节重载
+                    // 一次 64 位常量。改成先 long-to-int 再 int & 0xFF(and-int/lit16,
+                    // 立即数不占寄存器)→ 每字节少 1 条指令。位语义等价(高 32 位被丢弃前
+                    // 已先右移截断,与原来 &0xFFL 结果逐位相同)。
+                    int kb = (int) (w >>> (j * 8));
+                    out[k] = (byte) ((raw[k + 3] & 0xFF) ^ (kb & 0xFF));
+                }
             }
             return new String(out, "UTF-8");
         } catch (Throwable t) {

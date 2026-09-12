@@ -4,7 +4,7 @@
 # 造一个最小解包目录,跑完整加密流程,断言:
 #   ① 普通/中文/emoji 字符串被替换为密文 const-string + invoke-static d()
 #   ② 空串【不被加密】(3 字节 payload 会触发桩兜底、语义错误)
-#   ③ 字段常量初值被改写为密文(不再有 F 字段回填链)
+#   ③ 字段常量初值被去除(明文不再进字符串池),值由 <clinit> 回填链(含 intern)写入
 #   ④ 注入的桩含真种子、零哨兵残留、无 .line/.source
 #   ⑤ 幂等: 再跑一次,产物字节完全一致
 #   ⑥ 种子复用: 第二次跑读回第一次的种子(不重新生成)
@@ -65,10 +65,13 @@ RUN_CALLS="$(sed -n '/\.method public static run/,/\.end method/p' "$DEMO" | gre
 CLINIT_CALLS="$(sed -n '/constructor <clinit>/,/\.end method/p' "$DEMO" | grep -c 'invoke-static/range' || true)"
 chk "方法体内解密调用数 = 3" "[ '$RUN_CALLS' = 3 ]"
 chk "<clinit> 字段回填调用数 = 1" "[ '$CLINIT_CALLS' = 1 ]"
-# 字段:初值保持明文(报错二十四),值由 <clinit> 回填
-chk "字段初值保持明文(报错二十四)" "grep -q 'api.example.com' '$DEMO'"
+# 字段:初值已去掉(2026-09-12 字段去初值),值由 <clinit> 回填链写入(含 intern)
+chk "字段初值已去除(明文不再出现在字段行)" "! grep -q 'api.example.com' '$DEMO'"
+chk "字段声明仍保留(只去初值,不改修饰符)" "grep -q '\.field public static final API:Ljava/lang/String;$' '$DEMO'"
 chk "字段在 <clinit> 里回填" "grep -q 'sput-object v0, Lcom/demo/Demo;->API' '$DEMO'"
 chk "回填用 d() 解密" "grep -q 'StrDec;->d(Ljava/lang/String;)' '$DEMO'"
+chk "回填后经 intern()(去初值后引用语义唯一来源)" \
+    "sed -n '/constructor <clinit>/,/\.end method/p' '$DEMO' | grep -q 'Ljava/lang/String;->intern()Ljava/lang/String;'"
 chk "无 F000000 桩字段残留(S2 不再需要)" "! grep -q 'F000000' '$DEMO'"
 chk "无 FIELD 型 static_value 非法形态" "! grep -qE '=\s*Lcom/nc/strdec/StrDec;->' '$DEMO'"
 

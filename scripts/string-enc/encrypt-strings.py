@@ -578,6 +578,38 @@ def parse_field_string(line: str):
     return m, rest[:i], rest[i + 1:]
 
 
+def _strip_field_literal(line: str, m) -> 'str | None':
+    """字段去初值(2026-09-12):`.field ... X:Ljava/lang/String; = "明文"` → `.field ... X:...;`
+
+    只删"初值那一段",字面量之后保留(兼容 R8 的 `# annotations` 尾注与 `.field`
+    自身的其它修饰)。无法安全定位(如行尾有引号转义)时返回 None,调用方保持原样。
+
+    为什么不用计划书 §3.4 那种 sub 写法:① 字面量类用 [^"]* 时遇到转义引号会提前
+    收尾;② 非贪婪 + 行尾锚点在同一行有多个 等号引号 时会吃掉错的一段。
+    这里复用 parse_field_string 已经算好的引号区间,精确到字符。"""
+    rest = m.group('rest')                  # 初值所在区间(从第一个 `"` 之后开始)
+    lit_len = 0                             # 字面量在 rest 里的长度(可含转义)
+    i = 0
+    while i < len(rest):
+        c = rest[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == '"':
+            break
+        i += 1
+    if i > len(rest):
+        return None
+    lit_len = i
+    if lit_len >= len(rest) or rest[lit_len] != '"':
+        return None                         # 引号不闭合
+    head = line[:m.start('rest') - 1]       # 去掉开引号(leftover = "   = ")
+    tail = rest[lit_len + 1:]               # 闭合引号之后的一切(R8 注解尾注等)
+    # 把 "= <可选空白>" 一并去掉(head 形如 '.field ... X:Ljava/lang/String;   = ')
+    head = re.sub(r'[ \t]*=[ \t]*$', '', head)
+    return head.rstrip() + tail
+
+
 # ── splitmix64 密钥流(Python 侧参考实现;与 StrDec.java 逐字节一致) ──────
 # 【易错点,改这两行前先读】
 #  ① Python 的 >> 是算术右移,必须保证操作数是已掩码的非负数(每步 & MASK64);
@@ -707,6 +739,20 @@ _FIELD_REF_RE = re.compile(
 # 不允许的初值类型,ART 类初始化阶段(字节码执行之前)即失败 → 秒闪退且无日志。
 _ILLEGAL_FIELD_INIT_RE = re.compile(
     r'^[ \t]*\.field[^\n]*=[ \t]*' + re.escape(STUB_DESC) + r'->F\d+:', re.M)
+
+# 字段去初值断言(2026-09-12):目标类的 String/String[] 字段初值绝不允许是
+# 明文字面量 —— 否则 `strings` 扫产物照样命中(本次改动的存在理由)。
+# 只扫"我们处理过的类"(含 CLASS_MARK)与解密桩自身:没被规则命中的类(硬排除的
+# androidx/kotlin 等)本就不归本模块管,不能拿它们的字段去 fail 构建。
+# 桩自身的 `.field ... SEED:J` 是 long,不在扫描面内。
+_ILLEGAL_FIELD_LITERAL_RE = re.compile(
+    r'^[ \t]*\.field[^\n]*[A-Za-z_$][\w$]*:(?:Ljava/lang/String;|\[Ljava/lang/String;)'
+    r'[ \t]*=[ \t]*"', re.M)
+
+
+def _scope_allows_field_scan(content: str) -> bool:
+    """该文件是否属于"本模块的加密面"(据此决定字段初值断言是否适用)。"""
+    return CLASS_MARK in content or STUB_DESC in content
 
 
 def is_system_class(cls_dot: str) -> bool:
@@ -958,9 +1004,29 @@ def process_file(path: str, cls_desc: str, includes, excludes,
                 out.append(line)
                 continue
             fenc = fplain.encode('utf-8')
-            # 【报错二十四/D4】初值必须保持明文字面量:字段值靠 <clinit>
-            # 运行期回填(直接改初值 = 业务读到密文;FIELD 型 static_value = 秒闪退)
-            out.append(line)
+            # 【报错二十四/D4 + 字段去初值(2026-09-12)】
+            # 初值从"明文字面量"改为"无初值":明文不再出现在任何字段声明里,
+            # `strings` 扫产物对字段值零命中。字段值仍由 <clinit> 回填链写入
+            # (inject_clinit_backfills),链里含 intern(),是字段值的唯一来源。
+            #
+            # 【与报错二十四的区别(为什么这次允许去初值)】
+            # 报错二十四的非法形态是 `.field ... = StrDec;->FNNNNNN`(引用型
+            # encoded static_value,FIELD 型 0x19)—— dex 规范不允许。而"无初值"
+            # 是 STRING 型初值 offset=0(NO_INDEX),dex 规范明确允许(static
+            # final 字段由 <clinit> 赋值是 javac 的常规产物),两者机制不同。
+            # 注意:这仍属静态数据区改写,只有 `apktool b` 真汇编 + androguard
+            # 读回才能证明合法 —— 冒烟测试⑨/断言 A9 就是干这个的(报错二十四
+            # "汇编器宽容 ≠ 产物合法"教训)。
+            #
+            # 【幂等】初值已去掉的行不匹配 parse_field_string(需要 '= "..."'),
+            # 故重跑时自然不重复回填;代价是"初值永远拆不回明文"——这正是本改动
+            # 的意图(明文不该留在产物里)。用 git 恢复源码重跑才是重回明文的正路。
+            new_field = _strip_field_literal(line, fm)
+            if new_field is None:
+                print(f'⚠️ 字段行形态无法安全去初值,保持原样: {path}', file=sys.stderr)
+                out.append(line)
+                continue
+            out.append(new_field)
             field_backfills.append({
                 'owner_cls': cls_desc,            # Lcom/x/Y; 形式
                 'field': fm.group('name'),
@@ -1102,6 +1168,11 @@ def inject_clinit_backfills(path: str, backfills) -> bool:
         fill_lines.append(f'    invoke-static/range {{v0 .. v0}}, '
                           f'{STUB_DESC}->d(Ljava/lang/String;)Ljava/lang/String;')
         fill_lines.append('    move-result-object v0')
+        # 【intern (2026-09-12)】字段去初值后,常量的 interned 实例来自这里,
+        # 必须保持"解密结果 == 编译期字面量"的引用语义(历史 §3.7.4 曾依赖它)。
+        fill_lines.append('    invoke-virtual {v0}, '
+                          'Ljava/lang/String;->intern()Ljava/lang/String;')
+        fill_lines.append('    move-result-object v0')
         fill_lines.append(f'    sput-object v0, {bf["owner_cls"]}->{bf["field"]}:{ty}')
 
     if has_clinit:
@@ -1242,6 +1313,7 @@ def main():
     # 此前版本曾把字段初值改写成该形态且 apktool 编译器宽容放行,教训:
     # 汇编器宽容 ≠ 产物合法。每次跑完都复读全包做硬断言,违反即 fail-fast。
     illegal = []
+    literal = []
     for cls_path in iter_smali_files(args.decompiled):
         try:
             with open(cls_path, encoding='utf-8') as fp:
@@ -1250,6 +1322,8 @@ def main():
             continue
         if _ILLEGAL_FIELD_INIT_RE.search(c):
             illegal.append(cls_path)
+        elif _scope_allows_field_scan(c) and _ILLEGAL_FIELD_LITERAL_RE.search(c):
+            literal.append(cls_path)
     if illegal:
         sample = os.path.relpath(illegal[0], args.decompiled)
         raise SystemExit(
@@ -1257,6 +1331,15 @@ def main():
             f'(.field ... = {STUB_DESC}->F...):\n   {sample}\n'
             f'   该形态会被汇编成 FIELD 型(0x19) static_value,ART 类初始化即闪退'
             f'(报错二十四)。字段常量回填必须走 <clinit> 的 sget/sput 链。')
+    if literal:
+        sample = os.path.relpath(literal[0], args.decompiled)
+        with open(literal[0], encoding='utf-8') as fp:
+            hit = _ILLEGAL_FIELD_LITERAL_RE.search(fp.read())
+        raise SystemExit(
+            f'❌ 构建期断言失败:{len(literal)} 个文件的 String 字段初值仍是字面量 '
+            f'(去初值漏改):\n   {sample}\n   {hit.group(0).strip() if hit else ""}\n'
+            f'   该初值会原样进 dex 字符串池,`strings` 一扫即命中字段值明文 —— '
+            f'字段分支必须走 _strip_field_literal 去掉初值 + <clinit> 回填。')
 
     if not args.quiet:
         if activity_mode:
