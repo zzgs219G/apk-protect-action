@@ -29,6 +29,13 @@
 外加解密桩自身。`!` 排除行在非系统类范围内优先级最高;
 命中系统前缀的类无条件硬排除(与 classify 的实际判定顺序一致)。
 
+常用第三方依赖(反射/注解序列化/网络协议/跨进程绑定库)同列硬排除——
+此类库的 const-string 承载类名/字段名/协议/序列化标记(反射与注解处理必需),
+加密后 `Class.forName`/`getAnnotation`/序列化匹配、甚至网络协议会失效;
+加固只保护自家代码(com.xixin.box.*),第三方字符串本非重要资产。当前追加:
+  okhttp3. okio. com.google.gson. org.jsoup. org.commonmark.
+  io.ktor. coil3. moe.shizuku.
+
 【算法 v2/S2(与 stub 里的 Java 实现必须逐字节一致,靠对拍测试锁定)】
   seed        : 8 字节随机(secrets.token_bytes(8);--seed-hex 供复现)
   payload     : Base64( offset_be24 || cipher )
@@ -106,6 +113,21 @@ SYSTEM_CLASS_PREFIXES = (
     # 类/方法名一旦被加密/改写 → 崩溃捕获失效甚至自身崩溃。属"框架依赖",必须在
     # 规则层之上硬排除(与 kotlin./androidx. 同型)。前缀 'xcrash.' 覆盖其主包。
     'xcrash.',
+    # ── 常用第三方依赖包(2026-09-12 用户点名追加)──────────────────────────
+    # 以下来自 jian_box(app/build.gradle.kts)实际依赖，多为反射 / 注解序列化 /
+    # 网络协议 / 跨进程绑定库 —— 这些库里 const-string 承载了类名 / 字段名 /
+    # 协议/序列化标记(反射与注解处理必需)，一旦被加密，运行期 `Class.forName` /
+    # `getAnnotation` / 序列化/反序列化匹配、甚至 OkHttp 内部协议都会失效。
+    # 加固的本意只保护自家产品代码(com.xixin.box.*)，第三方依赖字符串本就不是
+    # 重要资产，且加密它们风险远大于收益 → 一律硬排除。
+    'okhttp3.',            # OkHttp：HTTP 客户端(内部拦截器/协议/注解 @Url 等)
+    'okio.',               # okio：OkHttp 底层 IO(ByteString/Buffer 序列化格式)
+    'com.google.gson.',    # Gson：反射 + @SerializedName 注解序列化
+    'org.jsoup.',          # jsoup：HTML 解析(选择器/反射)
+    'org.commonmark.',     # commonmark：Markdown 解析(行解析器反射注册)
+    'io.ktor.',            # Ktor：HTTP 客户端网络栈
+    'coil3.',              # Coil 3：Compose 图片加载(ImageView 工厂反射)
+    'moe.shizuku.',        # Shizuku：高权限跨进程服务绑定(JNI + binder)
 )
 
 IDX_MAX = (1 << 24) - 1                      # idx/offset 占 3 字节(共享表上限同源)
