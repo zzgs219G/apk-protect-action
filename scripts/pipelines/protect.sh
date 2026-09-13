@@ -125,7 +125,7 @@ log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → str
 # ── STEP 1: 提取证书指纹，生成 sig_hash.h（仅 --sigcheck） ──────────
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
   log_step 1 6 "提取证书指纹"
-  "$ROOT/scripts/sig-hash/make-sig-hash.sh" "$IN_APK" "$WORK/sig_hash.h"
+  "$ROOT/scripts/sigcheck/hash/make-sig-hash.sh" "$IN_APK" "$WORK/sig_hash.h"
 fi
 
 # ── STEP 2: dcc 转译（仅 --dex2c，--no-build 只产出工程包） ─────────
@@ -179,8 +179,8 @@ mkdir -p "$WORK/project"
 # LSG 标记注释生成 sig_log_data.h(XOR 密文,strings 不泄语义)。
 # 勾 sigcheck 或 envcheck 时需要;生成失败 fail-fast(文案缺失=编译必炸,早炸早定位)
 if [[ $WANT_SIGCHECK -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
-  python3 "$ROOT/scripts/sig-log/make-sig-log.py" \
-    "$ROOT/sigcheck/src/sig_check.c" "$ROOT/sigcheck/src/env_check.c" \
+  python3 "$ROOT/scripts/sigcheck/log/make-sig-log.py" \
+    "$ROOT/scripts/sigcheck/src/sig_check.c" "$ROOT/scripts/sigcheck/src/env_check.c" \
     "$WORK/sig_log_data.h"
 fi
 
@@ -192,12 +192,12 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
   # wildcard 都收（报错十一/十三教训），两种布局等价
   if [[ $WANT_DEX2C -eq 1 ]]; then
     mkdir -p "$WORK/project/jni/nc"
-    cp "$ROOT/sigcheck/src/sig_check.c" "$WORK/project/jni/nc/"
+    cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/nc/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/nc/"
     cp "$WORK/sig_log_data.h"           "$WORK/project/jni/nc/"
   else
     mkdir -p "$WORK/project/jni"
-    cp "$ROOT/sigcheck/src/sig_check.c" "$WORK/project/jni/"
+    cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/"
     cp "$WORK/sig_log_data.h"           "$WORK/project/jni/"
   fi
@@ -206,10 +206,10 @@ if [[ $WANT_ENVCHECK -eq 1 ]]; then
   # 环境检测(Frida/Xposed/调试器):与 sigcheck 同型并入同一 libnc.so(constructor 天然共存)
   if [[ $WANT_DEX2C -eq 1 ]]; then
     mkdir -p "$WORK/project/jni/nc"
-    cp "$ROOT/sigcheck/src/env_check.c" "$WORK/project/jni/nc/"
+    cp "$ROOT/scripts/sigcheck/src/env_check.c" "$WORK/project/jni/nc/"
   else
     mkdir -p "$WORK/project/jni"
-    cp "$ROOT/sigcheck/src/env_check.c" "$WORK/project/jni/"
+    cp "$ROOT/scripts/sigcheck/src/env_check.c" "$WORK/project/jni/"
   fi
   # envcheck 未勾 sigcheck 时也要有文案表(仅勾 envcheck 的组合)
   if [[ $WANT_SIGCHECK -ne 1 ]]; then

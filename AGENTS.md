@@ -41,12 +41,12 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 
 | 冻结模块 | 职责 | 钉死的回归测试 |
 |---|---|---|
-| `sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `tests/test_sig_check.sh`(宿主端编译+实包验证,若存在) |
+| `scripts/sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `tests/test_sig_check.sh`(宿主端编译+实包验证,若存在) |
 | `scripts/inject/inject-loadlib.py` | loadLibrary 插桩(幂等、多 dex、AXMLPrinter) | `tests/test_inject_loadlib.py`(冒烟,若存在) |
-| `scripts/sig-hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景,若存在) |
+| `scripts/sigcheck/hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景,若存在) |
 | `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: 回归测试内嵌 |
-| `sigcheck/dex2c/dcc/` | 第三方 dcc 工具(含内置 androguard) | 严禁任何改动(历史: 报错三/九) |
-| `sigcheck/tools/apktool.jar` | 解包/重打包工具 | 严禁替换版本(历史: 报错四/五) |
+| `tools/dcc/`(解压产物;真源 `tools/dcc.zip`) | 第三方 dcc 工具(含内置 androguard) | 严禁任何改动(历史: 报错三/九);真源包 `tools/dcc.zip` 严禁改包/换版 |
+| `tools/dcc/tools/apktool.jar` | 解包/重打包工具(apktool 3.0.3,随 dcc.zip 解压) | 严禁替换版本(历史: 报错四/五) |
 
 ### 为什么"100% 正确"也必须冻结
 

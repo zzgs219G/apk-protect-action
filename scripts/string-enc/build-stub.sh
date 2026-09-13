@@ -29,12 +29,12 @@
 #   tools/d8.jar — 仓库内固定版本 D8(r8 9.3.16,与 apktool.jar 同待遇)
 #   android-all.jar — $STUB_ANDROID_JAR 或 robolectric 默认路径(编译期 classpath,
 #                     提供 android.util.Base64)
-#   apktool.jar  — 仓库内 build/dcc/dcc/tools/apktool.jar(提供 baksmali)
+#   apktool.jar  — 仓库内 tools/dcc/tools/apktool.jar(dcc.zip 解压产物,提供 baksmali)
 set -euo pipefail
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _ROOT="$(dirname "$(dirname "$_HERE")")"                      # scripts/string-enc → 仓库根
-APKTOOL="${_ROOT}/build/dcc/dcc/tools/apktool.jar"
+APKTOOL="${_ROOT}/tools/dcc/tools/apktool.jar"
 
 SRC="$_HERE/stub-src/StrDec.java"
 OUT_DIR="${1:-$_HERE/stub-src}"

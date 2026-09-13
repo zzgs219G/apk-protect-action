@@ -19,7 +19,7 @@ _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _ENC="$(dirname "$_HERE")/encrypt-strings.py"
 _BUILD="$(dirname "$_HERE")/build-stub.sh"
 _ROOT="$(dirname "$(dirname "$(dirname "$_HERE")")")"   # tests → string-enc → scripts → 仓库根
-APKTOOL="${_ROOT}/build/dcc/dcc/tools/apktool.jar"
+APKTOOL="${_ROOT}/tools/dcc/tools/apktool.jar"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 

@@ -39,16 +39,15 @@ import sys
 SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')
 
 # androguard 从 dcc 目录导入(dcc 内置版,勿用 pip 版替换,见 make-filter-from-apk.py)
-# dcc 已改为 tools/dcc.zip 分发:目录缺失时从 zip 幂等解压到 <仓库根>/build/dcc/
+# dcc 已改为 tools/dcc.zip 分发:目录缺失时从 zip 幂等解压到 <仓库根>/tools/(得单层 tools/dcc/)
 _DCC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         '..', '..', 'build', 'dcc', 'dcc'))
+                                         '..', '..', 'tools', 'dcc'))
 
 
 def _ensure_dcc_dir():
     """dcc 摊开目录不存在时,从 tools/dcc.zip 解压(幂等)。返回 _DCC_DIR。"""
     if not os.path.isfile(os.path.join(_DCC_DIR, 'dcc.py')):
-        dcc_zip = os.path.normpath(os.path.join(_DCC_DIR, '..', '..', '..',
-                                                'tools', 'dcc.zip'))
+        dcc_zip = os.path.normpath(os.path.join(_DCC_DIR, '..', 'dcc.zip'))
         if not os.path.isfile(dcc_zip):
             raise FileNotFoundError(f'dcc 分发包缺失: {dcc_zip}')
         import zipfile
@@ -280,9 +279,9 @@ def _find_launcher_from_axml(manifest_path, package_name):
             if isinstance(xml_bytes, bytes) else str(xml_bytes)
     except ImportError as e:
         # 常见根因(报错六):dcc 内置 androguard 的 AXMLPrinter 依赖 lxml,
-        # runner 系统 python 不带 → pip3 install -r build/dcc/dcc/requirements.txt
+        # runner 系统 python 不带 → pip3 install -r tools/dcc/requirements.txt
         print(f'⚠️ androguard 不可用({_DCC_DIR}): {e};'
-              f'若提示缺 lxml,请先 pip3 install -r build/dcc/dcc/requirements.txt;'
+              f'若提示缺 lxml,请先 pip3 install -r tools/dcc/requirements.txt;'
               f'降级文本解析(仅对文本 XML 有效,二进制 AXML 必失败)', file=sys.stderr)
         return None
     except Exception as e:
