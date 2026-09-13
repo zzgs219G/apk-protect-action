@@ -37,9 +37,15 @@ _ORDER = {v: i for i, v in enumerate(DEX_VERSIONS)}
 
 
 def dcc_dir():
-    """dcc 内置 androguard 的路径(与 common.sh ensure_dcc 解压位置一致)。"""
+    """dcc 内置 androguard 的路径(与 common.sh ensure_dcc 解压位置一致: <仓库根>/tools/dcc)。
+
+    报错二十九: 本路径曾写死 <仓库根>/build/dcc/dcc;dcc 分发从 build/dcc 迁到 tools/dcc 时
+    漏改此处(路径写成 os.path.join(root, "build", "dcc", "dcc"),不含连续字面量 "build/dcc",
+    全仓 grep 搜不到),restore 阶段 sys.path 插入不存在的目录 → `import androguard`
+    ModuleNotFoundError。改动此文件时务必与 common.sh ensure_dcc 的目标位置保持一致。
+    """
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(root, "build", "dcc", "dcc")
+    return os.path.join(root, "tools", "dcc")
 
 
 def minsdk_to_dex_version(min_sdk: int) -> str:
@@ -54,7 +60,13 @@ def minsdk_to_dex_version(min_sdk: int) -> str:
 
 
 def read_manifest_min_sdk(apk_path: str) -> int:
-    sys.path.insert(0, dcc_dir())
+    d = dcc_dir()
+    # fail-fast: 路径写错时给出可诊断错误,而不是 sys.path 静默忽略不存在的目录后
+    # 抛出看不懂的 ModuleNotFoundError(报错二十九的暴露形态)。
+    if not os.path.isfile(os.path.join(d, "androguard", "core", "bytecodes", "apk.py")):
+        raise FileNotFoundError(
+            f"dcc 内置 androguard 缺失: {d};请确认 tools/dcc.zip 已解压(见 common.sh ensure_dcc)")
+    sys.path.insert(0, d)
     from androguard.core.bytecodes.apk import APK
     a = APK(apk_path)
     return int(a.get_min_sdk_version() or 1)
