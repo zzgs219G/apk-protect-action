@@ -68,12 +68,13 @@ jobs:
 
       - name: 解压 dcc 分发包
         run: |
-          mkdir -p build   # unzip 的 checkdir 不会自建多级父目录,build/ 不在仓库里必须先建(报错十五)
-          unzip -qo tools/dcc.zip -d build/dcc
-          test -f build/dcc/dcc/dcc.py || { echo "❌ dcc.zip 解压产物异常"; exit 1; }
+          # zip 内顶层已是 dcc/,解压到 tools/ 得单层 tools/dcc/(tools/ 必然存在 → 无需 mkdir,
+          # 也避开报错十五"unzip 不自建多级父目录";产物由 .gitignore 的 /tools/dcc/ 忽略)
+          unzip -qo tools/dcc.zip -d tools
+          test -f tools/dcc/dcc.py || { echo "❌ dcc.zip 解压产物异常"; exit 1; }
 
       - name: 安装 python 依赖(dcc)
-        run: pip3 install -r build/dcc/dcc/requirements.txt
+        run: pip3 install -r tools/dcc/requirements.txt
 
       - name: 勾选前置校验
         run: |

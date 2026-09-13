@@ -1,4 +1,6 @@
 build/
+# dcc.zip 解压产物(tools/dcc/ 单层,真源是 tools/dcc.zip)
+/tools/dcc/
 .gradle/
 .idea/
 local.properties

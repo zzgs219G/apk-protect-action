@@ -66,13 +66,14 @@ require_env() {
   [[ -n "${!name:-}" ]] || { log_err "环境变量 $name 未设置${2:+（$2）}"; exit 1; }
 }
 
-# ensure_dcc [解压根目录，默认 "$ROOT/build/dcc"] → 解压后 dcc 目录路径(stdout)
+# ensure_dcc [解压根目录，默认 "$ROOT/tools"] → 解压后 dcc 目录路径(stdout)
 # dcc 已从 sigcheck/dex2c/dcc/ 摊开目录改为 tools/dcc.zip 分发(单文件制品,
-# 与 dpt-shell 形态一致)。zip 内顶层是 dcc/,解压到 <根>/ 即得 <根>/dcc。
+# 与 dpt-shell 形态一致)。zip 内顶层是 dcc/,解压到 tools/ 即得单层 tools/dcc/
+# (与真源 dcc.zip 同目录);解压产物不进版本库,由 .gitignore 的 /tools/dcc/ 忽略。
 # 幂等:目标已存在(dcc.py 可见)则跳过解压,重复调用零开销。
 DCC_ZIP="$ROOT/tools/dcc.zip"    # dcc 分发包(唯一真源,严禁与解压产物混改)
 ensure_dcc() {
-  local dest="${1:-$ROOT/build/dcc}"
+  local dest="${1:-$ROOT/tools}"
   if [[ -f "$dest/dcc/dcc.py" ]]; then
     echo "$dest/dcc"
     return 0

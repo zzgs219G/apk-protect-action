@@ -17,19 +17,18 @@ import os
 import sys
 
 # 本脚本位于 scripts/filter/,dcc 从 tools/dcc.zip 分发 → 解压产物在
-# <仓库根>/build/dcc/dcc(缺失时从 zip 幂等解压)
+# <仓库根>/tools/dcc(单层;缺失时从 zip 幂等解压)
 # (更早教训 0f80c69: 移动脚本后基于 __file__ 的相对路径必须重算,
 #  否则云端 ModuleNotFoundError: androguard)
 DCC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       '..', '..', 'build', 'dcc', 'dcc')
+                       '..', '..', 'tools', 'dcc')
 
 
 def _ensure_dcc_dir():
     """dcc 摊开目录不存在时,从 tools/dcc.zip 解压(幂等)。返回绝对路径。"""
     dcc_dir = os.path.abspath(DCC_DIR)
     if not os.path.isfile(os.path.join(dcc_dir, 'dcc.py')):
-        dcc_zip = os.path.normpath(os.path.join(dcc_dir, '..', '..', '..',
-                                                'tools', 'dcc.zip'))
+        dcc_zip = os.path.normpath(os.path.join(dcc_dir, '..', 'dcc.zip'))
         if not os.path.isfile(dcc_zip):
             raise FileNotFoundError(f'dcc 分发包缺失: {dcc_zip}')
         import zipfile
