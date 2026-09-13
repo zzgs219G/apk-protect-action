@@ -17,7 +17,7 @@
 #   --sigcheck --dex2c   → 提取指纹 → dcc 转译 → sig_check.c 合入同一 NDK 工程 →
 #                          mark-native.py 壳替换（不插 loadLibrary：onCreate 已抽进 so，
 #                          删 <clinit> 的 loadLibrary 会让 native 壳直接自爆）→ 回编
-#   --envcheck           → 环境检测(Frida/Xposed/调试器)并入 libnc.so(可与其余模块任意组合)
+#   --envcheck           → 环境检测(Frida/Xposed/调试器/libc内存CRC/常驻复查)并入 libnc.so(可与其余模块任意组合)
 #   --packer             → 占位报错（dpt-shell 流程迁移中，与旧 packer.sh 一致）
 #
 # dex2c 类名来源决策(规则优先,修复联合勾选无视用户规则的 bug):
