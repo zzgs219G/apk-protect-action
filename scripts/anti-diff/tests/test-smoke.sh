@@ -50,6 +50,12 @@ cat > "$WORK/dec/smali/com/demo/A.smali" <<'EOF'
     return-object v1
 .end method
 
+.method public static wide()J
+    .locals 6
+    const-wide v0, 0x1L
+    return-wide v0
+.end method
+
 .method public static baz()V
     .registers 3
     const/4 v0, 0x0
@@ -139,6 +145,34 @@ grep -q '白名单排除' "$WORK/wl.log" \
   || { echo '❌ 白名单未生效'; exit 1; }
 grep -q ':cond_0' "$WORK/dec4/smali/androidx/demo/S.smali" \
   || { echo '❌ 白名单类被改动了'; exit 1; }
+
+# ── 断言 4e:变换 E(条件反折)生效,且结构合法 ─────────────────────────
+# foo 里有 if-eqz p0, :cond_0 → 反折后必须出现"反转指令 + goto + 新标签:"
+awk '/\.method public static foo/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/foo.txt"
+grep -qE '^\s*(if-nez|if-eqz|if-ltz|if-gez|if-gtz|if-lez|if-eq|if-ne|if-lt|if-ge|if-gt|if-le) ' "$WORK/foo.txt" \
+  || { echo '❌ 变换 E 未生效(foo 无条件指令)'; cat "$WORK/foo.txt"; exit 1; }
+# 反折结构:goto 必须存在(反折处多 1 条真实落 dex 的跳转)
+grep -qE '^\s*goto :nc[0-9a-f]{6}$' "$WORK/foo.txt" \
+  || { echo '❌ 变换 E 未生效(无跳转链 goto)'; cat "$WORK/foo.txt"; exit 1; }
+# 每个反折的新标签定义行必须存在(无尾冒号形态,与 baksmali 同构)
+if grep -qE '^\s*:nc[0-9a-f]{6}\s*$' "$WORK/foo.txt"; then :; else
+  echo '❌ 变换 E 结构不完整(无新标签定义)'; cat "$WORK/foo.txt"; exit 1
+fi
+
+# ── 断言 4f:变换 C 强化(return 前插桩)生效,wide 伴生寄存器被隔离 ──
+awk '/\.method public static wide/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/wide.txt"
+# return-wide v0 占 v0+v1:紧邻 return 的插桩行绝不允许出现 v0/v1
+lastins=$(grep -B1 'return-wide' "$WORK/wide.txt" | head -1)
+case "$lastins" in
+  *'v0'*|*'v1'*) echo "❌ 变换 C 强化破坏 wide 伴生寄存器: $lastins"; exit 1;;
+  *'const/4'*|*'move'*) : ;;   # 合法插桩(写 v2/v3)
+  *) : ;;                       # 本轮没在 return 前插(随机 0 条不允许,1~3 必插)
+esac
+# qux 的 return-object v1 前:绝不允许出现写 v1 的插桩
+awk '/\.method public static qux/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/qux.txt"
+if grep -B1 'return-object v1' "$WORK/qux.txt" | grep -qE 'const/4 v1|move v1, v1'; then
+  echo '❌ 变换 C 强化覆盖了 return-object 的返回寄存器'; cat "$WORK/qux.txt"; exit 1
+fi
 
 # ── 断言 5:带 try-catch 的 baz() 没有插入垃圾指令(const/4 v1, 0x0 不该出现在 baz 体内) ──
 # 提取 baz 方法体

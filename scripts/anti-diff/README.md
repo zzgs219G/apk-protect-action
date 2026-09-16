@@ -17,6 +17,14 @@
 | A 标签重命名 | 方法内 `:cond_0`/`:goto_0` 等 → `:ncXXXXXX` | `<init>`/`<clinit>` |
 | B 类内块重排 | `.method`/`.field` 块确定性乱序 | `<init>`/`<clinit>` 与含 `.annotation` 的块钉在原地 |
 | C 入口垃圾指令 | 方法首插 1~3 条 `const/4`/`move` | `<init>`/`<clinit>`、native、含 try-catch、`.locals < 4` 或 `.registers` 模式(低端寄存器可能是参数) |
+| C+ return 前插桩 | 每个 `return` 前插 1~3 条(打破"只插方法开头"的可识别模式,实际效果.md 反馈) | 同 C;ban 被 return 读取的寄存器及 return-wide 伴生寄存器 |
+| E 条件反折 | `if-eqz vX, :L` → `if-nez vX, :新` + `goto :L` + `:新:`,真实多 1 条 goto 落 dex | `<init>`/`<clinit>`、native、含 try-catch、fall-through 恰为目标的分支;单方法最多 `--max-cond-flip`(默认 3)处 |
+
+> 报错二十二教训(真实包 MT 对比实测,见 docs/对比测试apk/实际效果.md):
+> 变换 A(标签)与 B(块重排)在 dex 层**完全无效**——标签只是 baksmali 的
+> 临时命名、dex method_ids 不记源码顺序,回编→再反编译后 100% 复原。
+> 真正落进 dex 的只有 C/C+/E 的真实指令。判断"是否有效"必须以
+> "回编→再反编译→MT 对比"往返为准,smali 文本 diff 全红不算数。
 
 白名单:android./androidx./kotlin./okhttp3./org.jsoup. 等系统与第三方依赖
 类硬排除(与 stringenc `SYSTEM_CLASS_PREFIXES` 同型名单,见
@@ -28,7 +36,7 @@
 ## CLI
 
 ```
-anti-diff.py <解包目录> [--seed-hex HEX] [--level 1] [--max-per-method N]
+anti-diff.py <解包目录> [--seed-hex HEX] [--level 1] [--max-per-method N] [--max-cond-flip N]
 ```
 
 - 不给 `--seed-hex` 时,种子 = SHA-256(全部 smali 相对路径+内容),天然幂等;
