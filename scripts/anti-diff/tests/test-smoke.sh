@@ -125,6 +125,81 @@ grep -qE '^\s*(const/4 v[0-3], 0x0|move v[0-3], v[0-3])$' "$WORK/qux.txt" \
 grep -qF '"CC(remember):MainActivity.kt#9igjgp"' "$WORK/qux.txt" \
   || { echo '❌ qux 字符串被误改'; exit 1; }
 
+# ── 断言 4c2:报错三十四回归——参数槽多的方法禁止提升 .locals ─────────
+# _bump_locals 把 .locals 0→4 后参数物理号整体平移(pN → v(N+4));若方法
+# 参数槽 >12(含 wide J/D 计 2 槽、非 static 含 this),提升后最大参数
+# 物理号 > v15,超 dalvik 4-bit 寄存器编码槽,回编必炸
+# "Invalid register: v16. Must be between v0 and v15"(真实包 TaskEntity
+# .copy$default 实证,13 参数槽含 1 个 J)。
+mkdir -p "$WORK/dec5/smali/com/demo"
+cat > "$WORK/dec5/smali/com/demo/W.smali" <<'EOF'
+.class public Lcom/demo/W;
+.super Ljava/lang/Object;
+
+.method public static synthetic copy$default(Lcom/demo/W;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;JILjava/lang/Object;)Lcom/demo/W;
+    .locals 0
+
+    and-int/lit8 p12, p11, 0x1
+
+    if-eqz p12, :cond_0
+
+    iget p1, p0, Lcom/demo/W;->id:I
+
+    :cond_0
+    and-int/lit8 p12, p11, 0x2
+
+    if-eqz p12, :cond_1
+
+    iget-object p2, p0, Lcom/demo/W;->taskType:Ljava/lang/String;
+
+    :cond_1
+    move-wide p11, p9
+
+    move-object p9, p7
+
+    move-object p10, p8
+
+    move-object p7, p5
+
+    move-object p8, p6
+
+    move-object p5, p3
+
+    move-object p6, p4
+
+    move p3, p1
+
+    move-object p4, p2
+
+    move-object p2, p0
+
+    invoke-virtual/range {p2 .. p12}, Lcom/demo/W;->copy(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)Lcom/demo/W;
+
+    move-result-object p0
+
+    return-object p0
+.end method
+
+.method public static wideParam(IIIJLjava/lang/String;)I
+    .locals 0
+    and-int/lit8 p5, p0, 0x1
+    if-eqz p5, :cond_w
+    add-int p5, p3, p4
+    return p5
+    :cond_w
+    return p1
+.end method
+EOF
+run "$WORK/dec5" > /dev/null
+# wideParam 是 static,4 个 int + 1 个 J(2 槽)+ 1 个引用 = 7 槽 ≤12 → 应提升;
+# copy$default 13 槽 >12 → 必须保持 0
+if awk '/copy\$default/,/\.end method/' "$WORK/dec5/smali/com/demo/W.smali" | grep -qE '^\s*\.locals [1-9]'; then
+  echo '❌ 报错三十四回归:copy$default(13 参数槽)的 .locals 被提升 → 回编必炸 v16'; exit 1
+fi
+if awk '/\.method public static wideParam/,/\.end method/' "$WORK/dec5/smali/com/demo/W.smali" | grep -q '^\s*\.locals 0\s*$'; then
+  echo '❌ 报错三十四过度收紧:wideParam(7 参数槽)应正常提升'; exit 1
+fi
+
 # ── 断言 4d:白名单排除(androidx 等系统/依赖类不处理) ─────────────────
 mkdir -p "$WORK/dec4/smali/androidx/demo" "$WORK/dec4/smali/com/demo"
 cat > "$WORK/dec4/smali/androidx/demo/S.smali" <<'EOF'

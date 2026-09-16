@@ -431,7 +431,67 @@ def _method_locals_count(method_lines):
     return -1
 
 
-def _bump_locals(method_lines):
+def _count_param_slots(method_sig):
+    """解析 .method 行的参数列表,返回参数寄存器槽总数。
+
+    报错三十四根基:提升 .locals 后参数物理号 pN = v(N' + 槽偏移),wide
+    参数(J/D)占 2 个槽——不能按参数"个数"数,必须按槽。签名逐字符扫描:
+    基本类型/引用类型 1 槽,J/D 2 槽数,数组 [X 按元素类型(引用数组仍
+    1 槽);非 static 方法 this 再占 1 槽。
+    解析失败(签名形态异常)返回 None,调用方按"不可提升"处理(宁缺勿滥)。"""
+    m = re.search(r'\(([^)]*)\)', method_sig)
+    if not m:
+        return None
+    is_static = bool(re.search(r'\bstatic\b', method_sig))
+    args = m.group(1)
+    slots = 0 if is_static else 1  # 非 static:p0 = this
+    i = 0
+    n = len(args)
+    while i < n:
+        c = args[i]
+        if c in 'JD':
+            slots += 2
+            i += 1
+        elif c in 'BCFISZ':
+            slots += 1
+            i += 1
+        elif c == 'L':
+            j = args.find(';', i)
+            if j < 0:
+                return None
+            slots += 1
+            i = j + 1
+        elif c == '[':
+            # 数组:引用数组 1 槽;跳过所有 '[' 后按一个类型算
+            j = i
+            while j < n and args[j] == '[':
+                j += 1
+            if j >= n:
+                return None
+            if args[j] == 'L':
+                j = args.find(';', j)
+                if j < 0:
+                    return None
+            slots += 1
+            i = j + 1
+        else:
+            return None
+    return slots
+
+
+def _max_param_index(method_lines):
+    """方法体指令中实际引用的最大 pN 序号(兜底校验用);无引用返回 -1。"""
+    mx = -1
+    for ln in method_lines:
+        s = ln.strip()
+        if s.startswith('.') or s.startswith('#') or not s:
+            continue
+        for m in re.finditer(r'(?<![\w.$-])p(\d+)(?![\w.$-])', ln):
+            mx = max(mx, int(m.group(1)))
+    return mx
+
+
+def _bump_locals(method_lines, method_sig=None):
     """把 .locals N < 4 的方法提升到 4,返回(新行列表, 是否提升)。
 
     动机(防对比覆盖增强):.locals 0/1 的方法没有(或只有 1 个)局部
@@ -451,6 +511,16 @@ def _bump_locals(method_lines):
 
     注意:必须**同时**满足"方法无 try-catch"(变换 C/D 的共用门槛,
     在调用方保证);含 .registers 的方法不适用(参数在低端,不可平移)。
+
+    报错三十四(真实包回编炸 `Invalid register: v16. Must be between
+    v0 and v15`):参数整体平移有**编码上限**——提升后最大参数物理号
+    = 4 + 槽总数 - 1,dalvik 多数指令格式的寄存器槽是 4-bit(上限 v15;
+    iget/iget-object 是 22c、move 系是 12x、and-int/lit16 是 22b 的
+    4-bit 槽等)。真实包实证:TaskEntity.copy$default(静态,13 参数槽
+    含 1 个 wide)原 .locals 0、p12=v12 合法;提升后 p12=v16 →
+    and-int/lit16 p12 回编即炸。修复:参数槽总数 > 12(提升后最大物理
+    号必 > v15)的方法一律不提升,签名解析失败也跳过(宁缺勿滥);
+    同时用方法体实际引用的最大 pN 做双保险兜底。
     """
     for i, ln in enumerate(method_lines):
         s = ln.strip()
@@ -461,6 +531,24 @@ def _bump_locals(method_lines):
             except (IndexError, ValueError):
                 return method_lines, False
             if n >= 4:
+                return method_lines, False
+            # 报错三十四硬门槛:提升后最大参数物理号 ≤ 15
+            # 静态:slots 个参数 → 最大 p{slots-1} 物理 = 4 + slots - 1
+            # 非静态:含 this,签名槽数已 +1,同公式
+            # method_lines[0] 是 body 第一行(.method 行已被调用方剥掉),
+            # 签名需回溯调用方上下文——这里从"调用方约定的块结构"拿不到,
+            # 改为在 _process_method_block 传签名进来(见其调用点)。
+            slots = _count_param_slots(method_sig) if method_sig else None
+            if slots is None or slots < 1:
+                return method_lines, False
+            # 双保险:方法体实际引用的 pN 序号上界(签名解析万一漏算时兜底;
+            # wide 槽偏移已含在签名槽数里,这里直接取两者最大)
+            seen = _max_param_index(method_lines)
+            if seen >= slots:
+                seen = seen + 1  # 兜底形态:按序号近似,保守加 1
+            else:
+                seen = slots
+            if 4 + seen - 1 > 15:
                 return method_lines, False
             # 检查方法体是否有 vN 字面引用(vN 引用 .locals 提升后语义
             # 不变——vN 仍是低 N 个局部寄存器,编号不漂移;但要防止
@@ -911,7 +999,7 @@ def _process_method_block(block_lines, rng, max_per_method, max_cond_flip):
             # 变换 C0:.locals < 4 提升到 4(为 C/D 扩大覆盖面;.locals 0/1
             # 的方法在真实包占 54%,提升后才有局部寄存器可插垃圾/可置换)
             body = lines[1:-1]
-            new_body, nb = _bump_locals(body)
+            new_body, nb = _bump_locals(body, lines[0])
             if nb:
                 lines = [lines[0]] + new_body + [lines[-1]]
                 changes += 1
