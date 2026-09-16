@@ -1,7 +1,8 @@
 name: APK加固-模块勾选
 
 # 勾选式统一入口：想加固哪些模块就勾选哪些，执行顺序由 protect.sh 固定为
-#   签名校验 → Dex2C → 字符串加密 → 基础加壳（加壳必须最后，加了壳其它模块改不动）
+#   签名校验 → Dex2C → 字符串加密 → 防对比混淆(anti-diff) → 基础加壳
+#   （anti-diff 是 dex 层结构噪声,放 stringenc 后;加壳必须最后，加了壳其它模块改不动）
 # 旧 workflow（签名校验/签名校验-单独/dex2c/APK加固）已移除，本入口为唯一入口。
 
 on:
@@ -36,6 +37,10 @@ on:
         default: false
       packer:
         description: '勾选: 基础加壳(尚未接入)'
+        type: boolean
+        default: false
+      antidiff:
+        description: '勾选: 防对比混淆(anti-diff, dex 层结构噪声, 让 diff 全红)'
         type: boolean
         default: false
 
@@ -89,7 +94,7 @@ jobs:
             echo "❌ 勾选字符串加密必须填写类名规则(string_rules)"
             ok=0
           fi
-          if [[ "${{ inputs.sigcheck }}" != "true" && "${{ inputs.dex2c }}" != "true" && "${{ inputs.packer }}" != "true" && "${{ inputs.envcheck }}" != "true" && "${{ inputs.stringenc }}" != "true" ]]; then
+          if [[ "${{ inputs.sigcheck }}" != "true" && "${{ inputs.dex2c }}" != "true" && "${{ inputs.packer }}" != "true" && "${{ inputs.envcheck }}" != "true" && "${{ inputs.stringenc }}" != "true" && "${{ inputs.antidiff }}" != "true" ]]; then
             echo "❌ 至少勾选一个模块"
             ok=0
           fi
@@ -138,6 +143,7 @@ jobs:
           if [[ "${{ inputs.stringenc }}" == "true" ]]; then ARGS="$ARGS --stringenc string_rules.txt"; fi
           if [[ "${{ inputs.envcheck }}" == "true" ]]; then ARGS="$ARGS --envcheck"; fi
           if [[ "${{ inputs.packer }}" == "true" ]]; then ARGS="$ARGS --packer"; fi
+          if [[ "${{ inputs.antidiff }}" == "true" ]]; then ARGS="$ARGS --anti-diff"; fi
           set -o pipefail
           ./scripts/pipelines/protect.sh app.apk protected_unsigned.apk $ARGS 2>&1 | tee -a build.log
 
