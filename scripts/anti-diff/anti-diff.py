@@ -70,15 +70,55 @@ SMALI_DIR_RE = _INJECT.SMALI_DIR_RE
 
 CLASS_MARK = '# nc-antidiff-applied v1'   # 已处理类的标记注释(幂等判定)
 
+# ── 硬排除:系统类与框架依赖(与 stringenc SYSTEM_CLASS_PREFIXES 同型) ──
+# 理由(与 encrypt-strings.py §100 同源):这些类不是要保护的产品代码,
+# 反射/序列化/JNI 绑定库的任何文本扰动只有风险没有收益;攻击者对比时
+# 这些类本来就在"第三方依赖原样"的预期内,不构成定位线索。
+# 注:anti-diff 不改字符串/标识符,风险低于 stringenc,但 jsoup 这类
+# "字符串即协议"的库在变换 C 下仍可能被启发式工具误报,统一排除省心。
+SKIP_CLASS_PREFIXES = (
+    'android.', 'androidx.', 'android.support.', 'com.android.',
+    'com.google.android.', 'dalvik.', 'java.', 'javax.',
+    'kotlin.', 'kotlinx.', 'org.jetbrains.',
+    'org.apache.', 'org.json.', 'org.w3c.', 'org.xml.', 'sun.',
+    'xcrash.',
+    'okhttp3.', 'okio.', 'com.google.gson.', 'org.jsoup.',
+    'org.commonmark.', 'io.ktor.', 'coil3.', 'moe.shizuku.',
+)
+
+
+_SMALI_DIR_PREFIX_RE = re.compile(r'^smali(?:_classes\d+)?/')
+
+
+def _class_desc_from_path(rel_path):
+    """smali 相对路径 → 类描述符(如 smali/com/demo/A.smali → Lcom/demo/A;)。
+
+    rel_path 必含 smali/smali_classesN 目录层,先剥掉再换算(否则 'smali'
+    会被当成包名,白名单永远匹配不上——实测踩坑);内部类 A$B 与外部类 A
+    同属 com.demo. 前缀,按路径换算即可,无需读文件内容。"""
+    no_ext = rel_path[:-len('.smali')] if rel_path.endswith('.smali') else rel_path
+    no_ext = _SMALI_DIR_PREFIX_RE.sub('', no_ext)
+    return 'L' + no_ext + ';'
+
+
+def _is_skip_class(rel_path):
+    desc = _class_desc_from_path(rel_path)
+    # SKIP_CLASS_PREFIXES 是点号格式(androidx.),desc 是斜杠描述符
+    # (Landroidx/...) → 前缀先转斜杠再匹配
+    for p in SKIP_CLASS_PREFIXES:
+        slash = 'L' + p.replace('.', '/')
+        if desc.startswith(p) or desc.startswith(slash):
+            return True
+    return False
+
 # ── 块重排安全:这些指令块"位置敏感",一律不许挪 ──────────────────────
 # <init>/<clinit> 执行顺序与 .class 声明紧邻是 ART/验证器敏感区;带 .annotation
 # 的块可能有注解处理器顺序依赖,都不挪。
 _PIN_METHOD_NAMES = ('<init>', '<clinit>')
 
-# 变换 C 第一条指令白名单(纯赋值类,插桩前后寄存器状态语义不变)
-_ENTRY_SAFE_RE = re.compile(
-    r'^\s*(const(?:/4|/16|/high16)?|const-string(?:/jumbo)?|move(?:/from16|/16)?'
-    r'|move-object(?:/from16|/16)?)\s')
+# 变换 C 第一条指令白名单已移除:新安全模型基于 ".locals ≥ 4 ⇒ v0..v3 必为
+# 纯局部寄存器",与首指令类型无关(旧白名单在真实包上额外砍掉 16% 的方法,
+# 如首指令 sget-object 的 getter,毫无必要)。
 
 # 方法体内任何 try-catch 标记(出现即整方法跳过变换 C)
 _TRY_RE = re.compile(r'^\s*\.catch(?:all)?\s', re.M)
@@ -86,6 +126,37 @@ _TRY_RE = re.compile(r'^\s*\.catch(?:all)?\s', re.M)
 # 匹配 smali 的 label 行与分支/填充指令里的 label 引用
 _LABEL_DEF_RE = re.compile(r'^\s*(:[A-Za-z0-9_.$]+)\s*$')
 _LABEL_REF_RE = re.compile(r'(?<![\w])(:[A-Za-z0-9_.$]+)\b')
+
+# smali 字符串字面量:值里允许 \" 转义(报错二十二式教训:_LABEL_REF_RE 原先
+# 对 const-string 行内的 ":xxx" 也做标签替换,把 jsoup CSS 选择器
+# ":not(%s)"、Compose "CC(remember):MainActivity.kt#9igjgp" 等 1391 处
+# 运行时功能性字符串当标签改了名。字符串内容属开发文档 §2.2 红线
+# "不改字符串内容",必须在文本层替换前把引号内区间整段保护起来。)
+_STRING_SPAN_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _replace_outside_strings(line, fn):
+    """对一行做替换,但跳过所有双引号字符串字面量内的区间。
+
+    fn: 接收整行的替换函数(如 _LABEL_REF_RE.sub 的包装)。
+    实现:先用 _STRING_SPAN_RE 找出全部字符串区间,把区间内容替换为占位符,
+    对剩余部分做替换,再把原样内容放回。"""
+    if '"' not in line:
+        return fn(line)
+    pieces = []
+    protected = []
+    last = 0
+    for m in _STRING_SPAN_RE.finditer(line):
+        pieces.append(line[last:m.start()])
+        protected.append(m.group(0))
+        pieces.append('\x00%d\x00' % (len(protected) - 1))
+        last = m.end()
+    pieces.append(line[last:])
+    masked = ''.join(pieces)
+    out = fn(masked)
+    def _unmask(mm):
+        return protected[int(mm.group(1))]
+    return re.sub(r'\x00(\d+)\x00', _unmask, out)
 
 
 def _is_label_token(tok: str) -> bool:
@@ -142,7 +213,10 @@ def _rename_labels(method_lines, rng):
         def _sub(m):
             tok = m.group(1)
             return mapping.get(tok, tok)
-        out.append(_LABEL_REF_RE.sub(_sub, ln))
+        def _do(s):
+            return _LABEL_REF_RE.sub(_sub, s)
+        # 字符串字面量内的 ":xxx" 不是标签,必须原样保留(红线:不改字符串)
+        out.append(_replace_outside_strings(ln, _do))
     return out, len(mapping)
 
 
@@ -255,13 +329,29 @@ def _reorder_blocks(blocks, rng):
 # ── 方法入口垃圾指令(变换 C)────────────────────────────────────────
 
 def _method_first_code_index(method_lines):
-    """返回方法体内"第一条真实指令"的行号(跳过 .registers/.locals/.param/.prologue/.line/标签/注释)。"""
+    """返回方法体内"第一条真实指令"的行号(跳过 .registers/.locals/.param/
+    .prologue/.line/标签/注释,以及**完整的 .annotation 块**)。
+
+    报错二十二式教训:.annotation...end annotation 是方法内的注解子块
+    (MethodParameters/Signature 等),块体是注解元素不是指令;旧实现只
+    按"跳过点开头行"推进,把垃圾指令插进了注解块中间 → smali 汇编报
+    "missing EQUAL"。必须整体跳过配对的 .annotation...end annotation。"""
+    depth = 0
     for i, ln in enumerate(method_lines):
         s = ln.strip()
+        if depth > 0:
+            if s.startswith('.annotation'):
+                depth += 1
+            elif s.startswith('.end annotation'):
+                depth -= 1
+            continue
         if not s:
             continue
+        if s.startswith('.annotation'):
+            depth = 1
+            continue
         if s.startswith('.'):
-            # 仍可能是 .registers/.locals/.param/.prologue/.line —— 都跳过
+            # .registers/.locals/.param/.prologue/.line 等,仍跳过
             continue
         if s.startswith('#'):
             continue
@@ -283,24 +373,52 @@ def _method_registers(method_lines):
     return -1
 
 
+def _method_locals_count(method_lines):
+    """返回 .locals N 的 N;.registers 模式返回 -1。
+
+    报错二十二式教训:真实 APK(kotlinc/R8 产物)几乎 100% 用 .locals
+    (抽样 206503 处 .locals vs 0 处 .registers),旧代码只认 .registers
+    且要求 ≥5,导致变换 C 在真实包上**一个方法都没命中**。
+    .locals 模式下参数是 pN = v(N+idx),v0..v3 只要 N ≥ 4 就是纯局部
+    寄存器;.registers 模式下 v0 可能是参数(this),低端寄存器不可安全
+    覆盖 → 一律跳过(真实包零损失)。"""
+    for ln in method_lines:
+        s = ln.strip()
+        if s.startswith('.locals'):
+            parts = s.split()
+            try:
+                return int(parts[1])
+            except (IndexError, ValueError):
+                return -1
+        if s.startswith('.registers'):
+            return -1
+    return -1
+
+
 def _inject_junk_at_entry(method_lines, rng, max_per_method):
-    """满足全部硬条件时,在方法入口插 1~max_per_method 条垃圾指令。"""
-    # 硬条件 1:不能有 try-catch
+    """满足全部硬条件时,在方法入口插 1~max_per_method 条垃圾指令。
+
+    安全模型(.locals 模式,真实包 100% 形态):
+      - v0..v3 是纯局部寄存器(Dalvik/ART 验证器强制:局部寄存器被读之前
+        必有写,方法开头覆盖它们不影响任何路径的语义);
+      - 参数在 pN(= 高端寄存器),完全不触碰;
+      - 覆盖后原有指令逐条不动 → try-catch 边界内的寄存器状态也不受影响
+        (但保守起见含 try 的方法仍跳过,见硬条件 1)。"""
+    # 硬条件 1:不能有 try-catch(保守:避免验证器对边界寄存器状态的重校验)
     joined = '\n'.join(method_lines)
     if _TRY_RE.search(joined):
         return method_lines, 0
-    # 硬条件 2:.registers ≥ 5
-    regs = _method_registers(method_lines)
-    if regs < 5:
+    # 硬条件 2:.locals ≥ 4(v0..v3 全部是局部寄存器);
+    # .registers 模式返回 -1,直接跳过(低端寄存器可能是参数,不可覆盖)
+    n_locals = _method_locals_count(method_lines)
+    if n_locals < 4:
         return method_lines, 0
-    # 硬条件 3:第一条真实指令必须是白名单赋值类
+    # 定位第一条真实指令:插在它之前(所有声明行之后)
     idx = _method_first_code_index(method_lines)
     if idx < 0:
         return method_lines, 0
-    if not _ENTRY_SAFE_RE.match(method_lines[idx]):
-        return method_lines, 0
-    # 选要插的指令:只用 const/4 + move,寄存器只用低编号(必在 .registers 内)
-    # v0/v1 是局部变量区最低端,任何方法都有(因为 regs≥5),插桩安全
+    # 选要插的指令:const/4 覆盖 + move 自赋值,只用 v0..v3
+    # (n_locals≥4 保证存在,纯局部,写入安全)
     pool = [
         '    const/4 v0, 0x0',
         '    const/4 v1, 0x0',
@@ -455,9 +573,14 @@ def main(argv):
 
     n_files = 0
     n_skipped = 0
+    n_excluded = 0
     total_ac = 0
     total_moved = 0
     for p in sorted(files):
+        rel = os.path.relpath(p, root)
+        if _is_skip_class(rel):
+            n_excluded += 1
+            continue
         a, c, moved, skipped = process_file(p, rng, args.max_per_method)
         if skipped:
             n_skipped += 1
@@ -467,7 +590,8 @@ def main(argv):
         total_moved += moved
 
     print(f'✅ anti-diff 完成: 处理 {n_files} 个类'
-          f'({n_skipped} 个已处理跳过),'
+          f'({n_skipped} 个已处理跳过,'
+          f' {n_excluded} 个系统/依赖类白名单排除),'
           f' 标签/垃圾指令改动 {total_ac} 处,'
           f' 块重排移动 {total_moved} 块')
     return 0

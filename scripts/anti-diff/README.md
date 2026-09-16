@@ -16,7 +16,11 @@
 |---|---|---|
 | A 标签重命名 | 方法内 `:cond_0`/`:goto_0` 等 → `:ncXXXXXX` | `<init>`/`<clinit>` |
 | B 类内块重排 | `.method`/`.field` 块确定性乱序 | `<init>`/`<clinit>` 与含 `.annotation` 的块钉在原地 |
-| C 入口垃圾指令 | 方法首插 1~3 条 `const/4`/`move` | `<init>`/`<clinit>`、native、含 try-catch、`.registers < 5`、首指令非赋值类 |
+| C 入口垃圾指令 | 方法首插 1~3 条 `const/4`/`move` | `<init>`/`<clinit>`、native、含 try-catch、`.locals < 4` 或 `.registers` 模式(低端寄存器可能是参数) |
+
+白名单:android./androidx./kotlin./okhttp3./org.jsoup. 等系统与第三方依赖
+类硬排除(与 stringenc `SYSTEM_CLASS_PREFIXES` 同型名单,见
+`anti-diff.py` 的 `SKIP_CLASS_PREFIXES`)。
 
 红线(开发文档 §2.2):不改名 / 不改签名 / 不改字符串 / 不注死代码 / 不填 nop /
 不做控制流平坦化。
