@@ -43,6 +43,13 @@ cat > "$WORK/dec/smali/com/demo/A.smali" <<'EOF'
     return-void
 .end method
 
+.method public static qux()Ljava/lang/String;
+    .locals 6
+    const/4 v0, 0x0
+    const-string v1, "CC(remember):MainActivity.kt#9igjgp"
+    return-object v1
+.end method
+
 .method public static baz()V
     .registers 3
     const/4 v0, 0x0
@@ -96,6 +103,42 @@ if grep -q ':cond_0\|:goto_0' "$WORK/A.after1.smali"; then
 fi
 grep -q ':nc[0-9a-f]\{6\}' "$WORK/A.after1.smali" \
   || { echo '❌ 变换 A 未生效(无新标签)'; exit 1; }
+
+# ── 断言 4b:字符串字面量绝不被当标签改(红线:不改字符串内容) ─────────
+# 报错二十二式:_LABEL_REF_RE 曾把 const-string 里 ":MainActivity.kt" 改名
+grep -qF '"CC(remember):MainActivity.kt#9igjgp"' "$WORK/A.after1.smali" \
+  || { echo '❌ 字符串被误改(标签正则侵入引号内)'; exit 1; }
+
+# ── 断言 4c:.locals 方法(qux)必须插入垃圾指令(变换 C 真实包形态) ─────
+# 报错二十二式:旧代码只认 .registers 且要求 ≥5,真实包 100% 用 .locals,
+# 导致变换 C 一个方法都没命中。.locals 6 + 首指令 const/4 → 必须插入。
+awk '/\.method public static qux/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/qux.txt"
+grep -qE '^\s*(const/4 v[0-3], 0x0|move v[0-3], v[0-3])$' "$WORK/qux.txt" \
+  || { echo '❌ 变换 C 未生效(.locals 方法没有插入垃圾指令)'; cat "$WORK/qux.txt"; exit 1; }
+# 字符串行必须原样保留
+grep -qF '"CC(remember):MainActivity.kt#9igjgp"' "$WORK/qux.txt" \
+  || { echo '❌ qux 字符串被误改'; exit 1; }
+
+# ── 断言 4d:白名单排除(androidx 等系统/依赖类不处理) ─────────────────
+mkdir -p "$WORK/dec4/smali/androidx/demo" "$WORK/dec4/smali/com/demo"
+cat > "$WORK/dec4/smali/androidx/demo/S.smali" <<'EOF'
+.class public Landroidx/demo/S;
+.super Ljava/lang/Object;
+.method public static m()V
+    .locals 6
+    const/4 v0, 0x0
+    if-eqz v0, :cond_0
+    :cond_0
+    return-void
+.end method
+EOF
+cp "$WORK/dec/smali/com/demo/A.smali" "$WORK/dec4/smali/com/demo/A.smali"
+# A 已处理过(带标记)会跳过;S 在白名单里 → 输出应出现"白名单排除"
+run "$WORK/dec4" | tee "$WORK/wl.log"
+grep -q '白名单排除' "$WORK/wl.log" \
+  || { echo '❌ 白名单未生效'; exit 1; }
+grep -q ':cond_0' "$WORK/dec4/smali/androidx/demo/S.smali" \
+  || { echo '❌ 白名单类被改动了'; exit 1; }
 
 # ── 断言 5:带 try-catch 的 baz() 没有插入垃圾指令(const/4 v1, 0x0 不该出现在 baz 体内) ──
 # 提取 baz 方法体
