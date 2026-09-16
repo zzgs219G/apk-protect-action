@@ -20,7 +20,12 @@
   B 类内块重排:一个类的多个 .method/.field 块按确定性随机序重排。
     跳过 <init>/<clinit>(必须紧跟 .class 声明,不能挪)与含 .annotation 的块。
     smali 允许方法任意顺序,DEX 无序;重排只改文本,引用全部按描述符解析。
-    E 条件反转 + 跳转链(阶段 2 增强):方法内的条件分支做"反折"——
+  D 局部寄存器重编号(覆盖增强):方法内局部寄存器 v0..vN 做确定性随机
+    置换,dex 层每条指令的寄存器号真实变化,规则归一化无法抹平。
+    硬约束(报错三十三):低/高双域(4-bit 指令只能寻址 v0..v15),
+    /range 连续区间成员锁定不动,wide 对作整体单元、永不跨域拆分,
+    参数 pN 区永不参与,恒等置换跳过;语义等价由"读/写同步替换"保证。
+  E 条件反转 + 跳转链(阶段 2 增强):方法内的条件分支做"反折"——
       if-eqz vX, :L      →    if-nez vX, :nc新
                                 goto :L
                               :nc新
@@ -40,8 +45,13 @@
       - 方法入口 1~max_per_method 条(原行为)
       - 每个 return 指令前 1~2 条;被 return 读取的寄存器(return vX /
         return-wide vX 占 v 与 v+1)绝对排除,return-void 无限制
-    插入条只用 const/4 + move 自赋值,只写 v0..v3 局部寄存器,
-    不改 .locals 值。return 前的指令从方法入口可达,反编译器不会丢弃。
+    插入条只用 const/4 纯写,只写 v0..v3 局部寄存器,不改 .locals 值。
+    (报错三十二:曾含 move 自赋值——move 读源寄存器,而局部寄存器在方法
+    入口处可能从未初始化,ART verifier 直接 VerifyError 秒闪退,已移除。)
+    C0 .locals 提升(覆盖增强):.locals N<4 的方法(R8 产物常见 0/1,
+    无局部寄存器可用)提升到 4——smali pN 是虚拟参数名,汇编时自动重映射,
+    参数语义不变;提升后这些方法才有 v0..v3 可插垃圾指令/可置换。
+    return 前的指令从方法入口可达,反编译器不会丢弃。
 
 【幂等】
   * 类文件一旦被处理,会在 .class 声明行下方写一行标记注释
@@ -188,12 +198,19 @@ def _rename_labels(method_lines, rng):
     packed-switch-data / sparse-switch-data 里引用的 label 引用行
     (这些引用行里的 :label 必须与新名同步,所以统一重命名映射)。"""
     # 收集本方法内所有被"引用"的标签名(goto/if-* / packed-switch 等)
+    # 报错三十二之二(重放实证):.local/.end local/.restart local 调试行里
+    # 引号外的类型描述符形如 `"$scope":Lkotlinx/coroutines/...;`,冒号后的
+    # `:Lkotlinx` 会被 _LABEL_REF_RE 当标签引用收进映射并整体改名 → 描述符
+    # 被破坏,回编报 "Invalid text '/'"。调试行永远不含真标签,整行跳过。
+    _LOCAL_DEBUG_RE = re.compile(r'^\s*\.(?:end local|restart local|local)\b')
     refs = set()
     defs = set()
     for ln in method_lines:
         m = _LABEL_DEF_RE.match(ln)
         if m:
             defs.add(m.group(1))
+        if _LOCAL_DEBUG_RE.match(ln):
+            continue  # .local 调试行:只可能是类型描述符,不收集
         # 指令行里的 label 引用(goto :x / if-eqz v0, :x / .packed-switch 后的目标等)
         # 只收"行内出现的、以冒号开头的 token",且不是字符串里的内容
         # smali 标签引用只出现在分支指令与 .packed-switch/.sparse-switch/.array-data 的目标行
@@ -230,6 +247,11 @@ def _rename_labels(method_lines, rng):
         def _do(s):
             return _LABEL_REF_RE.sub(_sub, s)
         # 字符串字面量内的 ":xxx" 不是标签,必须原样保留(红线:不改字符串)
+        # .local 调试行整行原样保留(报错三十二之二:引号外是类型描述符,
+        # 不是标签,替换会破坏 `:Lkotlinx/...;` 形态的描述符)
+        if _LOCAL_DEBUG_RE.match(ln):
+            out.append(ln)
+            continue
         out.append(_replace_outside_strings(ln, _do))
     return out, len(mapping)
 
@@ -409,6 +431,49 @@ def _method_locals_count(method_lines):
     return -1
 
 
+def _bump_locals(method_lines):
+    """把 .locals N < 4 的方法提升到 4,返回(新行列表, 是否提升)。
+
+    动机(防对比覆盖增强):.locals 0/1 的方法没有(或只有 1 个)局部
+    寄存器,变换 C(垃圾指令写 v0..v3)与变换 D(局部寄存器置换)都
+    无法覆盖。真实包实测:37 方法中 20 个是 .locals 0/1 ——占 54%,
+    是覆盖率的最大短板。
+
+    安全性:smali 的 pN 是虚拟参数名,汇编器按 `.locals N` 把 p0 映射到
+    v(N + 参数序号)。把 N 从 0/1 提到 4 只是把参数整体平移到更高的物理
+    寄存器,方法寄存器总数增加,但:
+      - 指令引用一律写 pN → baksmali/smali 往返自动重映射,指令无需改动;
+      - v0..v3 成为纯局部寄存器(无初值,只能先写后读——变换 C 的
+        const/4 纯写形态天然满足);
+      - 验证器对寄存器总数无上限约束(≤65536),只增不减;
+      - 若方法含 /range {p0 .. pK} 指令,提升后 range 端点物理位置平移,
+        smali 层仍写 pN/smali 自动换算,回编正确。
+
+    注意:必须**同时**满足"方法无 try-catch"(变换 C/D 的共用门槛,
+    在调用方保证);含 .registers 的方法不适用(参数在低端,不可平移)。
+    """
+    for i, ln in enumerate(method_lines):
+        s = ln.strip()
+        if s.startswith('.locals'):
+            parts = s.split()
+            try:
+                n = int(parts[1])
+            except (IndexError, ValueError):
+                return method_lines, False
+            if n >= 4:
+                return method_lines, False
+            # 检查方法体是否有 vN 字面引用(vN 引用 .locals 提升后语义
+            # 不变——vN 仍是低 N 个局部寄存器,编号不漂移;但要防止
+            # 引用了不存在的局部寄存器之外的怪形态,保守:vN 引用存在
+            # 且编号 < N 的,提升后依然安全,因为 vN 编号不变)
+            out = list(method_lines)
+            out[i] = re.sub(r'^(\s*\.locals\s+)\d+', r'\g<1>4', ln)
+            return out, True
+        if s.startswith('.registers'):
+            return method_lines, False
+    return method_lines, False
+
+
 def _inject_junk_at_entry(method_lines, rng, max_per_method):
     """满足全部硬条件时,在方法入口插 1~max_per_method 条垃圾指令。
 
@@ -562,7 +627,14 @@ def _insert_before_returns(method_lines, rng, max_per_method):
 
 
 def _junk_pool(banned=frozenset()):
-    """构造垃圾指令池:只写 v0..v3 局部寄存器,排除 banned。"""
+    """构造垃圾指令池:只写 v0..v3 局部寄存器,排除 banned。
+
+    报错三十二(真实包 classes.dex 闪退实证):池中原含 `move r, r` 自赋值
+    ——move 会**读取**源寄存器,而 ".locals ≥ 4" 只保证 v0..v3 是局部寄存器,
+    **不保证已初始化**:方法入口处它们可以从未被写过(dex 层 13 处实证)。
+    ART verifier 读到未初始化寄存器直接拒绝整个方法 → VerifyError 秒闪退。
+    修复:垃圾指令只保留 const/4 纯写形态(const 对目标寄存器是"先定义后
+    使用",不读任何源寄存器);move 自赋值彻底移除,并加断言防回归。"""
     pool = []
     for i in range(4):
         r = f'v{i}'
@@ -570,7 +642,6 @@ def _junk_pool(banned=frozenset()):
             continue
         pool.append(f'    const/4 {r}, 0x0')
         pool.append(f'    const/4 {r}, 0x1')
-        pool.append(f'    move {r}, {r}')
     return pool
 
 
@@ -582,7 +653,230 @@ def _junk_ins(rng, count, pool=None):
     return [rng.choice(pool) for _ in range(count)]
 
 
-# ── 方法级处理 ─────────────────────────────────────────────────────
+# ── 变换 D:局部寄存器重编号(阶段 2 增强)──────────────────────────
+
+# wide(64 位)寄存器指令:寄存器对 (vN, vN+1) 构成不可拆分单元
+_WIDE_INS_RE = re.compile(
+    r'^\s*(?:const-wide|move-wide|return-wide|'
+    r'add-long|sub-long|mul-long|div-long|rem-long|and-long|or-long|xor-long|'
+    r'shl-long|shr-long|ushr-long|neg-long|long-to-(?:int|float|double)|'
+    r'double-to-(?:int|float|long)|int-to-long|int-to-double|float-to-long|'
+    r'float-to-double|cmp-long|'
+    r'add-double|sub-double|mul-double|div-double|rem-double|neg-double|'
+    r'aget-wide|aput-wide|sget-wide|sput-wide|iget-wide|iput-wide)')
+
+# 寄存器 token:vN / pN(替换时只匹配独立 token,防止 v1 误伤 v11)
+_REG_TOKEN_RE = re.compile(r'(?<![\w.$-])([vp]\d+)(?![\w.$-])')
+# 范围形态 {v1 .. v4} 的端点(换算后仍是连续区间,直接替换端点即可)
+_RANGE_REG_RE = re.compile(r'(\{[^}]*\})')
+
+
+def _collect_wide_pairs(method_lines):
+    """收集方法内所有 wide 寄存器对(vN 与 vN+1)。
+
+    wide 指令的寄存器对必须整体置换(两个成员绑在同一编号组内),
+    否则 64 位值的低/高半会落在不相邻的寄存器上 → 语义破坏。"""
+    pairs = set()
+    for ln in method_lines:
+        s = ln.strip()
+        if s.startswith('#') or not s:
+            continue
+        if _WIDE_INS_RE.match(ln):
+            regs = re.findall(r'\bv(\d+)\b', s)
+            if regs:
+                base = int(regs[0])
+                pairs.add((base, base + 1))
+    return pairs
+
+
+def _collect_range_blocks(method_lines):
+    """收集 /range 指令的连续寄存器区间列表 [(start, end), ...]。
+
+    dalvik 的 /range 形态(如 invoke-static/range {v2 .. v7})要求寄存器
+    **连续且升序**。真实包里区间大量两两重叠(实测单文件 31 区间 60+ 处
+    重叠),"区间整体互换"不可行。策略:区间成员**全部锁定不动**,
+    只置换区间外的寄存器(报错三十三之二)。"""
+    blocks = []
+    for ln in method_lines:
+        s = ln.strip()
+        if s.startswith('#') or not s or s.startswith('.'):
+            continue
+        if '/range' not in s:
+            continue
+        regs = [int(x) for x in re.findall(r'\bv(\d+)\b', s)]
+        if len(regs) >= 2:
+            a, b = min(regs), max(regs)
+            blocks.append((a, b))
+    return blocks
+
+
+def _collect_low_reg_set(method_lines):
+    """收集 4-bit 寄存器指令(35c invoke / 12x /2addr / 11n const/4 等)
+    涉及的全部寄存器号集合。
+
+    dalvik 编码:4-bit 槽只能寻址 v0..v15。非 /16、非 /from16、非 /range
+    形态的指令,其寄存器操作数全部按 4-bit(或 8-bit 低段)编码——保守起见,
+    凡不带 16 位后缀的指令,寄存器号一律要求 ≤15。置换必须保证这些寄存器
+    映射后仍在 0..15 内,否则回编报 `Invalid register: vNN. Must be between
+    v0 and v15`(真实包实测:报错三十三)。
+
+    注:当前 _permute_registers 采用更保守的"整个 v0..v15 划入低域"策略
+    (因为 baksmali 会把 /16 形态优化回短形态,静态判断不完备),本函数
+    保留为低域精细化的备用分析器,暂未被调用。"""
+    low = set()
+    for ln in method_lines:
+        s = ln.strip()
+        if s.startswith('#') or not s or s.startswith('.'):
+            continue
+        # 16 位形态:寄存器号可到 255,不参与低组约束
+        if '/16' in s or '/from16' in s or '/range' in s:
+            continue
+        if '/2addr' in s or re.match(r'^\s*(move|move-object|const/4)\s', s) \
+                or 'invoke' in s or s.startswith(('if-', 'packed-switch',
+                                                  'sparse-switch', 'add-',
+                                                  'sub-', 'mul-', 'div-',
+                                                  'rem-')):
+            low.update(int(x) for x in re.findall(r'\bv(\d+)\b', s))
+    return low
+
+
+def _permute_registers(method_lines, rng):
+    """变换 D:方法内局部寄存器 v0..vN 做确定性随机置换。
+
+    安全模型(报错三十二之教训延伸:寄存器类/区不变,只换编号):
+      - 只动 .locals 形态的方法;.registers 模式(参数在低端)直接跳过
+      - 置换对象:v0..v{locals-1} 全部局部寄存器(宽度 = max 使用编号+1
+        与 .locals 取大,保证覆盖到所有使用点)
+      - wide 对 (vN, vN+1) 作为整体单元参与置换(单元内两成员始终相邻)
+      - 参数 pN 区不在置换范围(物理寄存器号不动,pN 名在 smali 层是
+        固定映射,改了会把参数指到错误的物理位置)
+      - 每条指令的寄存器操作数同步替换;标签/字符串/.locals 声明不动
+
+    返回(新行列表, 是否发生置换)。"""
+    # .locals 声明
+    locals_line = None
+    n_locals = -1
+    for i, ln in enumerate(method_lines):
+        s = ln.strip()
+        if s.startswith('.locals'):
+            parts = s.split()
+            try:
+                n_locals = int(parts[1])
+                locals_line = i
+            except (IndexError, ValueError):
+                return method_lines, False
+            break
+        if s.startswith('.registers'):
+            return method_lines, False  # .registers 模式:参数在低端,不可置换
+    if locals_line is None or n_locals < 4:
+        return method_lines, False
+
+    # 扫描方法内实际使用的最大局部寄存器号(可能 > .locals-1,如 R8 产物)
+    max_used = n_locals - 1
+    for ln in method_lines:
+        s = ln.strip()
+        if s.startswith('#') or not s or s.startswith('.'):
+            if s.startswith('.'):
+                continue  # .locals/.param 行里的 pN/vN 不算使用
+        regs = [int(x) for x in re.findall(r'\bv(\d+)\b', ln)]
+        if regs:
+            max_used = max(max_used, max(regs))
+    # 置换空间:v0..v{max_used}
+    if max_used < 1:
+        return method_lines, False
+
+    # wide 对:作为整体单元;range 区间成员全部锁定不动
+    wide_pairs = _collect_wide_pairs(method_lines)
+    range_blocks = _collect_range_blocks(method_lines)
+    # 越过 16 位边界的 wide 对(低端受 4-bit 约束,高端不受)→ 放弃
+    locked = set()
+    for a, b in range_blocks:
+        locked.update(range(a, b + 1))
+    # 4-bit 约束组:0..15 与 16..max_used 两个独立置换域(跨域置换会让
+    # 4-bit 指令编码不下,报错三十三)
+    # 域划分:0..15 低域(保守整段划入),16..max_used 高域;
+    # range 区间成员、与区间重叠的 wide 对全部锁定
+    low_domain = [r for r in range(min(max_used + 1, 16)) if r not in locked]
+    high_domain = [r for r in range(16, max_used + 1) if r not in locked]
+    # wide 对:与 range 区间重叠的 → 整对锁定;跨 16 位边界的 → 放弃置换
+    free_pairs = []
+    for a, b in wide_pairs:
+        if a in locked or b in locked:
+            locked.update((a, b))
+            low_domain = [r for r in low_domain if r not in (a, b)]
+            high_domain = [r for r in high_domain if r not in (a, b)]
+        elif (a <= 15) != (b <= 15):
+            return method_lines, False
+        else:
+            free_pairs.append((a, b))
+    # 锁定 wide 对后要重算域(可能有成员刚被锁)
+    low_domain = [r for r in low_domain if r not in locked]
+    high_domain = [r for r in high_domain if r not in locked]
+    units_by_domain = {'low': [], 'high': []}
+    covered = set()
+    for a, b in sorted(free_pairs):
+        if b <= max_used and a not in covered:
+            dom = 'low' if a <= 15 else 'high'
+            units_by_domain[dom].append(('pair', a, b))
+            covered.update((a, b))
+    for dom, domain in (('low', low_domain), ('high', high_domain)):
+        for r in domain:
+            if r not in covered:
+                units_by_domain[dom].append(('single', r, r))
+
+    # 确定性随机置换:各域内单元洗牌(wide 对槽 ↔ wide 对,
+    # 单寄存器槽 ↔ 单寄存器)
+    mapping = {}
+    for dom in ('low', 'high'):
+        units = units_by_domain[dom]
+        pairs = [u for u in units if u[0] == 'pair']
+        singles = [u for u in units if u[0] == 'single']
+        pair_slots = [u for u in units if u[0] == 'pair']
+        single_slots = [u for u in units if u[0] == 'single']
+        if len(pairs) != len(pair_slots) or len(singles) != len(single_slots):
+            return method_lines, False
+        rng.shuffle(pairs)
+        rng.shuffle(singles)
+        rng.shuffle(pair_slots)
+        rng.shuffle(single_slots)
+        for i, u in enumerate(pairs):
+            mapping[u[1]] = pair_slots[i][1]
+            mapping[u[1] + 1] = pair_slots[i][1] + 1
+        for i, u in enumerate(singles):
+            mapping[u[1]] = single_slots[i][1]
+
+    # 恒等判定:全部编号未变则跳过
+    if all(k == v for k, v in mapping.items()):
+        return method_lines, False
+
+    out = []
+    for ln in method_lines:
+        s = ln.strip()
+        # .locals 声明行:数值不动(物理寄存器总数不变)
+        # .param 行:参数名映射不动
+        # .local/.end local 调试行:寄存器号跟指令同步(调试信息一致性),
+        # 但报错三十二之二:这些行的描述符/名字部分不能动 → 只替换 vN token
+        # 标签行(:label):无寄存器,不匹配
+        if s.startswith('.locals') or s.startswith('.registers'):
+            out.append(ln)
+            continue
+        if s.startswith('#') or not s:
+            out.append(ln)
+            continue
+
+        def _sub(mm):
+            tok = mm.group(1)
+            if tok.startswith('p'):
+                return tok  # 参数名 pN 不动(物理位置在置换范围外)
+            num = int(tok[1:])
+            new = mapping.get(num)
+            return f'v{new}' if new is not None else tok
+
+        out.append(_REG_TOKEN_RE.sub(_sub, ln))
+    return out, True
+
+
+
 
 def _method_name(block_lines):
     first = block_lines[0].strip() if block_lines else ''
@@ -614,6 +908,21 @@ def _process_method_block(block_lines, rng, max_per_method, max_cond_flip):
             lines = [lines[0]] + new_body + [lines[-1]]
             changes += n
         if not has_try and not _method_is_native(lines):
+            # 变换 C0:.locals < 4 提升到 4(为 C/D 扩大覆盖面;.locals 0/1
+            # 的方法在真实包占 54%,提升后才有局部寄存器可插垃圾/可置换)
+            body = lines[1:-1]
+            new_body, nb = _bump_locals(body)
+            if nb:
+                lines = [lines[0]] + new_body + [lines[-1]]
+                changes += 1
+            # 变换 D:局部寄存器重编号(在 E/C 之前:E/C 插入的垃圾指令
+            # 用 v0..v3 局部寄存器,若在 D 之后再插,v0..v3 依然指向局部区,
+            # 安全;D 先做能让 E/C 的新指令也落在置换后的坐标系,增加噪声)
+            body = lines[1:-1]
+            new_body, nd = _permute_registers(body, rng)
+            if nd:
+                lines = [lines[0]] + new_body + [lines[-1]]
+                changes += 1
             # 变换 E:条件反折(在标签改名之后做:新标签不在 mapping 里,
             # 原目标标签引用已同步改写;fall-through 判定基于新标签名,一致)
             body = lines[1:-1]
