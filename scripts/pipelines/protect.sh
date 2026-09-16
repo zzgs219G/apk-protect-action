@@ -2,7 +2,7 @@
 # protect.sh — 唯一加固总控（勾选式合并版，取代旧三个 pipeline 总控 + run-modules.sh）
 #
 # 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dex2c [规则文件]]
-#           [--stringenc 规则文件] [--envcheck] [--packer]
+#           [--stringenc 规则文件] [--envcheck] [--packer] [--anti-diff]
 #   - 输入/输出/规则路径一律 normalize 成绝对路径（报错三教训：dcc 运行时要切目录，
 #     相对输出路径会被写进 dcc 目录）
 #   - 主进程 cwd 全程不漂移：dcc.py 在子 shell 里运行（module_cd_run）
@@ -64,6 +64,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 WANT_STRINGENC=0; STRING_RULES=""
+WANT_ANTIDIFF=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sigcheck) WANT_SIGCHECK=1; shift ;;
@@ -79,13 +80,14 @@ while [[ $# -gt 0 ]]; do
                 fi ;;
     --envcheck) WANT_ENVCHECK=1; shift ;;
     --packer)   WANT_PACKER=1; shift ;;
+    --anti-diff) WANT_ANTIDIFF=1; shift ;;
     *)          log_err "未知参数: $1"; usage ;;
   esac
 done
 
-TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC))
+TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC + WANT_ANTIDIFF))
 if [[ $TOTAL -eq 0 ]]; then
-  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --envcheck / --packer）"
+  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --envcheck / --packer / --anti-diff）"
   exit 1
 fi
 
@@ -120,7 +122,7 @@ if [[ $WANT_STRINGENC -eq 1 ]]; then
   require_nonempty_file "$STRING_RULES" "stringenc 规则文件"
 fi
 
-log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → stringenc → packer"
+log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → stringenc → anti-diff → packer"
 
 # ── STEP 1: 提取证书指纹，生成 sig_hash.h（仅 --sigcheck） ──────────
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
@@ -276,6 +278,16 @@ if [[ $WANT_STRINGENC -eq 1 ]]; then
   fi
   python3 "$ROOT/scripts/string-enc/encrypt-strings.py" \
     "$WORK/decompiled" "$STRING_RULES" "${STRING_ENC_ARGS[@]}"
+fi
+
+# ── 防对比混淆（dex 层，最后做：等 dcc/stringenc 的改动落定后再上结构噪声） ──
+# 放在 stringenc 之后的原因:stringenc 会给选中类插入解密桩并改写 const-string,
+# 若 anti-diff 先做、stringenc 后做,stringenc 的改动会让 anti-diff 的"已处理"
+# 标记附近继续出现新差异,削弱防对比效果;最后做 anti-diff,全量 smali 一次性
+# 盖上标签重命名/块重排/入口垃圾指令噪声,diff 视角即"整包重编译"。
+# anti-diff 自带跳过:native 方法(dcc 壳)、<init>/<clinit>(sigcheck/dcc 依赖)。
+if [[ $WANT_ANTIDIFF -eq 1 ]]; then
+  python3 "$ROOT/scripts/anti-diff/anti-diff.py" "$WORK/decompiled"
 fi
 
 if [[ $WANT_SIGCHECK -eq 1 || $WANT_DEX2C -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
