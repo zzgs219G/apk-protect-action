@@ -20,14 +20,28 @@
   B 类内块重排:一个类的多个 .method/.field 块按确定性随机序重排。
     跳过 <init>/<clinit>(必须紧跟 .class 声明,不能挪)与含 .annotation 的块。
     smali 允许方法任意顺序,DEX 无序;重排只改文本,引用全部按描述符解析。
-  C 方法入口垃圾指令(谨慎版):仅当方法同时满足全部硬条件才插 1~3 条
+    E 条件反转 + 跳转链(阶段 2 增强):方法内的条件分支做"反折"——
+      if-eqz vX, :L      →    if-nez vX, :nc新
+                                goto :L
+                              :nc新
+    生成的指令真实落进 dex(if+goto 都是真实执行流,非 nop),MT/IDA 对比下
+    每个反折处都多出 1 条 goto 指令 + 新标签名;原目标标签定义行不动,
+    多分支引用同一标签也不受影响。语义零变(验证器可见的执行路径不变)。
+    跳过:含 try-catch 的方法(保守,不碰边界)、fall-through 恰为跳转
+    目标的分支(反折绕路无意义,还可能让 diff 工具一眼看穿模式)。
+    跳过 <init>/<clinit>(执行顺序敏感,sigcheck/dcc 依赖)。
+  C 方法入口 + return 前垃圾指令(谨慎版·强化):仅当方法同时满足全部
+    硬条件才插:
       - 不是 <init>/<clinit>
       - 不是 native(dcc 抽走的,无方法体,天然跳过)
       - 方法体内没有任何 .catchall/.catch(try-catch 边界禁止动)
-      - .registers ≥ 5(留足余量)
-      - 第一条真实指令是 const*/move*(纯赋值,插桩前后寄存器语义不变)
-    插入条只用 const/4 + move 这类无害指令,且只用已存在的寄存器编号,
-    不改 .registers 值(否则可能撞 try 边界/参数区)。
+      - .locals ≥ 4(v0..v3 必为纯局部寄存器)
+    插入位置(打破"只插方法开头"的可识别模式):
+      - 方法入口 1~max_per_method 条(原行为)
+      - 每个 return 指令前 1~2 条;被 return 读取的寄存器(return vX /
+        return-wide vX 占 v 与 v+1)绝对排除,return-void 无限制
+    插入条只用 const/4 + move 自赋值,只写 v0..v3 局部寄存器,
+    不改 .locals 值。return 前的指令从方法入口可达,反编译器不会丢弃。
 
 【幂等】
   * 类文件一旦被处理,会在 .class 声明行下方写一行标记注释
@@ -120,7 +134,7 @@ _PIN_METHOD_NAMES = ('<init>', '<clinit>')
 # 纯局部寄存器",与首指令类型无关(旧白名单在真实包上额外砍掉 16% 的方法,
 # 如首指令 sget-object 的 getter,毫无必要)。
 
-# 方法体内任何 try-catch 标记(出现即整方法跳过变换 C)
+# 方法体内任何 try-catch 标记(出现即整方法跳过变换 C/E)
 _TRY_RE = re.compile(r'^\s*\.catch(?:all)?\s', re.M)
 
 # 匹配 smali 的 label 行与分支/填充指令里的 label 引用
@@ -417,23 +431,155 @@ def _inject_junk_at_entry(method_lines, rng, max_per_method):
     idx = _method_first_code_index(method_lines)
     if idx < 0:
         return method_lines, 0
-    # 选要插的指令:const/4 覆盖 + move 自赋值,只用 v0..v3
-    # (n_locals≥4 保证存在,纯局部,写入安全)
-    pool = [
-        '    const/4 v0, 0x0',
-        '    const/4 v1, 0x0',
-        '    const/4 v2, 0x0',
-        '    const/4 v3, 0x0',
-        '    move v0, v0',
-        '    move v1, v1',
-        '    move v2, v2',
-        '    move v3, v3',
-    ]
-    n_ins = rng.randint(1, max_per_method)
-    ins = [rng.choice(pool) for _ in range(n_ins)]
+    ins = _junk_ins(rng, rng.randint(1, max_per_method))
     # 插在第一条真实指令之前
     new_lines = method_lines[:idx] + ins + method_lines[idx:]
-    return new_lines, n_ins
+    return new_lines, len(ins)
+
+
+# ── 变换 E:条件反转 + 跳转链(阶段 2)──────────────────────────────
+
+# 条件零值分支(22t 格式,寄存器 + 标签)
+_COND_Z_RE = re.compile(r'^(\s*)(if-eqz|if-nez|if-ltz|if-gez|if-gtz|if-lez)\s+(v\d+|p\d+)\s*,\s*(:[A-Za-z0-9_.$]+)\s*$')
+# 条件双值分支(22t 格式)
+_COND_2RE = re.compile(r'^(\s*)(if-eq|if-ne|if-lt|if-ge|if-gt|if-le)\s+(v\d+|p\d+)\s*,\s*(v\d+|p\d+)\s*,\s*(:[A-Za-z0-9_.$]+)\s*$')
+
+_Z_INVERSE = {
+    'if-eqz': 'if-nez', 'if-nez': 'if-eqz',
+    'if-ltz': 'if-gez', 'if-gez': 'if-ltz',
+    'if-gtz': 'if-lez', 'if-lez': 'if-gtz',
+}
+_2_INVERSE = {
+    'if-eq': 'if-ne', 'if-ne': 'if-eq',
+    'if-lt': 'if-ge', 'if-ge': 'if-lt',
+    'if-gt': 'if-le', 'if-le': 'if-gt',
+}
+
+# return 指令形态:return-void / return[-wide|-object] vX
+_RETURN_RE = re.compile(r'^\s*return(?:-void|-wide|-object)?(?:\s+(v\d+|p\d+))?\s*$')
+
+
+def _invert_conditionals(method_lines, rng, max_per_method):
+    """变换 E:方法内条件分支反折(确定性选择,非全量)。
+
+    改写:
+      if-eqz vX, :L   →   if-nez vX, :nc新
+                          goto :L
+                        :nc新
+    原目标标签的定义行不动(可能被多个分支引用);新标签名走种子驱动
+    确定性随机,与其余变换一致。落进 dex 的是 1 条真实 goto 指令。"""
+    # 逐行扫描,收集可反折的分支(带行号)
+    candidates = []
+    n = len(method_lines)
+    for i, ln in enumerate(method_lines):
+        m = _COND_Z_RE.match(ln) or _COND_2RE.match(ln)
+        if not m:
+            continue
+        target = m.groups()[-1]
+        # fall-through 恰为跳转目标:反折产生 goto :target 紧跟 :target
+        # 定义,纯绕路且模式明显 → 跳过
+        if i + 1 < n and method_lines[i + 1].strip() == target + ':':
+            continue
+        candidates.append(i)
+    if not candidates:
+        return method_lines, 0
+    n_flip = min(len(candidates), rng.randint(1, max_per_method))
+    picks = set(rng.sample(candidates, n_flip))
+    used_names = set()
+    out = []
+    flips = 0
+    for i, ln in enumerate(method_lines):
+        if i not in picks:
+            out.append(ln)
+            continue
+        m = _COND_Z_RE.match(ln) or _COND_2RE.match(ln)
+        if not m:
+            out.append(ln)
+            continue
+        groups = m.groups()
+        op = groups[1]
+        while True:
+            new_lab = ':nc' + ''.join(rng.choice('0123456789abcdef') for _ in range(6))
+            if new_lab not in used_names:
+                used_names.add(new_lab)
+                break
+        if op in _2_INVERSE:
+            indent, op2, a, b, target = groups
+            inverse = _2_INVERSE[op2]
+            out.append(f'{indent}{inverse} {a}, {b}, {new_lab}')
+        else:
+            indent, opz, a, target = groups
+            inverse = _Z_INVERSE[opz]
+            out.append(f'{indent}{inverse} {a}, {new_lab}')
+        out.append(f'{indent}goto {target}')
+        # 新标签定义行不带尾冒号(smali 3.x 解析器对 ":label:" 尾冒号形态
+        # 在"后续紧跟指令"时解析炸:报 no viable alternative;真实
+        # baksmali 产物 100% 无尾冒号,保持同构)
+        out.append(f'{indent}{new_lab}')
+        flips += 1
+    return out, flips
+
+
+def _insert_before_returns(method_lines, rng, max_per_method):
+    """变换 C 强化:每个 return 指令前插 1~max_per_method 条垃圾指令。
+
+    排除被 return 读取的寄存器(return vX / return-wide vX 占 v 与 v+1);
+    return-void 不读任何寄存器,全部 v0..v3 可用。插在 return 前的指令
+    从方法入口可达,反编译器(baksmali)不会丢弃 → 真实落进 dex。"""
+    out = []
+    inserted = 0
+    # 硬条件:.locals ≥ 4 才能保证 v0..v3 全是纯局部寄存器。
+    # 真实包教训(首次回编往返验证抓出):漏掉此门槛时,.locals 2 的方法
+    # 里 v2/v3 是参数寄存器(p0/p1),垃圾指令直接覆盖 this/参数 → 语义
+    # 被破坏。与入口插桩共用同一安全模型。
+    if _method_locals_count(method_lines) < 4:
+        return method_lines, 0
+    for ln in method_lines:
+        m = _RETURN_RE.match(ln)
+        if m:
+            reg = m.group(1)
+            if reg is None:
+                # return-void:不读任何寄存器,v0..v3 全部可写
+                pool = _junk_pool()
+            elif reg.startswith('v'):
+                # vN:return 读取 vN(ban 掉);return-wide 还读伴生 vN+1。
+                # 历史教训:此处曾把集合方向写反(排除"其余全部"导致插的
+                # 恰恰全是返回寄存器,直接覆盖返回值),probe 复测抓出。
+                banned = {reg}
+                if '-wide' in ln:
+                    banned.add('v' + str(int(reg[1:]) + 1))
+                pool = _junk_pool(banned)
+            else:
+                # pN 形态只是 baksmali 的参数视图,反编译产物中 return
+                # 始终以 vN 出现;防御性兜底:全部封禁(只剩 const 之外的
+                # 空池 → 不插),等价于跳过该处
+                pool = []
+            ins = _junk_ins(rng, rng.randint(1, max_per_method), pool)
+            out.extend(ins)
+            inserted += len(ins)
+        out.append(ln)
+    return out, inserted
+
+
+def _junk_pool(banned=frozenset()):
+    """构造垃圾指令池:只写 v0..v3 局部寄存器,排除 banned。"""
+    pool = []
+    for i in range(4):
+        r = f'v{i}'
+        if r in banned:
+            continue
+        pool.append(f'    const/4 {r}, 0x0')
+        pool.append(f'    const/4 {r}, 0x1')
+        pool.append(f'    move {r}, {r}')
+    return pool
+
+
+def _junk_ins(rng, count, pool=None):
+    """从池中确定性随机选 count 条垃圾指令。"""
+    if pool is None:
+        pool = _junk_pool()
+    count = min(count, len(pool))
+    return [rng.choice(pool) for _ in range(count)]
 
 
 # ── 方法级处理 ─────────────────────────────────────────────────────
@@ -450,8 +596,8 @@ def _method_is_native(block_lines):
                for ln in block_lines[:1])
 
 
-def _process_method_block(block_lines, rng, max_per_method):
-    """对一个 .method 块做 A(+C)。返回(新块, 改动计数)。"""
+def _process_method_block(block_lines, rng, max_per_method, max_cond_flip):
+    """对一个 .method 块做 A(+C+E)。返回(新块, 改动计数)。"""
     changes = 0
     lines = block_lines
     # 变换 A:标签重命名(<init>/<clinit> 跳过)
@@ -459,12 +605,29 @@ def _process_method_block(block_lines, rng, max_per_method):
     if name not in _PIN_METHOD_NAMES:
         # 只处理方法体(去掉 .method 行与 .end method 行)
         body = lines[1:-1]
+        # 方法级 try 门槛:含 try-catch 的方法一律不做 E/C(标签重命名 A
+        # 仍做,它不增删指令、不改偏移)。真实包抽样:含 try 方法占相当
+        # 比例,R8 优化后的 catch 块边界与寄存器状态耦合,保守跳过。
+        has_try = bool(_TRY_RE.search('\n'.join(body)))
         new_body, n = _rename_labels(body, rng)
         if n:
             lines = [lines[0]] + new_body + [lines[-1]]
             changes += n
-        # 变换 C:入口垃圾指令(native 方法没有方法体,天然不在此)
-        if not _method_is_native(lines):
+        if not has_try and not _method_is_native(lines):
+            # 变换 E:条件反折(在标签改名之后做:新标签不在 mapping 里,
+            # 原目标标签引用已同步改写;fall-through 判定基于新标签名,一致)
+            body = lines[1:-1]
+            new_body, ne = _invert_conditionals(body, rng, max_cond_flip)
+            if ne:
+                lines = [lines[0]] + new_body + [lines[-1]]
+                changes += ne
+            # 变换 C 强化:return 前插垃圾指令
+            body = lines[1:-1]
+            new_body, nr = _insert_before_returns(body, rng, max_per_method)
+            if nr:
+                lines = [lines[0]] + new_body + [lines[-1]]
+                changes += nr
+            # 变换 C:入口垃圾指令
             body = lines[1:-1]
             new_body, n2 = _inject_junk_at_entry(body, rng, max_per_method)
             if n2:
@@ -475,7 +638,7 @@ def _process_method_block(block_lines, rng, max_per_method):
 
 # ── 类文件级处理 ───────────────────────────────────────────────────
 
-def process_file(path, rng, max_per_method):
+def process_file(path, rng, max_per_method, max_cond_flip=3):
     with open(path, 'r', encoding='utf-8') as f:
         text = f.read()
     if CLASS_MARK in text:
@@ -488,7 +651,7 @@ def process_file(path, rng, max_per_method):
     new_blocks = []
     for kind, blk in blocks:
         if kind == 'method':
-            new_blk, ch = _process_method_block(blk, rng, max_per_method)
+            new_blk, ch = _process_method_block(blk, rng, max_per_method, max_cond_flip)
             # 拆分 A/C 计数由 _process_method_block 内部合并,这里只记总
             new_blocks.append((kind, new_blk))
             total_a += ch  # 合并计数(标签数+垃圾指令数),报告用
@@ -552,7 +715,9 @@ def main(argv):
     ap.add_argument('--level', type=int, default=1, choices=[1],
                     help='变换等级(目前只有 1 = MVP)')
     ap.add_argument('--max-per-method', type=int, default=3,
-                    help='变换 C 单方法最多插入条数(默认 3)')
+                    help='变换 C 单方法/单 return 最多插入条数(默认 3)')
+    ap.add_argument('--max-cond-flip', type=int, default=3,
+                    help='变换 E 单方法最多反折条件分支数(默认 3,阶段 2)')
     args = ap.parse_args(argv)
 
     root = os.path.abspath(args.decompiled)
@@ -581,7 +746,8 @@ def main(argv):
         if _is_skip_class(rel):
             n_excluded += 1
             continue
-        a, c, moved, skipped = process_file(p, rng, args.max_per_method)
+        a, c, moved, skipped = process_file(p, rng, args.max_per_method,
+                                            args.max_cond_flip)
         if skipped:
             n_skipped += 1
             continue
@@ -592,7 +758,7 @@ def main(argv):
     print(f'✅ anti-diff 完成: 处理 {n_files} 个类'
           f'({n_skipped} 个已处理跳过,'
           f' {n_excluded} 个系统/依赖类白名单排除),'
-          f' 标签/垃圾指令改动 {total_ac} 处,'
+          f' 标签/垃圾指令/条件反折改动 {total_ac} 处,'
           f' 块重排移动 {total_moved} 块')
     return 0
 
