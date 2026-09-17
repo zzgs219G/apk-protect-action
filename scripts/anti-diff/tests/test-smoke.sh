@@ -351,4 +351,59 @@ diff -u "$WORK/dec/smali/com/demo/A.smali" "$WORK/dec2/smali/com/demo/A.smali" \
   > "$WORK/det.diff" && echo '  确定性 ✅' \
   || { echo 'ℹ️ 两目录类结构不同(设计内,dec 多了 baz/nat 方法),跳过整体 diff'; }
 
+# ── 断言 8:报错三十五回归——wide 寄存器对必须整体置换(不拆散) ────────
+# 旧实现两处漏保护:① _WIDE_INS_RE 缺 move-result-wide;② _collect_wide_pairs
+# 只取 regs[0](多 src 宽对/ invoke 传入宽对全漏)。漏保护的宽对被当普通
+# single 单元独立置换 → 64 位值高低半拆到不相邻寄存器 → ART verifier 读
+# 未定义寄存器 → VerifyError 秒闪退(简盒闪退包实证:94 处读前未定义 vs
+# 原包 1 处)。此处用**黑盒行对齐**重建映射,断言置换后每个宽对仍整体移动。
+python3 - "$HERE/../anti-diff.py" <<'PY'
+import importlib.util, sys, random, re
+spec = importlib.util.spec_from_file_location('ad', sys.argv[1])
+ad = importlib.util.module_from_spec(spec); spec.loader.exec_module(ad)
+
+# ① 收集器必须覆盖三类旧漏洞形态
+assert ad._collect_wide_pairs(['    move-result-wide v2']) == {(2, 3)}, \
+    'move-result-wide 目标宽对漏保护(报错三十五之一)'
+assert ad._collect_wide_pairs(['    add-long v4, v0, v2']) == {(0, 1), (2, 3), (4, 5)}, \
+    'add-long 多 src 宽对漏保护(报错三十五之二)'
+assert ad._collect_invoke_wide_pairs(
+    '    invoke-static {v8, v9}, Ljava/lang/Math;->pow(DD)D') == {(8, 9)}, \
+    'invoke 传入宽对漏保护(报错三十五之四)'
+assert ad._collect_wide_pairs(
+    ['    cmpg-double v1, v2, v4']) == {(2, 3), (4, 5)}, 'cmpg-double src 宽对漏保护'
+
+# ② 黑盒:置换后宽对必须整体移动(行对齐重建映射,不依赖生产内部状态)
+# body 选 move-result-wide v2 + invoke {v2, v3}:宽对 (2,3) 不被任何 return
+# 覆盖,旧代码必拆散(旧版 move-result-wide 与 invoke 宽对都不登记)
+body = ['    .locals 6',
+        '    invoke-static {}, Lcom/x;->now()J',
+        '    move-result-wide v2',
+        '    invoke-static {v2, v3}, Ljava/lang/Long;->valueOf(J)Ljava/lang/Long;',
+        '    move-result-object v0',
+        '    return-object v0']
+protected = {(2, 3)}   # 硬编码期望(不依赖生产收集器)
+assert ad._collect_wide_pairs(body) == {(2, 3)}, \
+    f'宽对收集异常: {ad._collect_wide_pairs(body)}'
+ran = 0
+for seed in range(80):
+    out, ch = ad._permute_registers(list(body), random.Random(seed))
+    if not ch:
+        continue
+    ran += 1
+    assert len(out) == len(body), '置换不应增删行'
+    mp = {}
+    for lb, lo in zip(body, out):
+        rb = re.findall(r'\bv(\d+)\b', lb)
+        ro = re.findall(r'\bv(\d+)\b', lo)
+        if len(rb) == len(ro):
+            for a, b in zip(rb, ro):
+                mp[int(a)] = int(b)
+    for a, b in protected:
+        assert mp.get(b, b) == mp.get(a, a) + 1, \
+            f'seed={seed} 宽对 {(a, b)} 被拆散: map({a})={mp.get(a)}, map({b})={mp.get(b)}'
+assert ran > 0, '80 个种子都没触发置换,测试无效'
+print(f'  报错三十五回归 ✅ (宽对整体置换,{ran} 个种子验证)')
+PY
+
 echo '✅ 冒烟测试全部通过'
