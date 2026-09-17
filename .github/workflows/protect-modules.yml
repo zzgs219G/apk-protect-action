@@ -12,35 +12,35 @@ on:
         description: 'APK下载链接(需已用开发者keystore签名)'
         required: true
       sigcheck:
-        description: '勾选: 签名校验'
+        description: '签名校验（防移动端98％）'
         type: boolean
         default: true
       dex2c:
-        description: '勾选: Dex2C 转译(提供类规则→按规则;联合签名校验且不填→自动抽主类)'
+        description: 'Dex2C（java层代码抽至so层）'
         type: boolean
         default: false
       dex2c_rules:
-        description: 'Dex2C 类名规则(每行一条,支持 com.test.** / activity*;联合签名校验时可留空)'
+        description: '类名规则(每行一条,支持**/com.test.** / activity*;'
         required: false
         default: ''
       stringenc:
-        description: '勾选: 字符串加密(dex 层,与 so 无关;必须填规则)'
+        description: 'dex字符串加密（防字符串搜索）'
         type: boolean
         default: false
       string_rules:
-        description: '字符串加密类名规则(每行一条,语法同 dex2c_rules;勾选 stringenc 时必填)'
+        description: '类名规则(每行一条,支持**/com.test.** / activity*;'
         required: false
         default: ''
       envcheck:
-        description: '勾选: 环境检测(Frida/Xposed/调试器,检测到随机延时闪退)'
+        description: '环境检测(Frida/Xposed/调试器)'
         type: boolean
         default: false
       packer:
-        description: '勾选: 基础加壳(尚未接入)'
+        description: '基础加壳(尚未接入)'
         type: boolean
         default: false
       antidiff:
-        description: '勾选: 防对比混淆(anti-diff, dex 层结构噪声, 让 diff 全红)'
+        description: 'dex层结构噪声(防止修改处被轻易定位)'
         type: boolean
         default: false
 
