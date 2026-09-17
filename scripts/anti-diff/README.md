@@ -1,7 +1,7 @@
 # anti-diff — 防对比混淆模块(MVP)
 
 > 给下一任 AI / 开发者:本模块的"为什么、做什么、红线"全部以
-> [`docs/开发文档.md`](../../docs/开发文档.md) 为最终裁判,本文只是工程索引。
+> [`docs/archive/开发文档-anti-diff.md`](../../docs/archive/开发文档-anti-diff.md) 为最终裁判,本文只是工程索引。
 
 ## 是什么
 
@@ -65,3 +65,17 @@ bash scripts/anti-diff/tests/test-smoke.sh
 合成 smali,断言:三类变换生效、语义行零变化、`<init>`/native/try-catch 被跳过、
 重跑幂等。真实包(apktool 回编/真机冷启动)验证按开发文档 §5.4 在真机环境执行,
 不在本冒烟测试范围。
+
+
+
+
+作者添加
+
+切记！MT的对比会支持以下功能:
+
+忽略编译优化
+忽略寄存器数量
+忽略调试信息
+忽略nop指令
+
+所有要排除这四个因素进行对比
