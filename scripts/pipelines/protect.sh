@@ -2,7 +2,8 @@
 # protect.sh — 唯一加固总控（勾选式合并版，取代旧三个 pipeline 总控 + run-modules.sh）
 #
 # 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dex2c [规则文件]]
-#           [--stringenc 规则文件] [--envcheck] [--packer] [--anti-diff]
+#           [--stringenc 规则文件] [--light-obf 规则文件] [--envcheck] [--packer]
+#           [--anti-diff]
 #   - 输入/输出/规则路径一律 normalize 成绝对路径（报错三教训：dcc 运行时要切目录，
 #     相对输出路径会被写进 dcc 目录）
 #   - 主进程 cwd 全程不漂移：dcc.py 在子 shell 里运行（module_cd_run）
@@ -32,7 +33,14 @@
 #   名单排除,规则写 ** 也不突破。产物侧用纯 Java 解密桩 Lcom/nc/strdec/StrDec; 解,
 #   不依赖 so。
 #
-# 固定执行顺序（与勾选顺序无关）：sigcheck → dex2c → stringenc → packer
+# --light-obf [规则文件]   → 轻量混淆(dex 层,与 stringenc/anti-diff 同路线)。
+#   阶段 1 仅变换 D 标识符混淆(ascii 路线):类内 private 方法/字段改名,零膨胀、
+#   运行时零代价。规则语法与 --stringenc 完全一致;硬排除(Manifest 组件/R$/编译器
+#   合成符号/反射/序列化/native/com.nc. 桩)规则写 ** 也不突破。详见
+#   docs/开发文档-light-obf.md(变换 B/A/C 属阶段 2/3,未接入)。
+#   顺序:必须跑在 stringenc 之前(stringenc 桩字段引用依赖名字稳定,§5.2)。
+#
+# 固定执行顺序（与勾选顺序无关）：sigcheck → dex2c → light-obf → stringenc → packer
 #
 # 前置依赖（由 workflow 安装）: python3 + dcc requirements、JDK 17、Android NDK、apktool
 set -euo pipefail
@@ -64,6 +72,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 WANT_STRINGENC=0; STRING_RULES=""
+WANT_LIGHTOBF=0; LIGHTOBF_RULES=""
 WANT_ANTIDIFF=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,14 +89,19 @@ while [[ $# -gt 0 ]]; do
                 fi ;;
     --envcheck) WANT_ENVCHECK=1; shift ;;
     --packer)   WANT_PACKER=1; shift ;;
+    --light-obf) WANT_LIGHTOBF=1; shift
+                # 规则文件必填(标识符混淆必须明确范围,同 stringenc 不做自动兜底)
+                if [[ $# -ge 1 && "$1" != --* ]]; then
+                  LIGHTOBF_RULES="$(normalize_path "$1")"; shift
+                fi ;;
     --anti-diff) WANT_ANTIDIFF=1; shift ;;
     *)          log_err "未知参数: $1"; usage ;;
   esac
 done
 
-TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC + WANT_ANTIDIFF))
+TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC + WANT_LIGHTOBF + WANT_ANTIDIFF))
 if [[ $TOTAL -eq 0 ]]; then
-  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --envcheck / --packer / --anti-diff）"
+  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --light-obf 规则 / --envcheck / --packer / --anti-diff）"
   exit 1
 fi
 
@@ -121,8 +135,16 @@ if [[ $WANT_STRINGENC -eq 1 ]]; then
   fi
   require_nonempty_file "$STRING_RULES" "stringenc 规则文件"
 fi
+if [[ $WANT_LIGHTOBF -eq 1 ]]; then
+  if [[ -z "$LIGHTOBF_RULES" ]]; then
+    log_err "--light-obf 必须提供类名规则文件（标识符混淆必须明确范围,不做自动兜底）"
+    log_err "     规则语法与 --stringenc 完全一致: com.test.** / !com.test.libs.** / # 注释"
+    exit 1
+  fi
+  require_nonempty_file "$LIGHTOBF_RULES" "light-obf 规则文件"
+fi
 
-log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → stringenc → anti-diff → packer"
+log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → light-obf → stringenc → anti-diff → packer"
 
 # ── STEP 1: 提取证书指纹，生成 sig_hash.h（仅 --sigcheck） ──────────
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
@@ -245,6 +267,18 @@ elif [[ $WANT_SIGCHECK -eq 1 ]]; then
   # manifest 是二进制 AXML → inject-loadlib 内部走 androguard AXMLPrinter 解析
   python3 "$ROOT/scripts/inject/inject-loadlib.py" "$WORK/decompiled" \
     --launcher --entrypoints --so-name nc
+fi
+
+# ── 轻量混淆（dex 层；必须跑在 stringenc 之前） ─────────────────────
+# 顺序依据(开发文档-light-obf.md §5.2):stringenc 的解密桩字段引用依赖
+# 名字稳定,标识符改名必须在其之前完成;dcc 抽走的方法此时已是 native 壳、
+# 没有方法体,light-obf 自然扫不到它们(与 stringenc 同型的顺序免疫)。
+# light-obf 自带硬排除(Manifest 组件/R$/反射/序列化/native/com.nc. 桩),
+# 规则写 ** 也不突破;幂等标记 nc-lightobf-applied,重跑跳过。
+if [[ $WANT_LIGHTOBF -eq 1 ]]; then
+  python3 "$ROOT/scripts/light-obf/light-obf.py" "$WORK/decompiled" "$LIGHTOBF_RULES" \
+    --map "$WORK/light-obf-map.json"
+  log_info "light-obf map(改名映射,--clean 反查依据)已留存: light-obf-map.json"
 fi
 
 # ── 字符串加密（dex 层，与 so 无关；必须在 mark-native 之后） ──────

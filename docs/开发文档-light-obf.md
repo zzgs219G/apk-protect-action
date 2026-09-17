@@ -445,10 +445,13 @@ scripts/light-obf/tests/test-probes.sh
 
 # 冒烟（合成 smali，参照 anti-diff tests 的写法）
 scripts/light-obf/tests/test-smoke.sh
-# 断言点: ①变换生效计数 ②幂等(重跑逐字节不变) ③确定性(双 seed 相同输出)
-#         ④预算断言(新增指令行 ≤ 15%+2) ⑤反向 goto 方法零膨胀
-#         ⑥硬排除名单零触碰 ⑦--clean 只清标记不恢复标识符(--help 文案同步)
-#         ⑧引用计数守恒(改名前后引用条数一致) ⑨.charset 路线打印断言
+# 断言点(阶段 1 实测版,变换 B/A 落地后随阶段补充 ④⑤):
+#   ① 变换生效计数(private 方法/字段确实改名) ② 幂等(重跑逐字节不变)
+#   ③ 确定性(同 seed 双跑一致/异 seed 不同) ④ 零膨胀(变换 D 不增删指令行)
+#   ⑤ 硬排除名单零触碰(组件/R$/access$桥名/annotation 成员/native/反射/
+#      序列化/com.nc. 桩) ⑥ 引用计数守恒(跨文件引用同步 + 字面量不碰)
+#   ⑦ --clean 撤销变换 D(--map 反查,--help 同步"非完整回滚"文案)
+#   ⑧ 字符集路线打印断言 ⑨ fail-fast(unicode/未实现变换/B-A 孤儿标记)
 
 # 回编验证（需要 apktool.jar，见流程文档 §7 第 7 步同款命令）
 java -jar tools/dcc/tools/apktool.jar b -o /tmp/lo.apk /tmp/lo_dir
