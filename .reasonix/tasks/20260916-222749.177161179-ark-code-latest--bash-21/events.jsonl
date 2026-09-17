@@ -1,2 +1,0 @@
-{"sequence":1,"timestamp":"2026-09-16T23:44:22.51211553Z","event_type":"state_change","task_id":"20260916-222749.177161179-ark-code-latest--bash-21","session_id":"20260916-222749.177161179-ark-code-latest","state":"running","runtime_state":"alive"}
-{"sequence":2,"timestamp":"2026-09-16T23:46:38.810841384Z","event_type":"state_change","task_id":"20260916-222749.177161179-ark-code-latest--bash-21","session_id":"20260916-222749.177161179-ark-code-latest","state":"succeeded","runtime_state":"exited"}
