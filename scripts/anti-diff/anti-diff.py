@@ -744,14 +744,148 @@ def _junk_ins(rng, count, pool=None):
 # ── 变换 D:局部寄存器重编号(阶段 2 增强)──────────────────────────
 
 # wide(64 位)寄存器指令:寄存器对 (vN, vN+1) 构成不可拆分单元
+# 报错三十五:曾漏 move-result-wide(与 move-wide 前缀不同,不被其覆盖)与
+# cmpg-double/cmpl-double —— 这三类完全不被识别,其宽对整段漏保护。
 _WIDE_INS_RE = re.compile(
-    r'^\s*(?:const-wide|move-wide|return-wide|'
+    r'^\s*(?:const-wide|move-wide|move-result-wide|return-wide|'
     r'add-long|sub-long|mul-long|div-long|rem-long|and-long|or-long|xor-long|'
     r'shl-long|shr-long|ushr-long|neg-long|long-to-(?:int|float|double)|'
     r'double-to-(?:int|float|long)|int-to-long|int-to-double|float-to-long|'
-    r'float-to-double|cmp-long|'
+    r'float-to-double|cmp-long|cmpg-double|cmpl-double|'
     r'add-double|sub-double|mul-double|div-double|rem-double|neg-double|'
     r'aget-wide|aput-wide|sget-wide|sput-wide|iget-wide|iput-wide)')
+
+# 64 位操作数判定表(用于 _wide_operand_bases)
+_WIDE_ARITH = re.compile(r'^(add|sub|mul|div|rem|and|or|xor|shl|shr|ushr)-(long|double)$')
+_WIDE_ARITH_2ADDR = re.compile(r'^(add|sub|mul|div|rem|and|or|xor|shl|shr|ushr)-(long|double)/2addr$')
+_WIDE_TO = re.compile(r'^(long|double)-to-(int|float|long|double)$')
+_INT_FLOAT_TO_WIDE = re.compile(r'^(int|float)-to-(long|double)$')
+
+# invoke 行:op {寄存器列表}, 方法引用(参数描述符)返回类型
+_INVOKE_RE = re.compile(
+    r'^\s*(invoke-[a-z0-9/]+)\s+\{([^}]*)\}\s*,\s*[^\s(]+\(([^)]*)\)')
+
+
+def _param_slot_list(desc):
+    """把参数描述符展开为槽列表,如 '(JLjava/lang/String;D)V' → [2, 1, 2]。
+
+    invoke 指令的寄存器列表按参数**槽**顺序排列,wide 参数(J/D)占 2 槽且
+    两个寄存器必须相邻。用于定位 invoke 传入的 wide 寄存器对(报错三十五之四)。"""
+    out = []
+    i = 0
+    n = len(desc)
+    while i < n:
+        c = desc[i]
+        if c in ' \t':
+            i += 1          # baksmali 参数描述符含空格分隔符,必须跳过
+            continue
+        if c == '[':
+            while i < n and desc[i] == '[':
+                i += 1
+            if i < n and desc[i] == 'L':
+                while i < n and desc[i] != ';':
+                    i += 1
+            i += 1
+            out.append(1)
+        elif c == 'L':
+            while i < n and desc[i] != ';':
+                i += 1
+            i += 1
+            out.append(1)
+        elif c in 'JD':
+            out.append(2)
+            i += 1
+        else:
+            out.append(1)
+            i += 1
+    return out
+
+
+def _collect_invoke_wide_pairs(line):
+    """返回 invoke 指令传入的 wide 参数寄存器对集合。
+
+    报错三十五之四:invoke 的寄存器列表按参数槽排列,`invoke-static {v8, v9},
+    Ljava/lang/Math;->pow(DD)D` 中 (v8,v9) 是 double 的宽对,必须整体置换。
+    变换 D 只逐 token 替换寄存器号,不识别这种宽对 → 高低半被拆散 →
+    被调方收到错位的 64 位值 / verifier 读未定义寄存器。真实包实证:
+    简盒原包有数千处 invoke wide 对被拆散(如 `invoke-static {v4, v0},
+    Long;->valueOf(J)` 读断裂宽对)。
+    /range 形态由 _collect_range_blocks 整体锁定,这里跳过。"""
+    m = _INVOKE_RE.match(line)
+    if not m:
+        return set()
+    op = m.group(1)
+    if '/range' in op:
+        return set()
+    # 保留 token 的**位置**(含 pN 占位)——re.findall(r'\bv\d+') 会把 pN 丢掉
+    # 导致后续参数错位,产出 (v7, v4) 这类非连续假对(真实包实证)。
+    toks = re.findall(r'\b([vp]\d+)\b', m.group(2))
+    slots = _param_slot_list(m.group(3))
+    idx = 0 if 'static' in op else 1   # 非 static 第 0 个寄存器是 receiver(1 槽)
+    pairs = set()
+    for s in slots:
+        if idx >= len(toks):
+            break
+        if s == 2 and idx + 1 < len(toks):
+            t1, t2 = toks[idx], toks[idx + 1]
+            # 两个成员都是 vN 才是参与置换的局部宽对;pN 区不置换,跳过
+            if t1[0] == 'v' and t2[0] == 'v':
+                a = int(t1[1:])
+                if int(t2[1:]) == a + 1:
+                    pairs.add((a, a + 1))
+        idx += s
+    return pairs
+
+
+
+def _wide_operand_bases(name, regs):
+    """返回该指令中**全部** 64 位操作数的基址集合(含 dst 与所有 src)。
+
+    报错三十五:旧 _collect_wide_pairs 只登记 regs[0](首操作数),因此
+      * move-result-wide v2   → 目标宽对 (2,3) 完全漏(且不在 _WIDE_INS_RE)
+      * add-long v4, v0, v2   → 两个 src 宽对 (0,1)/(2,3) 全漏
+    漏保护的宽对被变换 D 当普通 single 单元独立置换 → 64 位值高低半拆到
+    不相邻寄存器 → ART verifier 读未定义寄存器 → VerifyError 秒闪退。
+    """
+    n = len(regs)
+    if n == 0:
+        return set()
+    bases = set()
+    # ── dst 是 64 位 ──
+    if name.startswith(('move-result-wide', 'move-wide', 'const-wide',
+                        'iget-wide', 'aget-wide', 'sget-wide')):
+        bases.add(regs[0])
+    elif _WIDE_ARITH.match(name) or _WIDE_ARITH_2ADDR.match(name):
+        bases.add(regs[0])
+    elif name in ('neg-long', 'neg-double'):
+        bases.add(regs[0])
+    elif _INT_FLOAT_TO_WIDE.match(name) or name == 'double-to-long':
+        bases.add(regs[0])
+    # ── src 是 64 位 ──
+    if name.startswith('move-wide'):
+        if n >= 2:
+            bases.add(regs[1])
+    elif name == 'return-wide':
+        bases.add(regs[0])
+    elif _WIDE_ARITH.match(name):
+        for i in (1, 2):
+            if i < n:
+                bases.add(regs[i])
+    elif _WIDE_ARITH_2ADDR.match(name):
+        bases.add(regs[0])          # /2addr 的 dst 即 src
+    elif name in ('neg-long', 'neg-double'):
+        if n >= 2:
+            bases.add(regs[1])
+    elif name in ('cmp-long', 'cmpg-double', 'cmpl-double'):
+        for i in (1, 2):
+            if i < n:
+                bases.add(regs[i])
+    elif _WIDE_TO.match(name):
+        if n >= 2:
+            bases.add(regs[1])
+    elif name.startswith(('iput-wide', 'aput-wide', 'sput-wide')):
+        bases.add(regs[0])
+    return bases
 
 # 寄存器 token:vN / pN(替换时只匹配独立 token,防止 v1 误伤 v11)
 _REG_TOKEN_RE = re.compile(r'(?<![\w.$-])([vp]\d+)(?![\w.$-])')
@@ -763,17 +897,34 @@ def _collect_wide_pairs(method_lines):
     """收集方法内所有 wide 寄存器对(vN 与 vN+1)。
 
     wide 指令的寄存器对必须整体置换(两个成员绑在同一编号组内),
-    否则 64 位值的低/高半会落在不相邻的寄存器上 → 语义破坏。"""
+    否则 64 位值的低/高半会落在不相邻的寄存器上 → 语义破坏。
+
+    报错三十五:旧实现只取每条 wide 指令的 regs[0],导致
+      * `move-result-wide v2` 的目标宽对 (2,3) 完全不被登记(且该指令名
+        不在旧 _WIDE_INS_RE 里,整条指令被无视);
+      * `add-long v4, v0, v2` 的两个 src 宽对 (0,1)/(2,3) 全漏。
+    漏保护的宽对随后被 _permute_registers 当普通 single 单元独立置换,
+    64 位值高低半被拆到不相邻寄存器 → ART verifier 读未定义寄存器 →
+    VerifyError 秒闪退(真实包实证:简盒闪退包 94 处读前未定义,原包 1 处)。
+    现改用 _wide_operand_bases:按指令语义取出**全部** 64 位操作数基址。"""
     pairs = set()
     for ln in method_lines:
         s = ln.strip()
-        if s.startswith('#') or not s:
+        if not s or s.startswith(('#', ':', '.')):
             continue
-        if _WIDE_INS_RE.match(ln):
-            regs = re.findall(r'\bv(\d+)\b', s)
-            if regs:
-                base = int(regs[0])
-                pairs.add((base, base + 1))
+        if s.startswith('invoke'):
+            # 报错三十五之四:invoke 传入的 wide 参数对也要整体保护
+            pairs |= _collect_invoke_wide_pairs(ln)
+            continue
+        m = re.match(r'^([a-z0-9][a-z0-9/._$-]*)', s)
+        if not m:
+            continue
+        name = m.group(1)
+        regs = [int(x) for x in re.findall(r'\bv(\d+)\b', s)]
+        if not regs:
+            continue
+        for b in _wide_operand_bases(name, regs):
+            pairs.add((b, b + 1))
     return pairs
 
 
@@ -876,10 +1027,28 @@ def _permute_registers(method_lines, rng):
     # wide 对:作为整体单元;range 区间成员全部锁定不动
     wide_pairs = _collect_wide_pairs(method_lines)
     range_blocks = _collect_range_blocks(method_lines)
+    # 报错三十五之三:宽对高端成员可能从未在文本出现(如 `const-wide v2`
+    # 只写 v2,伴生 v3 不出现)→ 置换空间上界必须覆盖宽对成员,否则该对会
+    # 被下面的 `b <= max_used` 丢弃,只剩低半变 single 被单独置换 → 断裂。
+    for _a, _b in wide_pairs:
+        if _b > max_used:
+            max_used = _b
     # 越过 16 位边界的 wide 对(低端受 4-bit 约束,高端不受)→ 放弃
     locked = set()
     for a, b in range_blocks:
         locked.update(range(a, b + 1))
+    # 报错三十五之二:宽对之间共享寄存器(如 `move-wide v0, v1` 产生
+    # (0,1) 与 (1,2))时无法让两对各自独立整体移动 → 涉及寄存器全部锁定
+    # 不动(保守:宁可不置换,绝不可拆散)。
+    _wl = sorted(wide_pairs)
+    for _i in range(len(_wl)):
+        _a, _b = _wl[_i]
+        for _j in range(_i + 1, len(_wl)):
+            _c, _d = _wl[_j]
+            if _c > _b + 1:
+                break
+            if not (_b < _c or _d < _a):
+                locked.update(range(min(_a, _c), max(_b, _d) + 1))
     # 4-bit 约束组:0..15 与 16..max_used 两个独立置换域(跨域置换会让
     # 4-bit 指令编码不下,报错三十三)
     # 域划分:0..15 低域(保守整段划入),16..max_used 高域;
