@@ -431,64 +431,22 @@ def _method_locals_count(method_lines):
     return -1
 
 
-def _count_param_slots(method_sig):
-    """解析 .method 行的参数列表,返回参数寄存器槽总数。
+# 参数槽计数单一真相(报错七/红线 7):count_param_slots/max_param_index
+# 抽到 scripts/lib/lib-smali-params.py,anti-diff 与 light-obf 共用同一实现,
+# 严禁在本文件再写副本或 fork 逻辑(报错七:单一真相)。
+_PARAMS_LIB = _load_module('lib_smali_params', 'scripts/lib/lib-smali-params.py')
+count_param_slots = _PARAMS_LIB.count_param_slots
+max_param_index = _PARAMS_LIB.max_param_index
 
-    报错三十四根基:提升 .locals 后参数物理号 pN = v(N' + 槽偏移),wide
-    参数(J/D)占 2 个槽——不能按参数"个数"数,必须按槽。签名逐字符扫描:
-    基本类型/引用类型 1 槽,J/D 2 槽数,数组 [X 按元素类型(引用数组仍
-    1 槽);非 static 方法 this 再占 1 槽。
-    解析失败(签名形态异常)返回 None,调用方按"不可提升"处理(宁缺勿滥)。"""
-    m = re.search(r'\(([^)]*)\)', method_sig)
-    if not m:
-        return None
-    is_static = bool(re.search(r'\bstatic\b', method_sig))
-    args = m.group(1)
-    slots = 0 if is_static else 1  # 非 static:p0 = this
-    i = 0
-    n = len(args)
-    while i < n:
-        c = args[i]
-        if c in 'JD':
-            slots += 2
-            i += 1
-        elif c in 'BCFISZ':
-            slots += 1
-            i += 1
-        elif c == 'L':
-            j = args.find(';', i)
-            if j < 0:
-                return None
-            slots += 1
-            i = j + 1
-        elif c == '[':
-            # 数组:引用数组 1 槽;跳过所有 '[' 后按一个类型算
-            j = i
-            while j < n and args[j] == '[':
-                j += 1
-            if j >= n:
-                return None
-            if args[j] == 'L':
-                j = args.find(';', j)
-                if j < 0:
-                    return None
-            slots += 1
-            i = j + 1
-        else:
-            return None
-    return slots
+
+def _count_param_slots(method_sig):
+    """兼容别名(报错七:本文件历史调用点统一走 lib 单一真相)。"""
+    return count_param_slots(method_sig)
 
 
 def _max_param_index(method_lines):
-    """方法体指令中实际引用的最大 pN 序号(兜底校验用);无引用返回 -1。"""
-    mx = -1
-    for ln in method_lines:
-        s = ln.strip()
-        if s.startswith('.') or s.startswith('#') or not s:
-            continue
-        for m in re.finditer(r'(?<![\w.$-])p(\d+)(?![\w.$-])', ln):
-            mx = max(mx, int(m.group(1)))
-    return mx
+    """兼容别名(报错七:本文件历史调用点统一走 lib 单一真相)。"""
+    return max_param_index(method_lines)
 
 
 def _bump_locals(method_lines, method_sig=None):
