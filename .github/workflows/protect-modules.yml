@@ -1,10 +1,15 @@
 name: APK加固-模块勾选
 
-# 勾选式统一入口：想加固哪些模块就勾选哪些，执行顺序由 protect.sh 固定为
+# 勾选式统一入口（schema 驱动动态配置版）：
+#   App 拉取 configs/v1/config-schema.json 生成父子级勾选 UI → 生成 protect_config
+#   JSON → dispatch 传入 → scripts/actions/resolve-config.py 按 schema 解释成
+#   protect.sh 参数（schema_rules/args.txt，一行一个）→ 执行。
+#   加新模块/子选项只改 configs/v1/config-schema.json 一份文件（App 与本 yml 零改动）。
+# 执行顺序由 protect.sh 固定为
 #   签名校验 → Dex2C → 轻量混淆(light-obf) → 字符串加密 → 防对比混淆(anti-diff) → 基础加壳
 #   （light-obf 必须在 stringenc 前:stringenc 桩字段引用依赖名字稳定;
 #     anti-diff 是 dex 层结构噪声,放 stringenc 后;加壳必须最后，加了壳其它模块改不动）
-# 旧 workflow（签名校验/签名校验-单独/dex2c/APK加固）已移除，本入口为唯一入口。
+# GitHub 网页兜底：不勾任何模块时可直接在 protect_config 手填 JSON（见 configs/v1/config-schema.json）。
 
 on:
   workflow_dispatch:
@@ -12,49 +17,9 @@ on:
       apk_url:
         description: 'APK下载链接(需已用开发者keystore签名)'
         required: true
-      sigcheck:
-        description: '签名校验（防移动端98％）'
-        type: boolean
-        default: true
-      dex2c:
-        description: 'Dex2C（java层代码抽至so层）'
-        type: boolean
-        default: false
-      dex2c_rules:
-        description: '类名规则(每行一条,支持**/com.test.** / activity*;'
-        required: false
-        default: ''
-      stringenc:
-        description: 'dex字符串加密（防字符串搜索）'
-        type: boolean
-        default: false
-      string_rules:
-        description: '类名规则(每行一条,支持**/com.test.** / activity*;'
-        required: false
-        default: ''
-      lightobf:
-        description: '轻量混淆(dex层,private标识符改名,零膨胀;防反编译阅读)'
-        type: choice
-        default: '不启用'
-        options:
-          - 不启用
-          - 标识符改名(变换D)
-      lightobf_rules:
-        description: '轻量混淆类名规则(选了非"不启用"必填;支持**/com.test.** / !排除行 / # 注释)'
-        required: false
-        default: ''
-      envcheck:
-        description: '环境检测(Frida/Xposed/调试器)'
-        type: boolean
-        default: false
-      packer:
-        description: '基础加壳(尚未接入)'
-        type: boolean
-        default: false
-      antidiff:
-        description: 'dex层结构噪声(防止修改处被轻易定位)'
-        type: boolean
-        default: false
+      protect_config:
+        description: '加固配置JSON(schema驱动;结构见 configs/v1/config-schema.json)'
+        required: true
 
 jobs:
   protect:
@@ -93,88 +58,41 @@ jobs:
       - name: 安装 python 依赖(dcc)
         run: pip3 install -r tools/dcc/requirements.txt
 
-      - name: 勾选前置校验
+      - name: 解析 protect_config（schema 驱动 → protect.sh 参数）
+        env:
+          # 经 env 中转，用户输入不直接插值进 shell（命令注入面，沿用旧 yml 思路）
+          # input 键名 protect_config 为永久冻结名（设计方案 §10.7）
+          INPUT_PROTECT_CONFIG: ${{ inputs.protect_config }}
         run: |
-          ok=1
-          # 单独 dex2c(未联合 sigcheck)必须提供规则;联合 sigcheck 时允许留空(自动抽主类)
-          if [[ "${{ inputs.dex2c }}" == "true" && "${{ inputs.sigcheck }}" != "true" && -z "${{ inputs.dex2c_rules }}" ]]; then
-            echo "❌ 单独勾选 Dex2C 必须提供类名规则(dex2c_rules);或同时勾选签名校验以自动抽取主类"
-            ok=0
-          fi
-          # 字符串加密必须显式给出范围(没有"自动抽主类"的兜底)
-          if [[ "${{ inputs.stringenc }}" == "true" && -z "${{ inputs.string_rules }}" ]]; then
-            echo "❌ 勾选字符串加密必须填写类名规则(string_rules)"
-            ok=0
-          fi
-          # 轻量混淆(choice 下拉):选了具体模式就必须给规则,不做自动兜底
-          if [[ "${{ inputs.lightobf }}" != "不启用" && -z "${{ inputs.lightobf_rules }}" ]]; then
-            echo "❌ 轻量混淆选择了「${{ inputs.lightobf }}」必须填写类名规则(lightobf_rules)"
-            ok=0
-          fi
-          if [[ "${{ inputs.sigcheck }}" != "true" && "${{ inputs.dex2c }}" != "true" && "${{ inputs.packer }}" != "true" && "${{ inputs.envcheck }}" != "true" && "${{ inputs.stringenc }}" != "true" && "${{ inputs.lightobf }}" != "不启用" && "${{ inputs.antidiff }}" != "true" ]]; then
-            echo "❌ 至少勾选一个模块"
-            ok=0
-          fi
-          [[ $ok -eq 1 ]] || exit 1
+          python3 scripts/actions/resolve-config.py
+          echo "=== args.txt（一行一个参数）==="
+          cat schema_rules/args.txt
+          for f in schema_rules/*.txt; do
+            [[ "$f" == schema_rules/args.txt ]] && continue
+            echo "=== $f ==="; cat "$f"
+          done
 
       - name: 下载 APK
         timeout-minutes: 5
+        env:
+          # apk_url 同样经 env 中转：URL 直接插值进 bash 双引号可被 "$(...)" 逃逸
+          # （安全审查 2026-09-18：protect_config 已中转，apk_url 补齐同一防线）
+          APK_URL: ${{ inputs.apk_url }}
         run: |
           set -o pipefail
-          curl -fL --retry 3 -o app.apk "${{ inputs.apk_url }}" 2>&1 | tee -a build.log
+          curl -fL --retry 3 -o app.apk "$APK_URL" 2>&1 | tee -a build.log
           ls -la app.apk | tee -a build.log
-
-      - name: 生成 Dex2C 规则文件
-        if: ${{ inputs.dex2c && inputs.dex2c_rules != '' }}
-        env:
-          # 经 env 中转,避免用户输入直接插值进 shell(命令注入面)
-          RULES: ${{ inputs.dex2c_rules }}
-        run: |
-          printf '%s\n' "$RULES" > dex2c_rules.txt
-          cat dex2c_rules.txt | tee -a build.log
-
-      - name: 生成字符串加密规则文件
-        if: ${{ inputs.stringenc && inputs.string_rules != '' }}
-        env:
-          # 同样经 env 中转(命令注入面)
-          RULES: ${{ inputs.string_rules }}
-        run: |
-          printf '%s\n' "$RULES" > string_rules.txt
-          echo "=== 字符串加密规则 ===" | tee -a build.log
-          cat string_rules.txt | tee -a build.log
-
-      - name: 生成轻量混淆规则文件
-        if: ${{ inputs.lightobf != '不启用' && inputs.lightobf_rules != '' }}
-        env:
-          # 同样经 env 中转(命令注入面)
-          RULES: ${{ inputs.lightobf_rules }}
-        run: |
-          printf '%s\n' "$RULES" > lightobf_rules.txt
-          echo "=== 轻量混淆规则 ===" | tee -a build.log
-          cat lightobf_rules.txt | tee -a build.log
 
       - name: 执行模块编排（固定顺序-签名校验-Dex2C-轻量混淆-字符串加密-加壳）
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           chmod +x scripts/pipelines/protect.sh
-          ARGS=""
-          if [[ "${{ inputs.sigcheck }}" == "true" ]]; then ARGS="$ARGS --sigcheck"; fi
-          if [[ "${{ inputs.dex2c }}" == "true" ]]; then
-            if [[ -n "${{ inputs.dex2c_rules }}" ]]; then
-              ARGS="$ARGS --dex2c dex2c_rules.txt"
-            else
-              ARGS="$ARGS --dex2c"   # 联合 sigcheck,protect.sh 内自动抽主类
-            fi
-          fi
-          if [[ "${{ inputs.stringenc }}" == "true" ]]; then ARGS="$ARGS --stringenc string_rules.txt"; fi
-          # choice 值即变换模式;当前阶段 1 只有变换 D,将来 B/A/C 在 options 里追加选项
-          if [[ "${{ inputs.lightobf }}" != "不启用" ]]; then ARGS="$ARGS --light-obf lightobf_rules.txt"; fi
-          if [[ "${{ inputs.envcheck }}" == "true" ]]; then ARGS="$ARGS --envcheck"; fi
-          if [[ "${{ inputs.packer }}" == "true" ]]; then ARGS="$ARGS --packer"; fi
-          if [[ "${{ inputs.antidiff }}" == "true" ]]; then ARGS="$ARGS --anti-diff"; fi
+          # §10.2：读取时必须过滤空行（禁止直接 mapfile < args.txt）；
+          # 一行一个参数 + "${ARGS[@]}" 引用展开，禁止空格分隔单行 + 无引号 $ARGS
+          mapfile -t ARGS < <(grep -v '^$' schema_rules/args.txt)
           set -o pipefail
-          ./scripts/pipelines/protect.sh app.apk protected_unsigned.apk $ARGS 2>&1 | tee -a build.log
+          ./scripts/pipelines/protect.sh app.apk protected_unsigned.apk "${ARGS[@]}" 2>&1 | tee -a build.log
 
       - name: 上传加固包到 R2
         id: upload-r2
