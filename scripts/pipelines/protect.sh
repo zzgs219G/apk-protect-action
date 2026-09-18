@@ -94,10 +94,17 @@ while [[ $# -gt 0 ]]; do
                 if [[ $# -ge 1 && "$1" != --* ]]; then
                   LIGHTOBF_RULES="$(normalize_path "$1")"; shift
                 fi ;;
-    --flags)    # 轻量混淆变换组合(d/b/a);位置不限,仅当 light-obf 已勾选时生效
+    --flags)    # 轻量混淆变换组合(d/b/a);位置不限(resolve-config 输出为
+                # --light-obf/--flags/规则路径三连,须在此兜住规则路径,报错三十六)
                 shift
                 if [[ $WANT_LIGHTOBF -eq 1 && $# -ge 1 && "$1" != --* ]]; then
                   LIGHTOBF_FLAGS="$1"; shift
+                  # --light-obf 与 --flags 之间被本参数隔开时,规则路径紧随其后,
+                  # 在此代为收纳(与 --light-obf 分支自身吃路径的行为互补,两处
+                  # 逻辑互斥:路径只可能被其中一处先碰到)
+                  if [[ $# -ge 1 && "$1" != --* && -z "$LIGHTOBF_RULES" ]]; then
+                    LIGHTOBF_RULES="$(normalize_path "$1")"; shift
+                  fi
                 else
                   log_err "--flags 需提供 d/b/a 组合值,且必须先勾选 --light-obf"
                   exit 1
