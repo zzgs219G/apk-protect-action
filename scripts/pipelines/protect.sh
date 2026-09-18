@@ -72,7 +72,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 WANT_STRINGENC=0; STRING_RULES=""
-WANT_LIGHTOBF=0; LIGHTOBF_RULES=""
+WANT_LIGHTOBF=0; LIGHTOBF_RULES=""; LIGHTOBF_FLAGS="d"
 WANT_ANTIDIFF=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -93,6 +93,14 @@ while [[ $# -gt 0 ]]; do
                 # 规则文件必填(标识符混淆必须明确范围,同 stringenc 不做自动兜底)
                 if [[ $# -ge 1 && "$1" != --* ]]; then
                   LIGHTOBF_RULES="$(normalize_path "$1")"; shift
+                fi ;;
+    --flags)    # 轻量混淆变换组合(d/b/a);位置不限,仅当 light-obf 已勾选时生效
+                shift
+                if [[ $WANT_LIGHTOBF -eq 1 && $# -ge 1 && "$1" != --* ]]; then
+                  LIGHTOBF_FLAGS="$1"; shift
+                else
+                  log_err "--flags 需提供 d/b/a 组合值,且必须先勾选 --light-obf"
+                  exit 1
                 fi ;;
     --anti-diff) WANT_ANTIDIFF=1; shift ;;
     *)          log_err "未知参数: $1"; usage ;;
@@ -277,6 +285,7 @@ fi
 # 规则写 ** 也不突破;幂等标记 nc-lightobf-applied,重跑跳过。
 if [[ $WANT_LIGHTOBF -eq 1 ]]; then
   python3 "$ROOT/scripts/light-obf/light-obf.py" "$WORK/decompiled" "$LIGHTOBF_RULES" \
+    --flags "$LIGHTOBF_FLAGS" \
     --map "$WORK/light-obf-map.json"
   log_info "light-obf map(改名映射,--clean 反查依据)已留存: light-obf-map.json"
 fi

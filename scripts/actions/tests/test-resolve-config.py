@@ -100,8 +100,19 @@ check("T4 stringenc 留空规则 → fail-fast", rc != 0 and "规则为空" in e
 
 # T5
 rc, args, files, err = run(cfg(lightobf={"enabled": True, "mode": "d", "rules_file": "**/com.a.**"}))
-check("T5 lightobf+规则 → --light-obf + 规则（mode 不产生参数）",
-      rc == 0 and args == ["--light-obf", "schema_rules/lightobf.txt"], f"rc={rc} args={args}")
+check("T5 lightobf+规则+mode=d → --light-obf + 规则 + --flags d",
+      rc == 0 and args == ["--light-obf", "--flags", "d", "schema_rules/lightobf.txt"],
+      f"rc={rc} args={args}")
+
+# T5b lightobf mode=dab(推荐强度) → --flags 归一化输出(db a 按 d,b,a 序)
+rc, args, files, err = run(cfg(lightobf={"enabled": True, "mode": "dab", "rules_file": "**/com.a.**"}))
+check("T5b lightobf mode=dab → --flags dba(归一化序)",
+      rc == 0 and args == ["--light-obf", "--flags", "dba", "schema_rules/lightobf.txt"],
+      f"rc={rc} args={args}")
+
+# T5c lightobf mode 非法值 → fail-fast(保险丝 c 的 flags 收紧)
+rc, args, files, err = run(cfg(lightobf={"enabled": True, "mode": "x", "rules_file": "**/com.a.**"}))
+check("T5c lightobf mode=x → fail-fast", rc != 0 and "只允许 d/b/a" in err, f"rc={rc} err={err}")
 
 # T6
 rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True,

@@ -55,18 +55,21 @@
     {
       "key": "lightobf",
       "label": "轻量混淆",
-      "desc": "dex层private标识符改名，零膨胀",
+      "desc": "dex层private标识符改名+数字混淆+指令替换，预算制膨胀",
       "type": "parent",
       "default": false,
       "arg": "--light-obf",
       "children": [
         {
           "key": "mode",
-          "label": "模式",
+          "label": "混淆强度",
           "type": "select",
-          "default": "d",
+          "default": "dab",
+          "value_kind": "flags",
           "options": [
-            { "value": "d", "label": "标识符改名(变换D)" }
+            { "value": "d", "label": "标识符改名(变换D)" },
+            { "value": "da", "label": "标识符+指令替换(D+A)" },
+            { "value": "dab", "label": "标识符+数字混淆+指令替换(D+A+B,推荐)" }
           ]
         },
         {
