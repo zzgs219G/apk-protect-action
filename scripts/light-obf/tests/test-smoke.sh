@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-smoke.sh — light-obf 阶段 1(变换 D)冒烟测试(合成 smali,无需 apktool)
+# test-smoke.sh — light-obf 阶段 1+2(变换 D/B/A)冒烟测试(合成 smali,无需 apktool)
 # 开发文档-light-obf.md §8 断言点(v3 语义):
 #   ① 变换生效计数(private 方法/字段确实改名) ② 幂等(重跑零 diff)
 #   ③ 确定性(同 seed 双跑输出一致;不同 seed 输出不同)
@@ -280,12 +280,147 @@ if python3 "$LIGHT_OBF" "$WORK/dec" --clean 2> "$WORK/err7b.log"; then
 fi
 grep -q '必须提供' "$WORK/err7b.log" || die "⑦b 报错文案缺失: $(cat "$WORK/err7b.log")"
 
+# ⑩ 变换 B(数字混淆)/A(指令替换) — 新增独立工作区重放(fresh unpack 语义)
+WORK2="$WORK/dec_ba"
+cp -r "$WORK/dec.orig" "$WORK2"
+echo "com.demo.**" > "$WORK/rules2.txt"
+
+# B/A 目标方法:>16 units、无循环、无 try、小参数槽、含 const/16 大常量与
+# mul-int/lit8 #2^k;wide 大参数槽方法(JJ...→slots=6,4+6-1=9≤15 可过红线 7
+# 但 old_locals+slots>15 拒 B)/反向 goto 循环方法用作拒判对照
+cat > "$WORK2/smali/com/demo/Calc.smali" <<'EOF'
+.class public Lcom/demo/Calc;
+.super Ljava/lang/Object;
+
+.method public calc(I)I
+    .locals 8
+    const/16 v0, 0x2BC
+    const/16 v1, 0x3E8
+    add-int/lit8 v2, p1, 0x5
+    mul-int/lit8 v3, v2, 0x8
+    add-int v4, v0, v3
+    add-int/lit8 v5, p1, 0x2
+    add-int/lit8 v6, v5, -0x3
+    add-int v4, v4, v6
+    add-int/lit8 v2, p1, 0x7
+    mul-int/lit8 v3, v2, 0x10
+    add-int v4, v4, v3
+    add-int/lit8 v5, p1, 0x1
+    add-int/lit8 v6, v5, -0x2
+    add-int v4, v4, v6
+    add-int/lit8 v2, p1, 0x9
+    mul-int/lit8 v3, v2, 0x20
+    add-int v4, v4, v3
+    add-int v4, v4, v1
+    add-int/lit8 v5, p1, 0x4
+    add-int/lit8 v6, v5, -0x6
+    add-int v4, v4, v6
+    add-int/lit8 v5, p1, 0x6
+    mul-int/lit8 v3, v5, 0x80
+    add-int v4, v4, v3
+    add-int/lit8 v5, p1, 0xa
+    add-int/lit8 v6, v5, -0x9
+    add-int v4, v4, v6
+    add-int/lit8 v5, p1, 0xb
+    add-int/lit8 v6, v5, -0x8
+    add-int v4, v4, v6
+    add-int/lit8 v5, p1, 0xc
+    add-int/lit8 v6, v5, -0x7
+    add-int v4, v4, v6
+    return v4
+.end method
+
+.method public loopless(I)I
+    .locals 9
+    const/16 v0, 0x2BC
+    add-int/lit8 v1, p1, 0x3
+    mul-int/lit8 v2, v1, 0x40
+    add-int v3, v0, v2
+    add-int/lit8 v4, p1, 0x8
+    add-int/lit8 v5, v4, -0x1
+    add-int v6, v3, v5
+    add-int v6, v6, v0
+    return v6
+.end method
+
+.method public wideSkip(JJ)I
+    .locals 6
+    const/16 v0, 0x2BC
+    const/16 v1, 0x3E8
+    add-int v2, v0, v1
+    long-to-int v3, p1
+    add-int v4, v2, v3
+    return v4
+.end method
+
+.method public loopSkip(I)I
+    .locals 3
+    const/16 v0, 0x2BC
+    move v1, p1
+    goto :chk
+    :body
+    add-int/lit8 v1, v1, 0x1
+    :chk
+    if-lt v1, v0, :body
+    return v1
+.end method
+EOF
+
+cp "$WORK2/smali/com/demo/Calc.smali" "$WORK/Calc.orig.smali"   # 未变换基线(⑩g 重放用)
+
+run "$WORK2" "$WORK/rules2.txt" --seed "$SEED" --flags "d,b,a" --map "$WORK/map_ba.json" > "$WORK/run_ba.log"
+grep -q '变换B [1-9]' "$WORK/run_ba.log" || die "⑩ 变换 B 未生效: $(grep 'light-obf 完成' "$WORK/run_ba.log")"
+grep -q '变换A [1-9]' "$WORK/run_ba.log" || die "⑩ 变换 A 未生效: $(grep 'light-obf 完成' "$WORK/run_ba.log")"
+
+# ⑩a B 拆解形态:calc 的 0x2BC(700) 必须变成 const/16(非700值) + const/4 + add-int 链
+#    且 jadx 折叠面:深链跨语句存在即达标(值域/数学守恒由 _split_int 值域约束保证)
+grep -qE 'const/16 v[0-9]+, 0x2c9' "$WORK2/smali/com/demo/Calc.smali" \
+  || die '⑩a B 拆解链(const/16 rest)未出现在 Calc.smali'
+grep -qE 'add-int v[0-9]+, v[0-9]+, v[0-9]+' "$WORK2/smali/com/demo/Calc.smali" \
+  || die '⑩a B 拆解链(add-int 合并)未出现'
+# ⑩a 原魔法数字在 calc 方法内必须消失(0x2BC 拆解;门槛拒判方法保留,见 ⑩d)
+calc_seg=$(sed -n '/^.method public calc/,/^.end method/p' "$WORK2/smali/com/demo/Calc.smali")
+if echo "$calc_seg" | grep -qE 'const/16 v[0-9]+, 0x2BC'; then
+  die '⑩a calc 内原常量 0x2BC 未被拆解'
+fi
+# ⑩b A 形态:mul-int/lit8 #2^k → shl-int/lit8 #k
+grep -qE 'shl-int/lit8 v[0-9]+, v[0-9]+, (0x[0-9a-fA-F]+|[0-9]+)' \
+  "$WORK2/smali/com/demo/Calc.smali" || die '⑩b 变换 A(mul→shl)未生效'
+mul_left=$(echo "$calc_seg" | grep -cE 'mul-int/lit8' || true)
+[ "$mul_left" -le 1 ] || die "⑩b calc 内 mul 保留数超配额(_A_MAX_SITES=3): 剩 $mul_left"
+# ⑩c .locals 提升:calc 原为 8,必须变 9(红线 7 临时寄存器 = 原 .locals 号)
+grep -q '.locals 9' "$WORK2/smali/com/demo/Calc.smali" || die '⑩c .locals 未提升(红线 7 路线失效)'
+# ⑩d 门槛拒判:loopSkip(反向 goto)/wideSkip(old_locals+slots>15) 的 0x2BC 必须原样保留
+grep -q 'const/16 v0, 0x2BC' "$WORK2/smali/com/demo/Calc.smali" \
+  || die '⑩d 门槛拒判失效(循环/wide 方法被误变换)'
+# ⑩e B/A 特征标记存在(不可逆提示,clean 不移除)
+grep -q '# nc-lightobf-ba' "$WORK2/smali/com/demo/Calc.smali" \
+  || die '⑩e B/A 特征标记缺失'
+# ⑩f 幂等:带 --flags 重跑零 diff
+cp -r "$WORK2" "$WORK2.snap"
+run "$WORK2" "$WORK/rules2.txt" --seed "$SEED" --flags "d,b,a" --map "$WORK/map_ba2.json" > /dev/null
+diff -r "$WORK2" "$WORK2.snap" > /dev/null || die '⑩f B/A 幂等破坏(重跑产生 diff)'
+# ⑩g 确定性:同 seed 对两个独立 fresh 副本首跑,B/A 产物一致
+rm -rf "$WORK/dec_ba2"
+mkdir -p "$WORK/dec_ba2/smali/com/demo"
+cp "$WORK/dec.orig/smali/com/demo/A.smali" "$WORK/dec_ba2/smali/com/demo/A.smali"
+cp "$WORK/Calc.orig.smali" "$WORK/dec_ba2/smali/com/demo/Calc.smali"
+run "$WORK/dec_ba2" "$WORK/rules2.txt" --seed "$SEED" --flags "d,b,a" --map "$WORK/map_ba3.json" >/dev/null
+diff "$WORK/dec_ba2/smali/com/demo/Calc.smali" "$WORK2.snap/smali/com/demo/Calc.smali" >/dev/null \
+  || die '⑩g 同 seed 重放产物不一致(确定性破坏)'
+# ⑩h 每方法 B 处数 ≤2、新增指令行 ≤ 预算(24 cap):粗断言 = 拆解链最多 2 条
+b_chains=$(grep -cE 'const/4 v[0-9]+, -?0x?[0-9a-f]*' "$WORK2/smali/com/demo/Calc.smali" || true)
+[ "$b_chains" -le 4 ] || die "⑩h B 处数超配额: $b_chains/2 方法"
+
 # ⑨ fail-fast: unicode / 未实现变换 / B/A 孤儿标记
 if run "$WORK/dec" "$WORK/rules.txt" --charset unicode 2> "$WORK/err9a.log"; then
   die '⑨ unicode 未被拒'
 fi
-if run "$WORK/dec" "$WORK/rules.txt" --flags a 2> "$WORK/err9b.log"; then
+if run "$WORK/dec" "$WORK/rules.txt" --flags c 2> "$WORK/err9b.log"; then
   die '⑨ 未实现变换未被拒'
+fi
+if run "$WORK/dec" "$WORK/rules.txt" --flags dabx 2> "$WORK/err9b.log"; then
+  die '⑨ 未知变换字母未被拒'
 fi
 printf '# nc-lightobf-ba\n.class public Lcom/demo/Orphan;\n' > "$WORK/dec/smali/com/demo/Orphan.smali"
 if run "$WORK/dec" "$WORK/rules.txt" 2> "$WORK/err9c.log"; then
@@ -294,4 +429,4 @@ fi
 grep -q 'fresh unpack' "$WORK/err9c.log" || die "⑨ fail-fast 文案缺失: $(cat "$WORK/err9c.log")"
 
 echo ""
-echo "✅ light-obf 阶段 1 冒烟测试全部通过(①~⑨)"
+echo "✅ light-obf 阶段 1+2 冒烟测试全部通过(①~⑩: D/B/A)"

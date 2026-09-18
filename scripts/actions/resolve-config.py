@@ -154,10 +154,23 @@ for m in modules:
 
         value = cfg_node.get(ckey, "")
         # 保险丝 c：未知 value_kind → 报错退出
-        if value_kind != "rules_file":
+        if value_kind != "rules_file" and value_kind != "flags":
             die(f"模块 {key}.{ckey} 的 value_kind 未知: {value_kind!r}（两端需同步支持）")
         if not isinstance(value, str):
             die(f"模块 {key}.{ckey} 的值必须是字符串，实际 {value!r}")
+
+        if value_kind == "flags":
+            # 轻量混淆变换组合（开发文档 §4）：值即 --flags 参数（d/b/a 组合）。
+            # 合法值由 schema options 约束（check-schema 校验 default ∈ options），
+            # 这里再收紧一道：只允许 d/b/a 的子集组合
+            flag_set = set(value.replace(",", ""))
+            if not flag_set:
+                continue          # 空值 = 用流水线缺省(d),不产生参数
+            if not flag_set <= {"d", "b", "a"}:
+                die(f"模块 {key}.{ckey} 的值非法: {value!r}（只允许 d/b/a 的组合）")
+            argv_out.append("--flags")
+            argv_out.append("".join(sorted(flag_set, key="dba".index)))
+            continue
 
         # 保险丝 d：required 校验（与 App 同一套 schema 规则，D4）
         rule = c.get("required")

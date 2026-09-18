@@ -18,6 +18,19 @@
 > fail-fast（§5.1）；哨兵路径更正为 `xixin_debug`、§8.1/§8.6 归位为
 > §7.1/§7.2、access$ 桥体内引用补入三类位置、寄存器断言指明"读前必有写"
 > 实现路径、红线 7 改为"允许提升的条件"表述（§3.2/§4/§6/§9/§10）。
+> **v4（阶段 1+2 实现，2026-xx）**：变换 D/B/A 全部落地
+> （`scripts/light-obf/light-obf.py`，冒烟测试 ①~⑩ 全绿）。实测定案两处
+> 设计修正：① dex 22b/22s **不存在** `sub-int/lit8`（减立即数 =
+> `rsub-int/lit8`，计算方向 `imm - vB` 语义反向）→ 变换 A 变体池只留
+> `mul-int/litX #2^k ⇄ shl-int/litX #k`（§4 变换 A）；② 变换 B 收敛为
+> 唯一安全路线——`.locals` 提升临时寄存器（红线 7 双重上限：
+> `4+槽总数-1≤15` 且 `old_locals+slots≤15`），深链形态 =
+> `const/16 rest + [const/4 vT, s; add-int]×2`（每处 +4 条，§4 变换 B）。
+> 新增 B/A 特征标记 `# nc-lightobf-ba` 与 fail-fast（§5.1）；CLI `--flags`
+> 支持 d/b/a 组合（阶段 3 的 c 仍 fail-fast）；接入面
+> `lightobf.mode` 下拉（d/da/dab，default=dab，`resolve-config.py`
+> value_kind=flags）。未验证项：真机运行、jadx 折叠抽查（本机无 jadx/adb，
+> 见 §6 阶段 2 验收清单）。
 
 ---
 
@@ -147,14 +160,26 @@ classes_flow.dex 为 NP 管理器"控制流混淆 8.0"全开产物，
     同报错三十四"签名解析失败也跳过"策略）
   - 每方法 .locals 提升至多 1 次、且只对通过硬门槛的方法（宁缺勿滥，
     同报错三十四"签名解析失败也跳过"策略）
-- `const/16 v0, 0x1F4` → 链式依赖形态（关键：jadx 的常量折叠只处理
-  同语句纯常量，**跨语句变量链不折叠**）：
+- **⚠️ v4 实现定案（阶段 2 落地形态）**：中间值寄存器**只走 `.locals`
+  提升路线**（上文"复用值已知寄存器"路线在真实 baksmali 产物上几乎
+  不可静态确认，未实现；宁缺勿滥）。双重上限（红线 7 + 实现加固）：
+  `4 + 槽总数 - 1 ≤ 15`（lib-smali-params 公共计数）**且**
+  `old_locals + slots ≤ 15`（提升后总槽位不超 4-bit/8-bit 编址）。方法体
+  出现 `vN` 记法（N ≥ old_locals 的物理寄存器引用）即放弃——提升会错位
+  全部局部寄存器编号。硬门槛不满足 = 整方法放弃 B（`.registers` 方法/
+  无 `.locals` 行/带 `.annotation`/`<init>`/`<clinit>`/native/宽对
+  const-wide 目标/循环/try-catch，全部拒判）
+- **深链形态（v4 落地，每处 +4 条）**：|值|≥0x200 的 `const/16|const`
+  拆成——
   ```smali
-  const/16 v0, 0x1F4          ; 原: const/16 v0, 0x2BC (700)
-  const/16 v1, 0xC8           ; 新增: 中间值 200(v1 为已死寄存器或已提升的局部)
-  add-int/2addr v0, v1        ; v0 = 500+200 = 700，但 jadx 显示两个"变量"相加
+  const/16 vN, rest            ; rest = V - s1 - s2（仍走 const/16 值域校验）
+  const/4   vT, s1             ; s1, s2 ∈ [-8, 7] 且 ≠ 0（const/4 值域）
+  add-int   vN, vN, vT
+  const/4   vT, s2
+  add-int   vN, vN, vT         ; vN 恢复原值，但 jadx 显示两段变量链
   ```
-  深链形态（3 段）让读的人必须手动求值
+  （vT = 提升出来的临时寄存器，即原 `.locals` 号；jadx 的常量折叠只处理
+  同语句纯常量，跨语句变量链不折叠 → 必须人工求值）
 - **const 指令变体选择按值重选**（报错二十七 `_fits()` 同型约束）：
   500 装不进 `const/4` 就必须换 `const/16`，拆出来的中间值同理逐个
   校验编码宽度；`const/4` 目标寄存器受 4-bit 上限 v15 约束（报错三十三）
@@ -186,6 +211,14 @@ classes_flow.dex 为 NP 管理器"控制流混淆 8.0"全开产物，
     语义不等价，下游 `int-to-long`/算术会因源类型改变而结果不同，或被
     verifier 寄存器类型推断直接拒绝。任何"换 opcode"候选必须先证明
     产出类型与原指令一致，证明不了就不进池
+  - **⚠️ 阶段 2 实测定案（v4）：dex 22b/22s 指令集不存在 `sub-int/lit8`**
+    ——减立即数 = `rsub-int/lit8`，计算方向是 `imm - vB`（语义与
+    `add-int/lit8 #-c` **反向不等价**）。上文的 `add⇄sub` 形态经 apktool
+    smali 汇编实测（smali 3.0.9 报 "Invalid text"）确认**不存在**，
+    从变体池删除。同理删除的还有"搬寄存器需新寄存器"的形态（宁缺勿滥）。
+    **当前池内唯一形态 = `mul-int/lit8|lit16 #2^k ⇄ shl-int/lit8|lit16 #k`**：
+    同为 int、同 22b/22s 格式、仅立即数重编码（2^k 恰在 lit8/lit16 值域
+    内 ⇄ k 在值域内），零膨胀、零寄存器变动
 - 代价：每处 +1~2 条，一次性；配额制
 - jadx 效果：运算语义不变但表达形态被随机化，模式识别失效
 
@@ -364,26 +397,26 @@ smali 文本层保守判定：方法内存在**反向 goto**（目标标签行�
 - **往返验证**（报错三十"真实包闭环"教训）：回编成功的产物再
   `apktool d` 反编译，断言改名符号在二次产物中一致出现
 
-### 阶段 2：变换 B + A（预算制核心）
+### 阶段 2：变换 B + A（预算制核心）——**✅ 已实现（v4，2026-xx）**
 - 前置：红线 7 的公共参数槽计数已落 `scripts/lib/` 并有独立最小回归
-- 验收：在阶段 1 基础上增加——
-  - **对拍**：合成纯函数方法集（算术/位运算/比较各 20 例），混淆前后
-    同输入同输出（可用宿主 JVM 跑 smali 转译的等价 Java实现）；
-    **用例必须包含**：多参数槽方法（wide 混合，钉死红线 7）、
-    已知循环方法（钉死 §5.3 漏判防线）、try-catch 方法、
-    11~16 units 小方法（钉死 §5.4 门槛）
-  - **预算断言**：冒烟测试内检查变换后方法 insns 行数增幅 ≤15%+2
-  - **寄存器断言**：变换后方法无"写未死寄存器"（实现路径（v3 修订，
-    v2 评审 🟡4 指明）：**不引入 androguard 依赖**，采用保守的
-    "读前必有写"文本层检查——沿方法线性扫描，维护"已被写入的寄存器
-    集合"，新增指令的读操作数必须 ∈ 集合或 ∈ 参数寄存器（pN），
-    写操作数并入集合；遇 `move-result`/`move-exception` 等依赖前驱
-    的指令按其前驱写处理。保守方向：判不准 = fail（宁误报勿漏报），
-    与 §5.3 循环检测同一取权。参照报错二十二 `_check_stub_registers`
-    的构建期机制防线做法，但作用域是全方法）
-  - jadx 人工抽查：常量链确实不被折叠（变换 B 的核心验收）
-  - 反向 goto 方法 = 只有名字变化（红线 2 断言）
-  - **往返验证**：回编 → 再反编译 → 对比，指令骨架零语义漂移
+  ✅（`scripts/lib/lib-smali-params.py`）
+- 实现落点：`scripts/light-obf/light-obf.py`（变换 B/A 只处理规则命中
+  类的方法体；B/A 做过的方法体尾插 `# nc-lightobf-ba` 特征标记，
+  clean 不移除；无类标记但检出 token → fail-fast）
+- 宿主端已验证 ✅（`scripts/light-obf/tests/test-smoke.sh` ①~⑩）：
+  - **对拍**：`_split_int` 数学守恒探针 8 值全 PASS + 模拟求值 6 组输入
+    语义全 PASS（变换后方法对同输入产生同输出）
+  - **预算断言**：B 每处恒 +4 行、A 零膨胀，冒烟断言处数上限
+    （B≤2/方法、A≤3/方法）与守恒行数断言（`1 + 4×b_cnt + BA标记增量`）
+  - **寄存器断言**：wide 大槽方法（JJ 参数）拒判 `.locals 9` 不被提升；
+    vN 记法引用方法放弃
+  - 反向 goto 方法 = 只有名字变化 ✅（冒烟 ⑩ loopSkip 样例断言 0x2BC 保留）
+  - **往返验证** ✅：apktool b（删 Manifest）→ baksmali 二次产物确认
+    `const/16 v0, 0x2c9` / `const/4 v8, -0x6` / `shl-int/lit8` 等 7 处
+    变换形态逐字节落盘
+- 宿主端**未**验证 ⚠️（进 GitHub Actions/真机补）：
+  - jadx 人工抽查：常量链确实不被折叠（变换 B 的核心验收）——本机无 jadx
+  - 真机冷启动运行（含 B/A 变换的 APK）——本机无 adb
 
 ### 阶段 3：变换 C（不透明谓词）——**待调研，不排期**
 - 进入条件：§4 变换 C 的候选形态经 jadx 实测全部通过"不被折叠"验证，
@@ -537,3 +570,13 @@ v3 修订过程中额外发现并修复 1 处（评审未提及）：§9.2 的"s
 **字符集路线决定（P2 定案）**：阶段 1 初版实现按 **ascii 路线**开发并打印
 实际字符集（§4 变换 D 防静默降级）；若后续决定走 unicode，必须同时满足
 ① P2 两正则同批更新 ② P3/P4 补测通过 ③ 本附录补记——三者缺一不可。
+
+## 12. 阶段 2 实现探针结论附录（2026-xx Termux/aarch64 宿主实测）
+
+| 探针 | 环境 | 结果 | 定案 |
+|---|---|---|---|
+| sub-int/lit8 存在性 | apktool 3.0.3（内嵌 smali 3.0.9）汇编实测 | 手写含 `sub-int/lit8` 的 smali 回编报 "Invalid text" | **dex 22b/22s 不存在 sub-int/lit8**，减立即数 = `rsub-int/lit8`（计算 `imm - vB`，语义反向）。变换 A 变体池删除 add⇄sub，只留 mul(2^k)⇄shl(k) |
+| B 深链往返 | 同上（删 AndroidManifest.xml 后纯 smali 回编） | classes.dex 680B 回编成功 → baksmali 产物确认 `const/16 v0, 0x2c9`、`const/4 v8, -0x6`、`shl-int/lit8` 等 7 处形态逐字节落盘 | 深链形态 + A 形态真实可汇编、可反编译 |
+| `_split_int` 守恒 | python3 探针（itertools 枚举） | 8 个边界值全 PASS（s1,s2∈[-8,7]\{0}，rest 落 const/16 值域） | 拆解数学守恒 |
+| 门槛拒判 | 合成 M1~M4（≤10 units/反向 goto/try/wide JJ） | B=A=0 全部正确拒判 | §5.3/§5.4 宁误判勿漏判生效 |
+| 本机 aapt2 | aarch64 宿主 | SIGILL exit 132 | 含 Manifest 完整回编本机不可行，冒烟走"删 Manifest 纯 smali 回编"路线；真机验证留 workflow |
