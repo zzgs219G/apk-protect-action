@@ -426,7 +426,13 @@ def run_apply(args, root):
         if own_desc is not None:
             new_text = '\n'.join(_insert_mark(new_text.split('\n')))
         if new_text != text:
-            assert len(new_text) >= n_before, rel   # 改名只增不减(防误删)
+            # 改名只做 token 级替换,绝不增删行(行数守恒才是真不变量;
+            # 原 len 断言在 old 名长于 8 字符新名时必炸 —— 真实包实测复现:
+            # GitHubDispatcher.smali getGithubClient(15字符) → a~xxxxxx(8字符)。
+            # "防误删"由 _verify_conservation 的引用计数守恒兜底;
+            # own 文件额外允许 +1 行 = _insert_mark 的幂等标记行)
+            delta = new_text.count('\n') - text.count('\n')
+            assert delta == (1 if own_desc is not None else 0), rel
             with open(path, 'w', encoding='utf-8') as fp:
                 fp.write(new_text)
             n_written += 1
