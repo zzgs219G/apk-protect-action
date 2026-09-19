@@ -35,6 +35,10 @@
     跳过:含 try-catch 的方法(保守,不碰边界)、fall-through 恰为跳转
     目标的分支(反折绕路无意义,还可能让 diff 工具一眼看穿模式)。
     跳过 <init>/<clinit>(执行顺序敏感,sigcheck/dcc 依赖)。
+  F 恒等算术重编码(零损耗):add-int/lit8 vA, vB, +x ⇄ rsub-int/lit8
+    vA, vB, -x 的确定性随机互转。两者同为 22b 格式(4 字节,等长零膨胀),
+    语义恒等(vA = vB − (−x) = vB + x);R8 优化器从不产出 rsub 重编码
+    形态,不可被上游消除也无法预测。跳过 <init>/<clinit>(同 A)。
   C 方法入口 + return 前垃圾指令(谨慎版·强化):仅当方法同时满足全部
     硬条件才插:
       - 不是 <init>/<clinit>
@@ -432,7 +436,8 @@ def _method_locals_count(method_lines):
 
 
 # 参数槽计数单一真相(报错七/红线 7):count_param_slots/max_param_index
-# 抽到 scripts/lib/lib-smali-params.py,anti-diff 与 light-obf 共用同一实现,
+# 抽到 scripts/lib/lib-smali-params.py,anti-diff 独占该实现
+# (历史上 light-obf 也曾共用;该模块 2026-09 已下线删除),
 # 严禁在本文件再写副本或 fork 逻辑(报错七:单一真相)。
 _PARAMS_LIB = _load_module('lib_smali_params', 'scripts/lib/lib-smali-params.py')
 count_param_slots = _PARAMS_LIB.count_param_slots
@@ -697,6 +702,50 @@ def _junk_ins(rng, count, pool=None):
         pool = _junk_pool()
     count = min(count, len(pool))
     return [rng.choice(pool) for _ in range(count)]
+
+
+# ── 变换 F:恒等算术重编码(零损耗)─────────────────────────────────
+
+# 仅匹配 add-int/lit8 的 22b 三操作数形态:目标 vA、源 vB、立即数 #+CC。
+# 立即数 0x0 不转:mul-int/lit8 vA, vB, 0x1 才是加 0 的恒等对应,但 R8 产物
+# 几乎不含 x+0(已被上游消掉),命中率为 0,白白多一个分支。
+# 注意不能写成 \badd-int/lit8\b 一类宽匹配:lit16/2addr 是别的编码格式,
+# 行数/字节不同,互转就不再等长(报错三十五同族教训:形态相邻≠形态等价)。
+_ADD_LIT8_RE = re.compile(
+    r'^(\s*)add-int/lit8\s+(v\d+|p\d+)\s*,\s*(v\d+|p\d+)\s*,\s*(-?0x[0-9a-fA-F]+)\s*$')
+
+
+def _reencode_add_rsub(method_lines, rng):
+    """变换 F:add-int/lit8 vA, vB, +x ⇄ rsub-int/lit8 vA, vB, -x。
+
+    22b 格式互转,4 字节等长;vA = vB + x ≡ vA = vB − (−x),语义恒等。
+    立即数为 0x0 跳过(无意义形态);寄存器/标签/字符串一概不动,
+    无需 _replace_outside_strings 保护(立即数在行尾,不在引号内)。
+    返回(新行列表, 改写条数)。"""
+    out = []
+    n = 0
+    for ln in method_lines:
+        m = _ADD_LIT8_RE.match(ln)
+        if m and m.group(4) != '0x0':
+            indent, dst, src, imm = m.groups()
+            val = int(imm, 16)
+            if rng.random() < 0.5:
+                # add → rsub:立即数取负后必须落回 8 位有符号字面量。
+                # 22b 的 imm 是 8 位补码(−128..127);smali 汇编器按字面量
+                # 数值做范围检查,vB − 0xfffffff8 这种 32 位写法虽语义等价,
+                # 但超 8 位字面量直接汇编报错 → 必须归一成 −0x8 形态。
+                # 取负在 8 位域内进行:−x mod 256 再按有符号解释(报错二十二
+                # 式教训:字面量合法性以 smali 汇编器实测为准,别想当然)。
+                neg = (-val) & 0xff
+                if neg >= 0x80:
+                    neg -= 0x100
+                out.append(f'{indent}rsub-int/lit8 {dst}, {src}, {neg:#x}')
+            else:
+                out.append(ln)
+            n += 1
+        else:
+            out.append(ln)
+    return out, n
 
 
 # ── 变换 D:局部寄存器重编号(阶段 2 增强)──────────────────────────
@@ -1105,8 +1154,9 @@ def _method_is_native(block_lines):
                for ln in block_lines[:1])
 
 
-def _process_method_block(block_lines, rng, max_per_method, max_cond_flip):
-    """对一个 .method 块做 A(+C+E)。返回(新块, 改动计数)。"""
+def _process_method_block(block_lines, rng, max_per_method, max_cond_flip,
+                          enable_f=False):
+    """对一个 .method 块做 A(+C+E+F)。返回(新块, 改动计数)。"""
     changes = 0
     lines = block_lines
     # 变换 A:标签重命名(<init>/<clinit> 跳过)
@@ -1138,6 +1188,15 @@ def _process_method_block(block_lines, rng, max_per_method, max_cond_flip):
             if nd:
                 lines = [lines[0]] + new_body + [lines[-1]]
                 changes += 1
+            # 变换 F:恒等算术重编码(add ⇄ rsub,22b 等长等语义,零膨胀;
+            # 放在 D 之后——D 改寄存器号,F 只看操作数形态互不干扰。
+            # 受流水线子复选框 antidiff.reencode 控制,--enable-f 才开)
+            if enable_f:
+                body = lines[1:-1]
+                new_body, nf = _reencode_add_rsub(body, rng)
+                if nf:
+                    lines = [lines[0]] + new_body + [lines[-1]]
+                    changes += nf
             # 变换 E:条件反折(在标签改名之后做:新标签不在 mapping 里,
             # 原目标标签引用已同步改写;fall-through 判定基于新标签名,一致)
             body = lines[1:-1]
@@ -1145,24 +1204,30 @@ def _process_method_block(block_lines, rng, max_per_method, max_cond_flip):
             if ne:
                 lines = [lines[0]] + new_body + [lines[-1]]
                 changes += ne
-            # 变换 C 强化:return 前插垃圾指令
+            # 变换 C 强化:return 前插垃圾指令(固定 1 条,用户拍板 2026-09:
+            # "返回前插一条就可以了"——原 1~max_per_method 随机上限砍到 1,
+            # 体积收益优先;返回寄存器 ban 名单/纯写池安全模型不变)
             body = lines[1:-1]
-            new_body, nr = _insert_before_returns(body, rng, max_per_method)
+            new_body, nr = _insert_before_returns(body, rng, 1)
             if nr:
                 lines = [lines[0]] + new_body + [lines[-1]]
                 changes += nr
-            # 变换 C:入口垃圾指令
-            body = lines[1:-1]
-            new_body, n2 = _inject_junk_at_entry(body, rng, max_per_method)
-            if n2:
-                lines = [lines[0]] + new_body + [lines[-1]]
-                changes += n2
+            # 变换 C:入口垃圾指令(已下线,用户拍板 2026-09:"方法开头插
+            # 1~3 条没什么必要"——return 前插桩已打破"只插方法开头"的可
+            # 识别模式(README 变换 C+ 的动机),入口桩删去不影响全红效果,
+            # 且省一半以上垃圾指令体积;函数保留供 CLI --max-per-method
+            # 消费端兼容,调用点移除)
+            # body = lines[1:-1]
+            # new_body, n2 = _inject_junk_at_entry(body, rng, max_per_method)
+            # if n2:
+            #     lines = [lines[0]] + new_body + [lines[-1]]
+            #     changes += n2
     return lines, changes
 
 
 # ── 类文件级处理 ───────────────────────────────────────────────────
 
-def process_file(path, rng, max_per_method, max_cond_flip=3):
+def process_file(path, rng, max_per_method, max_cond_flip=3, enable_f=False):
     with open(path, 'r', encoding='utf-8') as f:
         text = f.read()
     if CLASS_MARK in text:
@@ -1175,7 +1240,8 @@ def process_file(path, rng, max_per_method, max_cond_flip=3):
     new_blocks = []
     for kind, blk in blocks:
         if kind == 'method':
-            new_blk, ch = _process_method_block(blk, rng, max_per_method, max_cond_flip)
+            new_blk, ch = _process_method_block(blk, rng, max_per_method,
+                                                max_cond_flip, enable_f)
             # 拆分 A/C 计数由 _process_method_block 内部合并,这里只记总
             new_blocks.append((kind, new_blk))
             total_a += ch  # 合并计数(标签数+垃圾指令数),报告用
@@ -1242,6 +1308,9 @@ def main(argv):
                     help='变换 C 单方法/单 return 最多插入条数(默认 3)')
     ap.add_argument('--max-cond-flip', type=int, default=3,
                     help='变换 E 单方法最多反折条件分支数(默认 3,阶段 2)')
+    ap.add_argument('--enable-f', action='store_true', default=False,
+                    help='启用变换 F(add⇄rsub 恒等重编码,流水线子复选框开关;'
+                         '默认关,直接命令行调用时的行为与历史版本一致)')
     args = ap.parse_args(argv)
 
     root = os.path.abspath(args.decompiled)
@@ -1271,7 +1340,7 @@ def main(argv):
             n_excluded += 1
             continue
         a, c, moved, skipped = process_file(p, rng, args.max_per_method,
-                                            args.max_cond_flip)
+                                            args.max_cond_flip, args.enable_f)
         if skipped:
             n_skipped += 1
             continue

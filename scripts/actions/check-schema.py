@@ -34,5 +34,5 @@ for m in d["modules"]:
                 assert c["default"] in vals, f"{k}.{c['key']}: default 不在 options"
 
 assert len(keys) == len(set(keys)), "模块 key 重复"
-assert keys == ["sigcheck", "dex2c", "stringenc", "lightobf", "antidiff", "envcheck"], keys
+assert keys == ["sigcheck", "dex2c", "stringenc", "antidiff", "envcheck"], keys
 print("schema OK:", keys)

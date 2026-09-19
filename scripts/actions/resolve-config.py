@@ -98,10 +98,15 @@ if unknown_top:
 
 def read_enabled(module_key: str, cfg_node) -> bool:
     """enabled 语义（§3.1，审查 #2）：leaf=顶层 bool；parent=.enabled。
-    §10.1：模块 key 在 config 中缺失 → 视为 disabled（不报错）。"""
+    §10.1：模块 key 在 config 中缺失 → 视为 disabled（不报错）。
+    兼容层（v1.1）：模块从 leaf 升级为 parent（如 antidiff 挂子复选框）后，
+    旧版 App 快照仍会提交顶层 bool —— 按 leaf 语义读取，不 fail-fast
+    （v1.1 只增不破：老 config 无 children 字段，静默走默认值）。"""
     m = modules_by_key[module_key]
     if cfg_node is _MISSING:
         return False
+    if m.get("type") == "parent" and isinstance(cfg_node, bool):
+        return cfg_node  # 旧版 App 的 leaf 形态提交,向后兼容
     if m.get("type") == "leaf":
         if not isinstance(cfg_node, bool):
             die(f"模块 {module_key} 是 leaf，值必须是布尔，实际 {cfg_node!r}")
@@ -135,7 +140,9 @@ for m in modules:
         die(f"schema 模块 {key} 的 arg 非法: {arg!r}（须匹配 --xxx[-yyy]）")
     argv_out.append(arg)
 
-    if m.get("type") != "parent":
+    if m.get("type") != "parent" or isinstance(cfg_node, bool):
+        # isinstance(bool) 兜底：旧版 App 把本 parent 当 leaf 提交顶层 bool
+        # （read_enabled 已按 leaf 语义接受），后续子字段循环自然全部跳过
         continue
 
     # 保险丝 a（模块内）：未知子 key 拒绝
@@ -148,29 +155,33 @@ for m in modules:
         ckey = c.get("key")
         value_kind = c.get("value_kind")
         if value_kind is None:
-            # §3.1/审查 #5：无 value_kind 的子字段（如 lightobf.mode）不进 config、
+            # §3.1/审查 #5：无 value_kind 的子字段不进 config、
             # 不产生任何参数；若网页手填出现了也静默忽略（schema 有定义，不算未知 key）
+            continue
+
+        # 子复选框（v1.1）：value_kind=flag → 勾选时把 arg_on 追加进 argv。
+        # 与 text/rules_file 不同：值是布尔、不写规则文件、不进 required 校验；
+        # 未勾选时不追加任何参数（arg_off 形态暂不需要——变换默认开，
+        # 需要显式关的开关出现时再加 arg_off 分支）。
+        if value_kind == "flag":
+            value = cfg_node.get(ckey, c.get("default", False))
+            if not isinstance(value, bool):
+                die(f"模块 {key}.{ckey} 的值必须是布尔（flag），实际 {value!r}")
+            if value:
+                arg_on = c.get("arg_on", "")
+                # arg 白名单正则含 ^-- 前缀,lstrip 后 fullmatch 校验主体
+                if not ARG_RE.fullmatch(arg_on):
+                    die(f"模块 {key}.{ckey} 的 arg_on 非法: {arg_on!r}（须匹配 --xxx[-yyy]）")
+                if arg_on and arg_on not in argv_out:
+                    argv_out.append(arg_on)
             continue
 
         value = cfg_node.get(ckey, "")
         # 保险丝 c：未知 value_kind → 报错退出
-        if value_kind != "rules_file" and value_kind != "flags":
+        if value_kind != "rules_file":
             die(f"模块 {key}.{ckey} 的 value_kind 未知: {value_kind!r}（两端需同步支持）")
         if not isinstance(value, str):
             die(f"模块 {key}.{ckey} 的值必须是字符串，实际 {value!r}")
-
-        if value_kind == "flags":
-            # 轻量混淆变换组合（开发文档 §4）：值即 --flags 参数（d/b/a 组合）。
-            # 合法值由 schema options 约束（check-schema 校验 default ∈ options），
-            # 这里再收紧一道：只允许 d/b/a 的子集组合
-            flag_set = set(value.replace(",", ""))
-            if not flag_set:
-                continue          # 空值 = 用流水线缺省(d),不产生参数
-            if not flag_set <= {"d", "b", "a"}:
-                die(f"模块 {key}.{ckey} 的值非法: {value!r}（只允许 d/b/a 的组合）")
-            argv_out.append("--flags")
-            argv_out.append("".join(sorted(flag_set, key="dba".index)))
-            continue
 
         # 保险丝 d：required 校验（与 App 同一套 schema 规则，D4）
         rule = c.get("required")

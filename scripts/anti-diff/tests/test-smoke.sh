@@ -68,14 +68,23 @@ cat > "$WORK/dec/smali/com/demo/A.smali" <<'EOF'
     return-void
 .end method
 
+.method public static calc(II)I
+    .locals 2
+    add-int/lit8 v0, p0, 0x2
+    add-int/lit8 v1, p1, 0x1
+    add-int/2addr v0, v1
+    add-int/lit8 v0, v0, 0x0
+    return v0
+.end method
+
 .method public native nat()V
 .end method
 EOF
 
 run() { python3 "$HERE/../anti-diff.py" "$@"; }
 
-echo "== 第 1 次运行 =="
-run "$WORK/dec" > "$WORK/run1.log"
+echo "== 第 1 次运行(带 --enable-f,变换 F 开) =="
+run "$WORK/dec" --enable-f > "$WORK/run1.log"
 cat "$WORK/run1.log"
 cp "$WORK/dec/smali/com/demo/A.smali" "$WORK/A.after1.smali"
 
@@ -119,7 +128,7 @@ grep -qF '"CC(remember):MainActivity.kt#9igjgp"' "$WORK/A.after1.smali" \
 # 报错二十二式:旧代码只认 .registers 且要求 ≥5,真实包 100% 用 .locals,
 # 导致变换 C 一个方法都没命中。.locals 6 + 首指令 const/4 → 必须插入。
 awk '/\.method public static qux/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/qux.txt"
-grep -qE '^\s*(const/4 v[0-3], 0x0|move v[0-3], v[0-3])$' "$WORK/qux.txt" \
+grep -qE '^\s*const/4 v[0-3], 0x[01]\s*$' "$WORK/qux.txt" \
   || { echo '❌ 变换 C 未生效(.locals 方法没有插入垃圾指令)'; cat "$WORK/qux.txt"; exit 1; }
 # 字符串行必须原样保留
 grep -qF '"CC(remember):MainActivity.kt#9igjgp"' "$WORK/qux.txt" \
@@ -305,6 +314,62 @@ case "$first_method" in
   *'<init>'*) ;;
   *) echo "❌ dec3 中 <init> 被挪动: $first_method"; exit 1;;
 esac
+
+# ── 断言 5c:变换 F(恒等算术重编码)生效且语义守恒 ────────────────────
+# calc 含 4 条 add-int/lit8(x2 常规 + x1 2addr 对照 + x1 立即数 0x0):
+#   - 0x0 不转(无恒等对应价值);lit8 两条必须至少转出一条 rsub
+#   - 行数守恒(F 是等长替换,不增删行)
+#   - 2addr 形态绝不被误改(不同编码格式)
+awk '/\.method public static calc/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/calc.txt"
+if ! grep -qE '^\s*rsub-int/lit8 ' "$WORK/calc.txt"; then
+  echo '❌ 变换 F 未生效(calc 无 rsub-int/lit8)'; cat "$WORK/calc.txt"; exit 1
+fi
+# 立即数 0x0 那条必须原样保留(不转 0)
+grep -qE '^\s*add-int/lit8 v[0-9]+, v[0-9]+, 0x0\s*$' "$WORK/calc.txt" \
+  || { echo '❌ 变换 F 误转了 0x0 立即数'; cat "$WORK/calc.txt"; exit 1; }
+# 2addr 形态原样保留
+grep -qE '^\s*add-int/2addr ' "$WORK/calc.txt" \
+  || { echo '❌ 变换 F 误改了 add-int/2addr'; cat "$WORK/calc.txt"; exit 1; }
+# 语义等价黑盒:rsub 的目标/源寄存器与被改写前一致(只换助记符与立即数取负),
+# 即 add vA, vB, +x 与 rsub vA, vB, -x 的寄存器三元组逐行对得上
+python3 - "$WORK/calc.txt" <<'PY'
+import re, sys
+lines = [l.rstrip() for l in open(sys.argv[1], encoding='utf-8') if l.strip()]
+ins = [l for l in lines if not l.lstrip().startswith(('.', ':'))]
+rsub = [re.match(r'\s*rsub-int/lit8\s+(\S+),\s*(\S+),\s*(-?0x[0-9a-fA-F]+)$', l) for l in ins]
+rsub = [m for m in rsub if m]
+assert rsub, '无 rsub 断言对象'
+for m in rsub:
+    neg = int(m.group(3), 16)
+    assert -128 <= neg <= 127, f'立即数越 8 位域: {m.group(3)}'
+print('  变换 F 语义形态 ✅ (rsub 立即数均在 8 位域)')
+PY
+# F 行数守恒:calc 方法体(含 .method/.end method 与空行)行数不变
+if [[ $(grep -c '' "$WORK/calc.txt") -ne 9 ]]; then
+  echo '❌ 变换 F 行数不守恒'; cat "$WORK/calc.txt"; exit 1
+fi
+
+# ── 断言 5d:变换 F 开关(--enable-f 缺省关)——默认路径无 rsub ─────────
+mkdir -p "$WORK/dec6/smali/com/demo"
+cat > "$WORK/dec6/smali/com/demo/F.smali" <<'EOF'
+.class public Lcom/demo/F;
+.super Ljava/lang/Object;
+
+.method public static t(II)I
+    .locals 2
+    add-int/lit8 v0, p0, 0x2
+    add-int/lit8 v1, p1, 0x1
+    add-int v0, v0, v1
+    return v0
+.end method
+EOF
+run "$WORK/dec6" > /dev/null
+if grep -q 'rsub-int/lit8' "$WORK/dec6/smali/com/demo/F.smali"; then
+  echo '❌ 变换 F 未受 --enable-f 控制(默认路径出现了 rsub)'; exit 1
+fi
+# D 会置换寄存器、C+ 会插桩,断言只能盯"立即数 0x2 与助记符 add-int/lit8 同行"
+grep -qE '^\s*add-int/lit8 v[0-9]+, p[0-9]+, 0x2\s*$' "$WORK/dec6/smali/com/demo/F.smali" \
+  || { echo '❌ 断言 5d 前置失败(输入形态被其他变换改动)'; cat "$WORK/dec6/smali/com/demo/F.smali"; exit 1; }
 
 # ── 断言 6:幂等——第 2 次运行产物逐字节一致 ─────────────────────────
 echo "== 第 2 次运行(幂等) =="

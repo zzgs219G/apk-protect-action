@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 """lib-smali-params.py — smali 方法参数槽计数的单一真相(报错七)。
 
-提供两个纯函数,供 anti-diff 与 light-obf 共用(严禁各抄一份——
-报错七:同一逻辑在两处各写一份,迟早被改得分叉):
+提供两个纯函数,供 anti-diff 使用(严禁各抄一份——
+报错七:同一逻辑在两处各写一份,迟早被改得分叉;历史消费者 light-obf
+已于 2026-09 下线删除,本库保留):
 
   count_param_slots(method_sig)   解析 .method 行签名,返回参数寄存器槽总数
   max_param_index(method_lines)   方法体指令中实际引用的最大 pN 序号
 
-本文件只依赖 re/标准库,不得 import 仓库内其他模块;两处消费者
-(scripts/anti-diff/anti-diff.py, 未来的 scripts/light-obf/light-obf.py)
+本文件只依赖 re/标准库,不得 import 仓库内其他模块;消费者
+(scripts/anti-diff/anti-diff.py)
 经 importlib 按路径加载本文件后使用(同 anti-diff 复用 inject-loadlib
 `SMALI_DIR_RE` 的 _load_module 先例)。
 

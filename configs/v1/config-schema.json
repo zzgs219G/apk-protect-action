@@ -53,38 +53,24 @@
       ]
     },
     {
-      "key": "lightobf",
-      "label": "轻量混淆",
-      "desc": "dex层private标识符改名+数字混淆+指令替换，预算制膨胀",
+      "key": "antidiff",
+      "label": "防对比混淆",
+      "desc": "dex层结构噪声",
       "type": "parent",
       "default": false,
-      "arg": "--light-obf",
+      "arg": "--anti-diff",
       "children": [
         {
-          "key": "mode",
-          "label": "混淆强度",
-          "type": "select",
-          "default": "dab",
-          "value_kind": "flags",
-          "options": [
-            { "value": "d", "label": "标识符改名(变换D)" },
-            { "value": "da", "label": "标识符+指令替换(D+A)" },
-            { "value": "dab", "label": "标识符+数字混淆+指令替换(D+A+B,推荐)" }
-          ]
-        },
-        {
-          "key": "rules_file",
-          "label": "类名规则",
-          "type": "text",
-          "multiline": true,
-          "default": "",
-          "value_kind": "rules_file",
-          "required": { "when": "always" },
-          "hint": "支持 **/com.test.** / !排除行 / # 注释"
+          "key": "reencode",
+          "label": "恒等算术重编码(变换F)",
+          "type": "checkbox",
+          "default": true,
+          "value_kind": "flag",
+          "arg_on": "--anti-diff-f",
+          "desc": "add⇄rsub等长重编码,零体积零性能损耗"
         }
       ]
     },
-    { "key": "antidiff", "label": "防对比混淆", "desc": "dex层结构噪声", "type": "leaf", "default": false, "arg": "--anti-diff" },
     { "key": "envcheck", "label": "环境检测", "desc": "Frida/Xposed/调试器", "type": "leaf", "default": false, "arg": "--envcheck" }
   ]
 }
