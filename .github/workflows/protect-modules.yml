@@ -6,9 +6,8 @@ name: APK加固-模块勾选
 #   protect.sh 参数（schema_rules/args.txt，一行一个）→ 执行。
 #   加新模块/子选项只改 configs/v1/config-schema.json 一份文件（App 与本 yml 零改动）。
 # 执行顺序由 protect.sh 固定为
-#   签名校验 → Dex2C → 轻量混淆(light-obf) → 字符串加密 → 防对比混淆(anti-diff) → 基础加壳
-#   （light-obf 必须在 stringenc 前:stringenc 桩字段引用依赖名字稳定;
-#     anti-diff 是 dex 层结构噪声,放 stringenc 后;加壳必须最后，加了壳其它模块改不动）
+#   签名校验 → Dex2C → 字符串加密 → 防对比混淆(anti-diff) → 基础加壳
+#   （anti-diff 是 dex 层结构噪声,放 stringenc 后;加壳必须最后，加了壳其它模块改不动）
 # GitHub 网页兜底：不勾任何模块时可直接在 protect_config 手填 JSON（见 configs/v1/config-schema.json）。
 
 on:
@@ -83,7 +82,7 @@ jobs:
           curl -fL --retry 3 -o app.apk "$APK_URL" 2>&1 | tee -a build.log
           ls -la app.apk | tee -a build.log
 
-      - name: 执行模块编排（固定顺序-签名校验-Dex2C-轻量混淆-字符串加密-加壳）
+      - name: 执行模块编排（固定顺序-签名校验-Dex2C-字符串加密-加壳）
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |

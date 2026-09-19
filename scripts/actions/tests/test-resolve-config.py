@@ -7,7 +7,6 @@
   T2 dex2c 单独勾选 + 规则        → --dex2c + 规则文件路径（workspace 相对）
   T3 dex2c 联合 sigcheck 留空规则 → --dex2c 不带文件参数（§7 重点）
   T4 stringenc 勾选未填规则       → 解析器 fail（App 端同规则应拦截）
-  T5 lightobf 勾选 + 规则         → --light-obf + 规则；mode 不产生参数（§3.1）
   T6 全家桶组合                   → 参数齐全、顺序固定
   T7 未知顶层 key                 → 报错退出（保险丝 a，§10.1 反向）
   T8 config 缺失其余模块 key      → 视为 disabled 不报错（§10.1 正向）
@@ -70,7 +69,7 @@ def check(name, cond, detail=""):
 
 def cfg(**kw):
     base = {"schema_version": 1, "sigcheck": False, "dex2c": {"enabled": False},
-            "stringenc": {"enabled": False}, "lightobf": {"enabled": False},
+            "stringenc": {"enabled": False},
             "antidiff": False, "envcheck": False}
     base.update(kw)
     return base
@@ -98,30 +97,12 @@ check("T3 dex2c+sigcheck 留空规则 → --dex2c 无文件参数",
 rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": ""}))
 check("T4 stringenc 留空规则 → fail-fast", rc != 0 and "规则为空" in err, f"rc={rc} err={err}")
 
-# T5
-rc, args, files, err = run(cfg(lightobf={"enabled": True, "mode": "d", "rules_file": "**/com.a.**"}))
-check("T5 lightobf+规则+mode=d → --light-obf + 规则 + --flags d",
-      rc == 0 and args == ["--light-obf", "--flags", "d", "schema_rules/lightobf.txt"],
-      f"rc={rc} args={args}")
-
-# T5b lightobf mode=dab(推荐强度) → --flags 归一化输出(db a 按 d,b,a 序)
-rc, args, files, err = run(cfg(lightobf={"enabled": True, "mode": "dab", "rules_file": "**/com.a.**"}))
-check("T5b lightobf mode=dab → --flags dba(归一化序)",
-      rc == 0 and args == ["--light-obf", "--flags", "dba", "schema_rules/lightobf.txt"],
-      f"rc={rc} args={args}")
-
-# T5c lightobf mode 非法值 → fail-fast(保险丝 c 的 flags 收紧)
-rc, args, files, err = run(cfg(lightobf={"enabled": True, "mode": "x", "rules_file": "**/com.a.**"}))
-check("T5c lightobf mode=x → fail-fast", rc != 0 and "只允许 d/b/a" in err, f"rc={rc} err={err}")
-
 # T6
 rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True,
                                dex2c={"enabled": True, "rules_file": "**/com.test.**"},
-                               stringenc={"enabled": True, "rules_file": "**/com.s.**"},
-                               lightobf={"enabled": True, "rules_file": "**/com.l.**"}))
+                               stringenc={"enabled": True, "rules_file": "**/com.s.**"}))
 expect = ["--sigcheck", "--dex2c", "schema_rules/dex2c.txt",
-          "--stringenc", "schema_rules/stringenc.txt",
-          "--light-obf", "schema_rules/lightobf.txt", "--anti-diff", "--envcheck"]
+          "--stringenc", "schema_rules/stringenc.txt", "--anti-diff", "--envcheck"]
 check("T6 全家桶 → 参数齐全且顺序固定", rc == 0 and args == expect, f"rc={rc} args={args}")
 
 # T7（§10.1 反向）
@@ -167,6 +148,31 @@ check("T14 任意 cwd 运行 → 结果一致（仓库根推算）", rc == 0 and
 rc, args, files, err = run(cfg(sigcheck=True, envcheck=True))
 raw = files.get("args.txt", "")
 check("T15 args.txt 一行一个、结尾无多余空行", rc == 0 and raw == "--sigcheck\n--envcheck\n", f"raw={raw!r}")
+
+# T16 子复选框勾选 → arg_on 追加（antidiff 升级 parent 后的 .enabled 形态）
+rc, args, files, err = run(cfg(antidiff={"enabled": True, "reencode": True}))
+check("T16 子复选框勾选 → arg_on 追加",
+      rc == 0 and args == ["--anti-diff", "--anti-diff-f"], f"rc={rc} args={args} err={err}")
+
+# T16b 子复选框不勾 → 只吐模块 arg,无 arg_on
+rc, args, files, err = run(cfg(antidiff={"enabled": True, "reencode": False}))
+check("T16b 子复选框不勾 → 无 arg_on",
+      rc == 0 and args == ["--anti-diff"], f"rc={rc} args={args} err={err}")
+
+# T16c 子复选框缺失 → 按 schema default(true)处理,arg_on 追加
+rc, args, files, err = run(cfg(antidiff={"enabled": True}))
+check("T16c 子复选框缺失 → 按 default=true 追加 arg_on",
+      rc == 0 and args == ["--anti-diff", "--anti-diff-f"], f"rc={rc} args={args} err={err}")
+
+# T16d 旧版 App 形态:antidiff 顶层 bool(leaf 升 parent 的向后兼容)
+rc, args, files, err = run(cfg(sigcheck=True, antidiff=True))
+check("T16d 旧形态 antidiff=true → 兼容,只吐模块 arg",
+      rc == 0 and args == ["--sigcheck", "--anti-diff"], f"rc={rc} args={args} err={err}")
+
+# T16e 子复选框值非布尔 → 报错
+rc, args, files, err = run(cfg(antidiff={"enabled": True, "reencode": "yes"}))
+check("T16e 子复选框非布尔 → 报错退出",
+      rc != 0 and "布尔" in err, f"rc={rc} err={err}")
 
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
