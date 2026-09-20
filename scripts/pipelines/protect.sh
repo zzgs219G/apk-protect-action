@@ -291,7 +291,7 @@ if [[ $WANT_ANTIDIFF -eq 1 ]]; then
   ANTIDIFF_ARGS=()
   if [[ $ANTIDIFF_F -eq 1 ]]; then
     # 子复选框"恒等算术重编码(变换F)"(schema antidiff.reencode,
-    # value_kind=flag):勾选 → 启用 add⇄rsub 等长重编码
+    # value_kind=flag):勾选 → 启用 shl⇄mul 等长重编码
     ANTIDIFF_ARGS+=(--enable-f)
   fi
   python3 "$ROOT/scripts/anti-diff/anti-diff.py" "$WORK/decompiled" "${ANTIDIFF_ARGS[@]}"

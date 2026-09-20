@@ -68,12 +68,12 @@ cat > "$WORK/dec/smali/com/demo/A.smali" <<'EOF'
     return-void
 .end method
 
-.method public static calc(II)I
+.method public static calc(I)I
     .locals 2
-    add-int/lit8 v0, p0, 0x2
-    add-int/lit8 v1, p1, 0x1
-    add-int/2addr v0, v1
-    add-int/lit8 v0, v0, 0x0
+    shl-int/lit8 v0, p0, 0x1
+    shl-int/lit8 v1, p0, 0x2
+    shl-int/2addr v0, v1
+    shl-int/lit8 v0, v0, 0x0
     return v0
 .end method
 
@@ -316,33 +316,33 @@ case "$first_method" in
 esac
 
 # ── 断言 5c:变换 F(恒等算术重编码)生效且语义守恒 ────────────────────
-# calc 含 4 条 add-int/lit8(x2 常规 + x1 2addr 对照 + x1 立即数 0x0):
-#   - 0x0 不转(无恒等对应价值);lit8 两条必须至少转出一条 rsub
+# calc 含 4 条 shl 形态(x2 lit8 常规 + x1 shl-int/2addr 对照 + x1 移位量 0x0):
+#   - k=0x0 不转(×1 恒等无混淆价值);k∈0x1..0x6 的 lit8 必须转出 mul
 #   - 行数守恒(F 是等长替换,不增删行)
 #   - 2addr 形态绝不被误改(不同编码格式)
 awk '/\.method public static calc/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/calc.txt"
-if ! grep -qE '^\s*rsub-int/lit8 ' "$WORK/calc.txt"; then
-  echo '❌ 变换 F 未生效(calc 无 rsub-int/lit8)'; cat "$WORK/calc.txt"; exit 1
+if ! grep -qE '^\s*mul-int/lit8 ' "$WORK/calc.txt"; then
+  echo '❌ 变换 F 未生效(calc 无 mul-int/lit8)'; cat "$WORK/calc.txt"; exit 1
 fi
-# 立即数 0x0 那条必须原样保留(不转 0)
-grep -qE '^\s*add-int/lit8 v[0-9]+, v[0-9]+, 0x0\s*$' "$WORK/calc.txt" \
-  || { echo '❌ 变换 F 误转了 0x0 立即数'; cat "$WORK/calc.txt"; exit 1; }
+# 移位量 0x0 那条必须原样保留(×1 形态不转)
+grep -qE '^\s*shl-int/lit8 v[0-9]+, v[0-9]+, 0x0\s*$' "$WORK/calc.txt" \
+  || { echo '❌ 变换 F 误转了移位量 0x0'; cat "$WORK/calc.txt"; exit 1; }
 # 2addr 形态原样保留
-grep -qE '^\s*add-int/2addr ' "$WORK/calc.txt" \
-  || { echo '❌ 变换 F 误改了 add-int/2addr'; cat "$WORK/calc.txt"; exit 1; }
-# 语义等价黑盒:rsub 的目标/源寄存器与被改写前一致(只换助记符与立即数取负),
-# 即 add vA, vB, +x 与 rsub vA, vB, -x 的寄存器三元组逐行对得上
+grep -qE '^\s*shl-int/2addr ' "$WORK/calc.txt" \
+  || { echo '❌ 变换 F 误改了 shl-int/2addr'; cat "$WORK/calc.txt"; exit 1; }
+# 语义恒等黑盒:断言输出 mul 立即数 = 2^输入移位量(输入 k=1,2 是本测试
+# 钉死的形态,漂移会在"期望 2,4"断言处暴露)——报错三十七:
+# 旧版 add⇄rsub 把方向写反导致算术反号,若实现忘算 2^k 或方向再写反,
+# mul 值必对不上 2,4,此断言即死;不做寄存器配对:D 寄存器置换
+# 在 F 之前跑,目标寄存器已被重编号,行数守恒断言兜底寄存器层面)
 python3 - "$WORK/calc.txt" <<'PY'
 import re, sys
-lines = [l.rstrip() for l in open(sys.argv[1], encoding='utf-8') if l.strip()]
-ins = [l for l in lines if not l.lstrip().startswith(('.', ':'))]
-rsub = [re.match(r'\s*rsub-int/lit8\s+(\S+),\s*(\S+),\s*(-?0x[0-9a-fA-F]+)$', l) for l in ins]
-rsub = [m for m in rsub if m]
-assert rsub, '无 rsub 断言对象'
-for m in rsub:
-    neg = int(m.group(3), 16)
-    assert -128 <= neg <= 127, f'立即数越 8 位域: {m.group(3)}'
-print('  变换 F 语义形态 ✅ (rsub 立即数均在 8 位域)')
+out = [l.rstrip() for l in open(sys.argv[1], encoding='utf-8') if l.strip()]
+out_ins = [l for l in out if not l.lstrip().startswith(('.', ':'))]
+mul = [re.match(r'\s*mul-int/lit8\s+\S+,\s*\S+,\s*(0x[0-9a-fA-F]+)$', l) for l in out_ins]
+mul = [int(m.group(1), 16) for m in mul if m]
+assert sorted(mul) == [2, 4], f'mul 立即数 ≠ 2^输入移位量(输入 k=1,2 → 期望 2,4): {mul}'
+print(f'  变换 F 语义恒等 ✅ (mul {mul} = 2^[1,2],方向/指数双重锁)')
 PY
 # F 行数守恒:calc 方法体(含 .method/.end method 与空行)行数不变
 if [[ $(grep -c '' "$WORK/calc.txt") -ne 9 ]]; then
@@ -355,20 +355,20 @@ cat > "$WORK/dec6/smali/com/demo/F.smali" <<'EOF'
 .class public Lcom/demo/F;
 .super Ljava/lang/Object;
 
-.method public static t(II)I
+.method public static t(I)I
     .locals 2
-    add-int/lit8 v0, p0, 0x2
-    add-int/lit8 v1, p1, 0x1
+    shl-int/lit8 v0, p0, 0x1
+    shl-int/lit8 v1, p0, 0x7
     add-int v0, v0, v1
     return v0
 .end method
 EOF
 run "$WORK/dec6" > /dev/null
-if grep -q 'rsub-int/lit8' "$WORK/dec6/smali/com/demo/F.smali"; then
-  echo '❌ 变换 F 未受 --enable-f 控制(默认路径出现了 rsub)'; exit 1
+if grep -q 'mul-int/lit8' "$WORK/dec6/smali/com/demo/F.smali"; then
+  echo '❌ 变换 F 未受 --enable-f 控制(默认路径出现了 mul)'; exit 1
 fi
-# D 会置换寄存器、C+ 会插桩,断言只能盯"立即数 0x2 与助记符 add-int/lit8 同行"
-grep -qE '^\s*add-int/lit8 v[0-9]+, p[0-9]+, 0x2\s*$' "$WORK/dec6/smali/com/demo/F.smali" \
+# D 会置换寄存器、C+ 会插桩,断言只能盯"移位量 0x1 与助记符 shl-int/lit8 同行"
+grep -qE '^\s*shl-int/lit8 v[0-9]+, p[0-9]+, 0x1\s*$' "$WORK/dec6/smali/com/demo/F.smali" \
   || { echo '❌ 断言 5d 前置失败(输入形态被其他变换改动)'; cat "$WORK/dec6/smali/com/demo/F.smali"; exit 1; }
 
 # ── 断言 6:幂等——第 2 次运行产物逐字节一致 ─────────────────────────

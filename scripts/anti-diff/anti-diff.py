@@ -35,10 +35,14 @@
     跳过:含 try-catch 的方法(保守,不碰边界)、fall-through 恰为跳转
     目标的分支(反折绕路无意义,还可能让 diff 工具一眼看穿模式)。
     跳过 <init>/<clinit>(执行顺序敏感,sigcheck/dcc 依赖)。
-  F 恒等算术重编码(零损耗):add-int/lit8 vA, vB, +x ⇄ rsub-int/lit8
-    vA, vB, -x 的确定性随机互转。两者同为 22b 格式(4 字节,等长零膨胀),
-    语义恒等(vA = vB − (−x) = vB + x);R8 优化器从不产出 rsub 重编码
-    形态,不可被上游消除也无法预测。跳过 <init>/<clinit>(同 A)。
+  F 恒等算术重编码(零损耗):shl-int/lit8 vA, vB, k → mul-int/lit8
+    vA, vB, 2^k 的确定性单向改写。两者同为 22b 格式
+    (4 字节,等长零膨胀),32 位补码语义下 vB << k ≡ vB × 2^k(含负数与
+    溢出回绕,数学恒等);R8 强度削减会把"乘 2 的幂"规约成 shl,故乘 2
+    的幂的 mul 重编码形态 R8 从不产出,不可被上游消除也无法预测。仅改
+    写移位量 k ∈ 0x1..0x6(2^k ≤ 0x40 才落回 mul 的 8 位字面量域),
+    k=0 与 k>6
+    原样保留。跳过 <init>/<clinit>(同 A)。
   C 方法入口 + return 前垃圾指令(谨慎版·强化):仅当方法同时满足全部
     硬条件才插:
       - 不是 <init>/<clinit>
@@ -706,43 +710,43 @@ def _junk_ins(rng, count, pool=None):
 
 # ── 变换 F:恒等算术重编码(零损耗)─────────────────────────────────
 
-# 仅匹配 add-int/lit8 的 22b 三操作数形态:目标 vA、源 vB、立即数 #+CC。
-# 立即数 0x0 不转:mul-int/lit8 vA, vB, 0x1 才是加 0 的恒等对应,但 R8 产物
-# 几乎不含 x+0(已被上游消掉),命中率为 0,白白多一个分支。
-# 注意不能写成 \badd-int/lit8\b 一类宽匹配:lit16/2addr 是别的编码格式,
+# 仅匹配 shl-int/lit8 的 22b 三操作数形态:目标 vA、源 vB、移位量 #+CC。
+# 恒等对应:mul-int/lit8 vA, vB, 2^k(22b 同为 4 字节;32 位补码语义下
+# vB << k ≡ vB × 2^k,含负数与溢出回绕,数学恒等)。R8 强度削减把"乘 2
+# 的幂"规约成 shl,故 baksmali 产物只含 shl 形态,mul 重编码不可消除。
+# 注意不能写成 \bshl-int/lit8\b 一类宽匹配:lit16/2addr 是别的编码格式,
 # 行数/字节不同,互转就不再等长(报错三十五同族教训:形态相邻≠形态等价)。
-_ADD_LIT8_RE = re.compile(
-    r'^(\s*)add-int/lit8\s+(v\d+|p\d+)\s*,\s*(v\d+|p\d+)\s*,\s*(-?0x[0-9a-fA-F]+)\s*$')
+# 历史教训(报错三十七):本变换首版曾把 add-int/lit8 ⇄ rsub-int/lit8
+# 当作"语义恒等"——实际 rsub 的运算方向是 CC − vB(立即数是被减数,
+# androguard rsubintlit8: BinaryExpressionLit(Op.SUB, cst, var_b)),改写
+# 后算术结果反号,真实包必崩。22b 三操作数形态里 vA = vB + x 的单指令
+# 恒等替代只有 add 自身,不存在正确的 rsub 对应 → 整体换成 shl⇄mul。
+_SHL_LIT8_RE = re.compile(
+    r'^(\s*)shl-int/lit8\s+(v\d+|p\d+)\s*,\s*(v\d+|p\d+)\s*,\s*(-?0x[0-9a-fA-F]+)\s*$')
 
 
-def _reencode_add_rsub(method_lines, rng):
-    """变换 F:add-int/lit8 vA, vB, +x ⇄ rsub-int/lit8 vA, vB, -x。
+def _reencode_shl_mul(method_lines, rng):
+    """变换 F:shl-int/lit8 vA, vB, k → mul-int/lit8 vA, vB, 2^k(单向)。
 
-    22b 格式互转,4 字节等长;vA = vB + x ≡ vA = vB − (−x),语义恒等。
-    立即数为 0x0 跳过(无意义形态);寄存器/标签/字符串一概不动,
-    无需 _replace_outside_strings 保护(立即数在行尾,不在引号内)。
+    22b 格式互转,4 字节等长;vB << k ≡ vB × 2^k(32 位补码,数学恒等)。
+    仅当移位量 k ∈ 0x1..0x6 时无条件全量改写(2^k ≤ 0x40,落回 mul 的
+    8 位字面量域);k=0 恒等于 ×1(R8 已消)与 k>6(2^k 超域)与移位量为
+    负的防御性形态(baksmali 不产出)一律原样保留。寄存器/标签/字符串
+    一概不动,无需 _replace_outside_strings 保护(立即数在行尾,不在
+    引号内)。rng 为签名兼容占位(旧版按概率抽改,现全量改写)。
     返回(新行列表, 改写条数)。"""
     out = []
     n = 0
     for ln in method_lines:
-        m = _ADD_LIT8_RE.match(ln)
-        if m and m.group(4) != '0x0':
+        m = _SHL_LIT8_RE.match(ln)
+        if m:
             indent, dst, src, imm = m.groups()
-            val = int(imm, 16)
-            if rng.random() < 0.5:
-                # add → rsub:立即数取负后必须落回 8 位有符号字面量。
-                # 22b 的 imm 是 8 位补码(−128..127);smali 汇编器按字面量
-                # 数值做范围检查,vB − 0xfffffff8 这种 32 位写法虽语义等价,
-                # 但超 8 位字面量直接汇编报错 → 必须归一成 −0x8 形态。
-                # 取负在 8 位域内进行:−x mod 256 再按有符号解释(报错二十二
-                # 式教训:字面量合法性以 smali 汇编器实测为准,别想当然)。
-                neg = (-val) & 0xff
-                if neg >= 0x80:
-                    neg -= 0x100
-                out.append(f'{indent}rsub-int/lit8 {dst}, {src}, {neg:#x}')
+            k = int(imm, 16)
+            if 0x1 <= k <= 0x6:
+                out.append(f'{indent}mul-int/lit8 {dst}, {src}, {1 << k:#x}')
+                n += 1
             else:
                 out.append(ln)
-            n += 1
         else:
             out.append(ln)
     return out, n
@@ -1188,12 +1192,12 @@ def _process_method_block(block_lines, rng, max_per_method, max_cond_flip,
             if nd:
                 lines = [lines[0]] + new_body + [lines[-1]]
                 changes += 1
-            # 变换 F:恒等算术重编码(add ⇄ rsub,22b 等长等语义,零膨胀;
+            # 变换 F:恒等算术重编码(shl ⇄ mul,22b 等长等语义,零膨胀;
             # 放在 D 之后——D 改寄存器号,F 只看操作数形态互不干扰。
             # 受流水线子复选框 antidiff.reencode 控制,--enable-f 才开)
             if enable_f:
                 body = lines[1:-1]
-                new_body, nf = _reencode_add_rsub(body, rng)
+                new_body, nf = _reencode_shl_mul(body, rng)
                 if nf:
                     lines = [lines[0]] + new_body + [lines[-1]]
                     changes += nf
@@ -1309,7 +1313,7 @@ def main(argv):
     ap.add_argument('--max-cond-flip', type=int, default=3,
                     help='变换 E 单方法最多反折条件分支数(默认 3,阶段 2)')
     ap.add_argument('--enable-f', action='store_true', default=False,
-                    help='启用变换 F(add⇄rsub 恒等重编码,流水线子复选框开关;'
+                    help='启用变换 F(shl⇄mul 恒等重编码,流水线子复选框开关;'
                          '默认关,直接命令行调用时的行为与历史版本一致)')
     args = ap.parse_args(argv)
 
