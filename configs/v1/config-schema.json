@@ -67,7 +67,7 @@
           "default": true,
           "value_kind": "flag",
           "arg_on": "--anti-diff-f",
-          "desc": "add⇄rsub等长重编码,零体积零性能损耗"
+          "desc": "shl⇄mul等长重编码,零体积零性能损耗"
         }
       ]
     },
