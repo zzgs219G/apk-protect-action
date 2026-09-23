@@ -99,15 +99,22 @@ if unknown_top:
 def read_enabled(module_key: str, cfg_node) -> bool:
     """enabled 语义（§3.1，审查 #2）：leaf=顶层 bool；parent=.enabled。
     §10.1：模块 key 在 config 中缺失 → 视为 disabled（不报错）。
-    兼容层（v1.1）：模块从 leaf 升级为 parent（如 antidiff 挂子复选框）后，
-    旧版 App 快照仍会提交顶层 bool —— 按 leaf 语义读取，不 fail-fast
-    （v1.1 只增不破：老 config 无 children 字段，静默走默认值）。"""
+    兼容层（v1.2 回退）：antidiff 曾是 parent（挂 reencode 子复选框），
+    旧版 App 快照仍会提交 {"enabled": ..., "reencode": ...} dict 形态——
+    leaf 分支按 .enabled 读取，已下线的子字段静默忽略不 fail-fast
+    （变换 F 现固定并入模块本体，旧快照勾不勾子复选框行为一致）。"""
     m = modules_by_key[module_key]
     if cfg_node is _MISSING:
         return False
     if m.get("type") == "parent" and isinstance(cfg_node, bool):
         return cfg_node  # 旧版 App 的 leaf 形态提交,向后兼容
     if m.get("type") == "leaf":
+        if isinstance(cfg_node, dict):
+            # v1.2 回退兼容：旧 parent 形态 dict → 按 .enabled 读，子字段忽略
+            enabled = cfg_node.get("enabled", False)
+            if not isinstance(enabled, bool):
+                die(f"模块 {module_key}.enabled 必须是布尔，实际 {enabled!r}")
+            return enabled
         if not isinstance(cfg_node, bool):
             die(f"模块 {module_key} 是 leaf，值必须是布尔，实际 {cfg_node!r}")
         return cfg_node
@@ -142,7 +149,10 @@ for m in modules:
 
     if m.get("type") != "parent" or isinstance(cfg_node, bool):
         # isinstance(bool) 兜底：旧版 App 把本 parent 当 leaf 提交顶层 bool
-        # （read_enabled 已按 leaf 语义接受），后续子字段循环自然全部跳过
+        # （read_enabled 已按 leaf 语义接受），后续子字段循环自然全部跳过。
+        # 注（v1.2 回退）：反向兜底——旧版 App 把已回退成 leaf 的 antidiff 当
+        # parent 提交 dict（含已下线 reencode 字段），read_enabled 已按
+        # .enabled 语义接受，此处因模块 type=leaf 同样跳过子字段循环。
         continue
 
     # 保险丝 a（模块内）：未知子 key 拒绝
@@ -163,18 +173,9 @@ for m in modules:
         # 与 text/rules_file 不同：值是布尔、不写规则文件、不进 required 校验；
         # 未勾选时不追加任何参数（arg_off 形态暂不需要——变换默认开，
         # 需要显式关的开关出现时再加 arg_off 分支）。
-        if value_kind == "flag":
-            value = cfg_node.get(ckey, c.get("default", False))
-            if not isinstance(value, bool):
-                die(f"模块 {key}.{ckey} 的值必须是布尔（flag），实际 {value!r}")
-            if value:
-                arg_on = c.get("arg_on", "")
-                # arg 白名单正则含 ^-- 前缀,lstrip 后 fullmatch 校验主体
-                if not ARG_RE.fullmatch(arg_on):
-                    die(f"模块 {key}.{ckey} 的 arg_on 非法: {arg_on!r}（须匹配 --xxx[-yyy]）")
-                if arg_on and arg_on not in argv_out:
-                    argv_out.append(arg_on)
-            continue
+        # （v1.2 已移除：antidiff.reencode 子复选框随 antidiff 回退 leaf 整体
+        # 下线，变换 F 固定并入模块本体；schema 中已无 flag 型子字段，
+        # 本分支删除，出现 flag 即走下方未知 value_kind 保险丝 c 报错）
 
         value = cfg_node.get(ckey, "")
         # 保险丝 c：未知 value_kind → 报错退出

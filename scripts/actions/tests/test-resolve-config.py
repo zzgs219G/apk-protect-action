@@ -149,29 +149,30 @@ rc, args, files, err = run(cfg(sigcheck=True, envcheck=True))
 raw = files.get("args.txt", "")
 check("T15 args.txt 一行一个、结尾无多余空行", rc == 0 and raw == "--sigcheck\n--envcheck\n", f"raw={raw!r}")
 
-# T16 子复选框勾选 → arg_on 追加（antidiff 升级 parent 后的 .enabled 形态）
+# T16 v1.2 回退:antidiff 已回退 leaf,变换 F 并入本体固定开启,不再有子复选框。
+# 旧 parent dict 形态提交(含已下线 reencode 字段)→ 按 .enabled 读,只吐模块 arg
 rc, args, files, err = run(cfg(antidiff={"enabled": True, "reencode": True}))
-check("T16 子复选框勾选 → arg_on 追加",
-      rc == 0 and args == ["--anti-diff", "--anti-diff-f"], f"rc={rc} args={args} err={err}")
-
-# T16b 子复选框不勾 → 只吐模块 arg,无 arg_on
-rc, args, files, err = run(cfg(antidiff={"enabled": True, "reencode": False}))
-check("T16b 子复选框不勾 → 无 arg_on",
+check("T16 旧 parent dict 形态(勾选 reencode) → 兼容,只吐 --anti-diff",
       rc == 0 and args == ["--anti-diff"], f"rc={rc} args={args} err={err}")
 
-# T16c 子复选框缺失 → 按 schema default(true)处理,arg_on 追加
-rc, args, files, err = run(cfg(antidiff={"enabled": True}))
-check("T16c 子复选框缺失 → 按 default=true 追加 arg_on",
-      rc == 0 and args == ["--anti-diff", "--anti-diff-f"], f"rc={rc} args={args} err={err}")
+# T16b 旧 parent dict 形态(不勾 reencode)→ 同样只吐模块 arg(变换 F 固定开,行为一致)
+rc, args, files, err = run(cfg(antidiff={"enabled": True, "reencode": False}))
+check("T16b 旧 parent dict 形态(不勾 reencode) → 只吐 --anti-diff",
+      rc == 0 and args == ["--anti-diff"], f"rc={rc} args={args} err={err}")
 
-# T16d 旧版 App 形态:antidiff 顶层 bool(leaf 升 parent 的向后兼容)
+# T16c 旧 parent dict 形态(缺 reencode)→ 同样兼容
+rc, args, files, err = run(cfg(antidiff={"enabled": True}))
+check("T16c 旧 parent dict 形态(缺 reencode) → 兼容,只吐 --anti-diff",
+      rc == 0 and args == ["--anti-diff"], f"rc={rc} args={args} err={err}")
+
+# T16d 旧版 App 顶层 bool 形态 → 兼容,只吐模块 arg
 rc, args, files, err = run(cfg(sigcheck=True, antidiff=True))
-check("T16d 旧形态 antidiff=true → 兼容,只吐模块 arg",
+check("T16d 顶层 bool 形态 antidiff=true → 兼容,只吐模块 arg",
       rc == 0 and args == ["--sigcheck", "--anti-diff"], f"rc={rc} args={args} err={err}")
 
-# T16e 子复选框值非布尔 → 报错
-rc, args, files, err = run(cfg(antidiff={"enabled": True, "reencode": "yes"}))
-check("T16e 子复选框非布尔 → 报错退出",
+# T16e 旧 parent dict 形态 enabled 非布尔 → 报错
+rc, args, files, err = run(cfg(antidiff={"enabled": "yes"}))
+check("T16e 旧 dict 形态 enabled 非布尔 → 报错退出",
       rc != 0 and "布尔" in err, f"rc={rc} err={err}")
 
 print(f"\n结果: {passed} 通过, {failed} 失败")
