@@ -64,7 +64,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 WANT_STRINGENC=0; STRING_RULES=""
-WANT_ANTIDIFF=0; ANTIDIFF_F=0
+WANT_ANTIDIFF=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sigcheck) WANT_SIGCHECK=1; shift ;;
@@ -81,7 +81,6 @@ while [[ $# -gt 0 ]]; do
     --envcheck) WANT_ENVCHECK=1; shift ;;
     --packer)   WANT_PACKER=1; shift ;;
     --anti-diff) WANT_ANTIDIFF=1; shift ;;
-    --anti-diff-f) WANT_ANTIDIFF=1; ANTIDIFF_F=1; shift ;;
     *)          log_err "未知参数: $1"; usage ;;
   esac
 done
@@ -288,13 +287,9 @@ fi
 # 盖上标签重命名/块重排/入口垃圾指令噪声,diff 视角即"整包重编译"。
 # anti-diff 自带跳过:native 方法(dcc 壳)、<init>/<clinit>(sigcheck/dcc 依赖)。
 if [[ $WANT_ANTIDIFF -eq 1 ]]; then
-  ANTIDIFF_ARGS=()
-  if [[ $ANTIDIFF_F -eq 1 ]]; then
-    # 子复选框"恒等算术重编码(变换F)"(schema antidiff.reencode,
-    # value_kind=flag):勾选 → 启用 shl⇄mul 等长重编码
-    ANTIDIFF_ARGS+=(--enable-f)
-  fi
-  python3 "$ROOT/scripts/anti-diff/anti-diff.py" "$WORK/decompiled" "${ANTIDIFF_ARGS[@]}"
+  # 变换 F（shl⇄mul 恒等重编码）已并入模块本体固定开启——原 antidiff.reencode
+  # 子复选框（--anti-diff-f）已从 schema 下线（v1.2 回退），此处无条件传 --enable-f
+  python3 "$ROOT/scripts/anti-diff/anti-diff.py" "$WORK/decompiled" --enable-f
 fi
 
 if [[ $WANT_SIGCHECK -eq 1 || $WANT_DEX2C -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then

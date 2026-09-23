@@ -55,21 +55,10 @@
     {
       "key": "antidiff",
       "label": "防对比混淆",
-      "desc": "dex层结构噪声",
-      "type": "parent",
+      "desc": "dex层结构噪声（含变换F恒等算术重编码，已并入模块本体默认开启）",
+      "type": "leaf",
       "default": false,
-      "arg": "--anti-diff",
-      "children": [
-        {
-          "key": "reencode",
-          "label": "恒等算术重编码(变换F)",
-          "type": "checkbox",
-          "default": true,
-          "value_kind": "flag",
-          "arg_on": "--anti-diff-f",
-          "desc": "shl⇄mul等长重编码,零体积零性能损耗"
-        }
-      ]
+      "arg": "--anti-diff"
     },
     { "key": "envcheck", "label": "环境检测", "desc": "Frida/Xposed/调试器", "type": "leaf", "default": false, "arg": "--envcheck" }
   ]

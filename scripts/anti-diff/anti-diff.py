@@ -1194,7 +1194,8 @@ def _process_method_block(block_lines, rng, max_per_method, max_cond_flip,
                 changes += 1
             # 变换 F:恒等算术重编码(shl ⇄ mul,22b 等长等语义,零膨胀;
             # 放在 D 之后——D 改寄存器号,F 只看操作数形态互不干扰。
-            # 受流水线子复选框 antidiff.reencode 控制,--enable-f 才开)
+            # 流水线固定传 --enable-f(原 antidiff.reencode 子复选框已下线,
+            # 变换 F 并入模块本体;CLI 开关保留,直跑脚本时仍可显式控制)
             if enable_f:
                 body = lines[1:-1]
                 new_body, nf = _reencode_shl_mul(body, rng)
@@ -1313,8 +1314,9 @@ def main(argv):
     ap.add_argument('--max-cond-flip', type=int, default=3,
                     help='变换 E 单方法最多反折条件分支数(默认 3,阶段 2)')
     ap.add_argument('--enable-f', action='store_true', default=False,
-                    help='启用变换 F(shl⇄mul 恒等重编码,流水线子复选框开关;'
-                         '默认关,直接命令行调用时的行为与历史版本一致)')
+                    help='启用变换 F(shl⇄mul 恒等重编码;流水线已固定传入——'
+                         '原 antidiff.reencode 子复选框已下线,变换 F 并入模块本体;'
+                         'CLI 开关保留供直接命令行调用时显式控制,默认关)')
     args = ap.parse_args(argv)
 
     root = os.path.abspath(args.decompiled)
