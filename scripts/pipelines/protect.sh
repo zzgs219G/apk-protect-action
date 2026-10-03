@@ -18,7 +18,9 @@
 #                          mark-native.py 壳替换（不插 loadLibrary：onCreate 已抽进 so，
 #                          删 <clinit> 的 loadLibrary 会让 native 壳直接自爆）→ 回编
 #   --envcheck           → 环境检测(Frida/Xposed/调试器/libc内存CRC/常驻复查)并入 libnc.so(可与其余模块任意组合)
-#   --packer             → 占位报错（dpt-shell 流程迁移中，与旧 packer.sh 一致）
+#   --packer             → 基础加壳(dpt-shell)：必须最后跑，作用于回编并 zipalign
+#                          之后的成品包；勾了加壳则跳过本脚本的 finish_apk，
+#                          由 packer.sh 的产物直接作为最终输出(加壳包不能二次 zipalign)
 #
 # dex2c 类名来源决策(规则优先,修复联合勾选无视用户规则的 bug):
 #   提供了规则(无论是否联合勾选) → 用户规则(rules-to-filter.py)
@@ -87,7 +89,7 @@ done
 
 TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC + WANT_ANTIDIFF))
 if [[ $TOTAL -eq 0 ]]; then
-  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --envcheck / --packer / --anti-diff）"
+  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --envcheck / --anti-diff / --packer）"
   exit 1
 fi
 
@@ -107,10 +109,6 @@ if [[ $WANT_DEX2C -eq 1 ]]; then
     log_err "     (提供规则文件: --dex2c rules.txt;或联合 --sigcheck 自动抽取主类)"
     exit 1
   fi
-fi
-if [[ $WANT_PACKER -eq 1 ]]; then
-  log_err "packer 模块尚未接入（dpt-shell 流程迁移中）；请先去掉 --packer 重试"
-  exit 1
 fi
 if [[ $WANT_STRINGENC -eq 1 ]]; then
   if [[ -z "$STRING_RULES" ]]; then
@@ -300,7 +298,22 @@ if [[ $WANT_SIGCHECK -eq 1 || $WANT_DEX2C -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
 fi
 repack_build "$WORK/decompiled" "$WORK/unsigned.apk"
 
-# ── 输出: zipalign（不签名！签名由开发者自行完成） ───────────────────
-finish_apk "$WORK/unsigned.apk" "$OUT_APK"
-
-log_done "完成 ✅ 共 $TOTAL 个模块，产物: $OUT_APK（未签名，开发者需自行 apksigner 重签）"
+# ── 输出 ────────────────────────────────────────────────────────────
+# 先把回编产物对齐好，再决定加壳是否接手最后一步（全程不签名，签名由开发者完成）。
+#   - 勾加壳：dpt 吃的是"已对齐的成品包"。dpt 内部虽自带 zipalign，但它同时会
+#     重写 dex/so/Manifest —— 与其让它对着未对齐的包做一次全量重写，不如先
+#     对齐再交壳，失败时也更接近"哪一步坏的"（报错八的定位纪律）。
+#   - 不勾加壳：与接入 packer 之前完全一致（finish_apk 直接落到 OUT_APK），
+#     保证既有组合零行为变更。
+if [[ $WANT_PACKER -eq 1 ]]; then
+  ALIGNED="$WORK/aligned.apk"
+  finish_apk "$WORK/unsigned.apk" "$ALIGNED"
+  log_step 6 6 "基础加壳（dpt-shell）"
+  # packer.sh 产物直接作为最终输出：加壳包不能在本脚本再叠一次 finish_apk
+  # （加壳已重写 dex/so/Manifest，二次 zipalign 属二次改写）
+  "$ROOT/scripts/packer/packer.sh" "$ALIGNED" "$OUT_APK"
+  log_done "完成 ✅ 共 $TOTAL 个模块，产物: $OUT_APK（已加壳，未签名，开发者需自行 apksigner 重签）"
+else
+  finish_apk "$WORK/unsigned.apk" "$OUT_APK"
+  log_done "完成 ✅ 共 $TOTAL 个模块，产物: $OUT_APK（未签名，开发者需自行 apksigner 重签）"
+fi

@@ -17,6 +17,8 @@
   T13 未知模块内子 key            → 报错退出（保险丝 a 模块内）
   T14 cwd 无关性（§10.5）          → 任意 cwd 下运行结果一致
   T15 args.txt 结尾无多余空行（§10.2）
+  T6b/T6c packer(基础加壳)          → leaf 模块，只吐 --packer，与共存模块顺序固定
+  T6d 旧 App 快照无 packer 键       → 视为 disabled，不报错（§10.1 正向）
 """
 import json
 import os
@@ -70,7 +72,7 @@ def check(name, cond, detail=""):
 def cfg(**kw):
     base = {"schema_version": 1, "sigcheck": False, "dex2c": {"enabled": False},
             "stringenc": {"enabled": False},
-            "antidiff": False, "envcheck": False}
+            "antidiff": False, "envcheck": False, "packer": False}
     base.update(kw)
     return base
 
@@ -98,12 +100,29 @@ rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": ""}))
 check("T4 stringenc 留空规则 → fail-fast", rc != 0 and "规则为空" in err, f"rc={rc} err={err}")
 
 # T6
-rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True,
+rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True, packer=True,
                                dex2c={"enabled": True, "rules_file": "**/com.test.**"},
                                stringenc={"enabled": True, "rules_file": "**/com.s.**"}))
 expect = ["--sigcheck", "--dex2c", "schema_rules/dex2c.txt",
-          "--stringenc", "schema_rules/stringenc.txt", "--anti-diff", "--envcheck"]
+          "--stringenc", "schema_rules/stringenc.txt", "--anti-diff", "--envcheck",
+          "--packer"]
 check("T6 全家桶 → 参数齐全且顺序固定", rc == 0 and args == expect, f"rc={rc} args={args}")
+
+# T6b packer:新增的加壳模块是 leaf(无子选项),勾选只吐一个 --packer
+rc, args, files, err = run(cfg(packer=True))
+check("T6b packer 单独勾选 → 仅 --packer", rc == 0 and args == ["--packer"],
+      f"rc={rc} args={args} err={err}")
+
+# T6c packer 与其余模块共存 → 顺序固定,packer 落在最后
+rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True, packer=True))
+check("T6c packer 与其余共存 → --packer 在末尾",
+      rc == 0 and args == ["--sigcheck", "--anti-diff", "--envcheck", "--packer"],
+      f"rc={rc} args={args} err={err}")
+
+# T6d 旧版 App 快照(config 无 packer 键)→ 视为 disabled,不报错(§10.1 正向)
+rc, args, files, err = run({"schema_version": 1, "sigcheck": True})
+check("T6d config 缺 packer 键 → 视为 disabled(旧 App 向后兼容)",
+      rc == 0 and args == ["--sigcheck"], f"rc={rc} args={args} err={err}")
 
 # T7（§10.1 反向）
 rc, args, files, err = run(cfg(unknown_mod=True))

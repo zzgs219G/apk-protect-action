@@ -34,5 +34,9 @@ for m in d["modules"]:
                 assert c["default"] in vals, f"{k}.{c['key']}: default 不在 options"
 
 assert len(keys) == len(set(keys)), "模块 key 重复"
-assert keys == ["sigcheck", "dex2c", "stringenc", "antidiff", "envcheck"], keys
+# key 顺序 = 勾选 UI 的展示顺序 = protect.sh 的固定执行顺序
+# （protect.sh 阶段序：指纹 → dex2c → 组装 NDK(含 envcheck 并入 libnc.so) → 编译
+#   → mark-native → stringenc → anti-diff → 回编 → packer。
+#   envcheck 在 NDK 组装阶段并入 so，与 packer 一样排在列表末位。）
+assert keys == ["sigcheck", "dex2c", "stringenc", "antidiff", "envcheck", "packer"], keys
 print("schema OK:", keys)
