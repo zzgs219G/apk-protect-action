@@ -1,6 +1,8 @@
 build/
 # dcc.zip 解压产物(tools/dcc/ 单层,真源是 tools/dcc.zip)
 /tools/dcc/
+# dpt-shell.zip 解压产物(tools/executable/ 单层,真源是 tools/dpt-shell.zip)
+/tools/executable/
 .gradle/
 .idea/
 local.properties
