@@ -55,7 +55,7 @@
     {
       "key": "antidiff",
       "label": "防对比混淆",
-      "desc": "dex层结构噪声（含变换F恒等算术重编码，已并入模块本体默认开启）",
+      "desc": "dex层结构噪声",
       "type": "leaf",
       "default": false,
       "arg": "--anti-diff"
