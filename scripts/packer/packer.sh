@@ -7,7 +7,12 @@
 #     build-key 必须与 jar 同级，见下方契约），一律走 module_cd_run 子 shell
 #   - 产物不签名（-x），沿用本仓库"未签名包、开发者自行重签"契约
 #
-# dpt CLI 契约（由 dpt-shell v2.17.0 字节码 + --help 实测钉死，勿凭猜测改）：
+# dpt CLI 契约（由 dpt-shell 源码 + --help 实测钉死，勿凭猜测改；dpt-shell 是
+# 自研二改项目，源码在父目录 ../dpt-shell/，换版核对直接查源码：
+#   CLI 选项 → dpt/src/main/java/com/luoye/dpt/config/Const.java
+#   产物命名 → builder/AndroidPackage.buildPackage（-o 传目录 → <base>_unsign.apk）
+#   解压布局 → util/FileUtils.getExecutablePath() + shell/build.gradle
+# v1.0.0 换版时已逐项复核 -f/-o/-x/-r、产物命名、解压布局均与旧版一致）：
 #   java -jar dpt.jar -f <in.apk> -o <outdir> [-x] [-r <rules>] [-c <config>]
 #   - getExecutablePath() = jar 所在目录 → executable/shell-files/ 与
 #     executable/build-key 必须与 executable/dpt.jar 同级，解压布局不能改
