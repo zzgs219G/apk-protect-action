@@ -10,8 +10,9 @@
 #     的额外收益，对产物无行为差异——sig_check.c 以 constructor 方式并入同一 so）。
 #
 # 行为对齐（与旧脚本逐一等价）：
-#   只 --sigcheck        → 提取指纹 → sig_check.c 单独成 so → inject-loadlib.py
-#                          双保险插桩（<clinit> + onCreate）→ 回编
+#   只 --sigcheck        → 提取指纹 → sig_check.c + nc_link.c 单独成 so → inject-loadlib.py
+#                          双保险插桩（<clinit> + onCreate）→ Java 层判决式签名
+#                          联动注入(§3.11,判决在 so/杀在 Java,so 缺失即 fail-closed)→ 回编
 #   只 --dex2c [规则]    → 规则转 filter → dcc 转译 → mark-native.py 壳替换 → 回编
 #   只 --stringenc 规则  → 规则转正则 → 字符串加密(注入 Java 解密桩) → 回编
 #   --sigcheck --dex2c   → 提取指纹 → dcc 转译 → sig_check.c 合入同一 NDK 工程 →
@@ -190,14 +191,17 @@ fi
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
   # 联合时并入 dcc 工程 jni/nc/；单独时放 jni/ 根 —— ndk_write_mk 的两级
   # wildcard 都收（报错十一/十三教训），两种布局等价
+  # nc_link.c = Java 层判决式联动(§3.11):标准值比对在 so 内,零新头文件依赖
   if [[ $WANT_DEX2C -eq 1 ]]; then
     mkdir -p "$WORK/project/jni/nc"
     cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/nc/"
+    cp "$ROOT/scripts/sigcheck/src/nc_link.c"   "$WORK/project/jni/nc/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/nc/"
     cp "$WORK/sig_log_data.h"           "$WORK/project/jni/nc/"
   else
     mkdir -p "$WORK/project/jni"
     cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/"
+    cp "$ROOT/scripts/sigcheck/src/nc_link.c"   "$WORK/project/jni/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/"
     cp "$WORK/sig_log_data.h"           "$WORK/project/jni/"
   fi
@@ -243,6 +247,16 @@ elif [[ $WANT_SIGCHECK -eq 1 ]]; then
   # manifest 是二进制 AXML → inject-loadlib 内部走 androguard AXMLPrinter 解析
   python3 "$ROOT/scripts/inject/inject-loadlib.py" "$WORK/decompiled" \
     --launcher --entrypoints --so-name nc
+fi
+
+# ── Java 层判决式签名联动(§3.11,随 --sigcheck 自动生效,无独立勾选) ──
+# 两套独立真校验之一:Java 只"量"(PackageManager)并执行杀,标准值与比对全在
+# so(nc_link.c) —— 指纹永不过境进 dex;so 缺失 → fail-closed 杀,loadLibrary
+# 由"可删开关"变"承重墙"(修复 sigcheck-only 删开关静默绕过的最大缺口)。
+# 必须在插桩/loadLibrary 之后、stringenc 之前:新类常量可被 stringenc 顺带加密。
+if [[ $WANT_SIGCHECK -eq 1 ]]; then
+  python3 "$ROOT/scripts/sigcheck/javalink/inject-javacheck.py" \
+    "$WORK/decompiled" --so-name nc
 fi
 
 # ── 字符串加密（dex 层，与 so 无关；必须在 mark-native 之后） ──────
