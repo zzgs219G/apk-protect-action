@@ -1,2 +1,0 @@
-{"sequence":1,"timestamp":"2026-10-10T19:07:03.104999759Z","event_type":"state_change","task_id":"20261010-174452.104597619-z-ai-glm-5.3--bash-6","session_id":"20261010-174452.104597619-z-ai-glm-5.3","state":"running","runtime_state":"alive"}
-{"sequence":2,"timestamp":"2026-10-10T19:08:33.553587457Z","event_type":"state_change","task_id":"20261010-174452.104597619-z-ai-glm-5.3--bash-6","session_id":"20261010-174452.104597619-z-ai-glm-5.3","state":"succeeded","runtime_state":"exited"}
