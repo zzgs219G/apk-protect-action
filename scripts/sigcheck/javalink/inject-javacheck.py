@@ -383,6 +383,7 @@ def _first_instruction_idx(lines, start_idx):
 def inject_call_site(path, wrapper_desc):
     """往该 smali 文件的 onCreate 里插一行 invoke-static {p0}(零新增寄存器)。
     onCreate 不存在则新建覆写(合法形态:super 调用 + 本调用)。
+    onCreate 被 mark-native 抽成 native 壳时跳过该点(报错三十九防线)。
     返回 (changed, note);p0 物理编号 > v15 时弃用该点(报错二十一式防线)。"""
     with open(path, encoding='utf-8') as fp:
         lines = fp.read().splitlines()
@@ -398,6 +399,17 @@ def inject_call_site(path, wrapper_desc):
             break
     if target is None:
         return False, 'no-method'
+
+    # 报错三十九(2026-10-12 build.log,dex2c 组合场景):onCreate 被
+    # mark-native 抽成 native 壳(无方法体,dex 寄存器数为 0)。空壳会
+    # 落进下面 ins is None 的"补方法体"分支 → 给 native 方法凭空造体,
+    # 回编必炸:"A native method cannot have any instructions" + p0 按
+    # 零寄存器解析成负号(2 参数槽 → v-2)。native 壳本身就是承重墙
+    # (删 loadLibrary → UnsatisfiedLinkError fail-closed),跳过该点
+    # 不降整体防护——app 侧调用点仍在(双保险),与 inject-loadlib 对
+    # native 壳的保守策略同向(其 'no-registers' 分支天然跳过)。
+    if re.search(r'\bnative\b', lines[target]):
+        return False, 'native-onCreate'
 
     is_static, proto, total = _method_info(lines, target)
     this_words = 0 if is_static else 1

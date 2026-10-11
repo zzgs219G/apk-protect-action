@@ -183,6 +183,49 @@ print('  ✅ 读回断言全部通过')
 PY
 PASS=$((PASS + 1))
 
+echo "[5b/9] 报错三十九回归——native onCreate 壳必须跳过(dex2c 组合场景防回编炸)"
+python3 - "$JL/inject-javacheck.py" <<'PY'
+import importlib.util, sys, os, tempfile
+spec = importlib.util.spec_from_file_location('ij', sys.argv[1])
+ij = importlib.util.module_from_spec(spec); spec.loader.exec_module(ij)
+
+# mark-native(dex2c)抽走方法体后的 native 壳形态:无指令、无 .locals
+native_stub = (
+    '.class public Lcom/xixin/box/MainActivity;\n'
+    '.super Landroid/app/Activity;\n'
+    '\n'
+    '.method public native onCreate(Landroid/os/Bundle;)V\n'
+    '.end method\n')
+path = os.path.join(tempfile.mkdtemp(), 'MainActivity.smali')
+with open(path, 'w') as fp:
+    fp.write(native_stub)
+changed, note = ij.inject_call_site(path, 'Lcom/xixin/box/NativeGuard;')
+assert changed is False and note == 'native-onCreate', (changed, note)
+with open(path) as fp:
+    assert fp.read() == native_stub, 'native 壳被改动(报错三十九回归:曾凭空造方法体)'
+assert ij.CALL_MARKER not in native_stub
+print('  ✅ native onCreate 壳:跳过 + 文件零改动(note=native-onCreate)')
+
+# 对照:普通 onCreate 不回归(注入照常生效)
+normal = native_stub.replace(
+    '.method public native onCreate(Landroid/os/Bundle;)V\n.end method\n',
+    '.method public onCreate(Landroid/os/Bundle;)V\n'
+    '    .locals 2\n'
+    '    invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n'
+    '    return-void\n'
+    '.end method\n')
+with open(path, 'w') as fp:
+    fp.write(normal)
+changed, note = ij.inject_call_site(path, 'Lcom/xixin/box/NativeGuard;')
+assert changed is True, note
+with open(path) as fp:
+    body = fp.read()
+assert 'invoke-static {p0}, Lcom/xixin/box/NativeGuard;->c(Landroid/content/Context;)V' in body
+print('  ✅ 普通 onCreate:注入照常生效(无过度收紧)')
+os.unlink(path)
+PY
+PASS=$((PASS + 1))
+
 echo "[6/9] 幂等(重跑零改动)"
 H1=$(find "$T/app" -type f -exec md5sum {} \; | sort | md5sum)
 python3 "$JL/inject-javacheck.py" "$T/app" --wrapper-name 'Lcom/test/jc/NativeGuard;'
