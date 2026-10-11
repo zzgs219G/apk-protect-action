@@ -25,6 +25,9 @@
     硬约束(报错三十三):低/高双域(4-bit 指令只能寻址 v0..v15),
     /range 连续区间成员锁定不动,wide 对作整体单元、永不跨域拆分,
     参数 pN 区永不参与,恒等置换跳过;语义等价由"读/写同步替换"保证。
+    硬约束(报错三十八):置换域严格限于局部区 [0, .locals),宽对/单
+    寄存器永不以参数物理槽(v{locals}+)为源或目标;shl/shr/ushr-long
+    的移位量是 32 位单寄存器,不得登记成宽对(幽灵对曾致真机闪退)。
   E 条件反转 + 跳转链(阶段 2 增强):方法内的条件分支做"反折"——
       if-eqz vX, :L      →    if-nez vX, :nc新
                                 goto :L
@@ -769,6 +772,10 @@ _WIDE_INS_RE = re.compile(
 # 64 位操作数判定表(用于 _wide_operand_bases)
 _WIDE_ARITH = re.compile(r'^(add|sub|mul|div|rem|and|or|xor|shl|shr|ushr)-(long|double)$')
 _WIDE_ARITH_2ADDR = re.compile(r'^(add|sub|mul|div|rem|and|or|xor|shl|shr|ushr)-(long|double)/2addr$')
+# 移位形态的第三操作数是 32 位移位量(单寄存器),绝不能当宽操作数登记
+# (报错三十八:曾与普通双宽源一并 `for i in (1,2)` 登记出幽灵宽对)
+_WIDE_ARITH_SHIFT = re.compile(r'^(shl|shr|ushr)-(long|double)$')
+_WIDE_ARITH_SHIFT_2ADDR = re.compile(r'^(shl|shr|ushr)-(long|double)/2addr$')
 _WIDE_TO = re.compile(r'^(long|double)-to-(int|float|long|double)$')
 _INT_FLOAT_TO_WIDE = re.compile(r'^(int|float)-to-(long|double)$')
 
@@ -857,7 +864,13 @@ def _wide_operand_bases(name, regs):
       * add-long v4, v0, v2   → 两个 src 宽对 (0,1)/(2,3) 全漏
     漏保护的宽对被变换 D 当普通 single 单元独立置换 → 64 位值高低半拆到
     不相邻寄存器 → ART verifier 读未定义寄存器 → VerifyError 秒闪退。
-    """
+
+    报错三十八:shl/shr/ushr-long(含 /2addr)的移位量是 32 位**单**寄存器,
+    曾按普通双宽源一并登记 → 移位量产生幽灵宽对 (vN,vN+1) 进置换槽位池 →
+    真宽对被轮换到骑住 pN 物理槽 → const-wide 高半段被 if 读走(简盒
+    10-12 真机实证)。另补两处同族漏登记:非移位 -long/2addr 的第二源、
+    long-to-double 的目标对。regs 里的 None 是 _operand_regs 的 pN 占位,
+    统一在返回前过滤。"""
     n = len(regs)
     if n == 0:
         return set()
@@ -870,7 +883,7 @@ def _wide_operand_bases(name, regs):
         bases.add(regs[0])
     elif name in ('neg-long', 'neg-double'):
         bases.add(regs[0])
-    elif _INT_FLOAT_TO_WIDE.match(name) or name == 'double-to-long':
+    elif _INT_FLOAT_TO_WIDE.match(name) or name in ('double-to-long', 'long-to-double'):
         bases.add(regs[0])
     # ── src 是 64 位 ──
     if name.startswith('move-wide'):
@@ -879,11 +892,21 @@ def _wide_operand_bases(name, regs):
     elif name == 'return-wide':
         bases.add(regs[0])
     elif _WIDE_ARITH.match(name):
-        for i in (1, 2):
-            if i < n:
-                bases.add(regs[i])
+        if _WIDE_ARITH_SHIFT.match(name):
+            # 报错三十八:移位形态只有唯一的 long src;第三操作数是
+            # 32 位移位量,绝不能登记
+            if n >= 2:
+                bases.add(regs[1])
+        else:
+            for i in (1, 2):
+                if i < n:
+                    bases.add(regs[i])
     elif _WIDE_ARITH_2ADDR.match(name):
-        bases.add(regs[0])          # /2addr 的 dst 即 src
+        # /2addr 的 dst 即 src1(dst 分支已登记);非移位形态的第二源也是
+        # 宽对(报错三十八同族:and-long/2addr vA,vB 的 vB 曾漏保护),
+        # 移位形态的 vB 是 32 位移位量,不得登记
+        if not _WIDE_ARITH_SHIFT_2ADDR.match(name) and n >= 2:
+            bases.add(regs[1])
     elif name in ('neg-long', 'neg-double'):
         if n >= 2:
             bases.add(regs[1])
@@ -896,7 +919,7 @@ def _wide_operand_bases(name, regs):
             bases.add(regs[1])
     elif name.startswith(('iput-wide', 'aput-wide', 'sput-wide')):
         bases.add(regs[0])
-    return bases
+    return {b for b in bases if b is not None}
 
 # 寄存器 token:vN / pN(替换时只匹配独立 token,防止 v1 误伤 v11)
 _REG_TOKEN_RE = re.compile(r'(?<![\w.$-])([vp]\d+)(?![\w.$-])')
@@ -917,7 +940,15 @@ def _collect_wide_pairs(method_lines):
     漏保护的宽对随后被 _permute_registers 当普通 single 单元独立置换,
     64 位值高低半被拆到不相邻寄存器 → ART verifier 读未定义寄存器 →
     VerifyError 秒闪退(真实包实证:简盒闪退包 94 处读前未定义,原包 1 处)。
-    现改用 _wide_operand_bases:按指令语义取出**全部** 64 位操作数基址。"""
+    现改用 _wide_operand_bases:按指令语义取出**全部** 64 位操作数基址。
+
+    报错三十八(简盒 10-12 真机闪退):解析只认 vN token,pN 操作数"塌缩"
+    后 v-token 位置整体左移 → `shr-long v2, p5, v4` 的移位量 v4 被当成
+    第二源登记成幽灵宽对 (4,5) 进置换槽位池 → 真宽对 (0,1) 被轮换上去,
+    骑住 p0 的物理槽位 → const-wide 写出的常量高半段紧被 `if-ge p0` 读走
+    → "args to 'if' (High-half Constant, Integer) must be integral"
+    VerifyError。现改为 _operand_regs 位置感知解析:pN 以 None 占位保持
+    操作数位置对齐,配合 _wide_operand_bases 按真实位置登记。"""
     pairs = set()
     for ln in method_lines:
         s = ln.strip()
@@ -931,12 +962,30 @@ def _collect_wide_pairs(method_lines):
         if not m:
             continue
         name = m.group(1)
-        regs = [int(x) for x in re.findall(r'\bv(\d+)\b', s)]
+        regs = _operand_regs(s)
         if not regs:
             continue
         for b in _wide_operand_bases(name, regs):
             pairs.add((b, b + 1))
     return pairs
+
+
+def _operand_regs(s):
+    """按文本顺序解析指令操作数寄存器;pN 记 None(位置占位,值不可见)。
+
+    报错三十八:pN 若直接过滤掉,后面的 v-token 会整体左移一位,把移位量
+    (第三操作数)错当成长 src。占位后位置对齐:
+      `shr-long v2, p5, v4` → [2, None, 4]   dst=2 宽 / src 不可见 / 移位量=4 不登记
+      `shl-long p5, v4, v2` → [None, 4, 2]   src=4 宽登记 / 移位量=2 不登记
+    None 统一在 _wide_operand_bases 末尾过滤。
+    解析范围截到首个 `, L`(字段/方法描述符)为止——寄存器永远在描述符
+    之前,防止字段名恰为 p1/v1 之类的罕见形态混进操作数位。"""
+    cut = s.find(', L')
+    head = s if cut < 0 else s[:cut]
+    out = []
+    for m in re.finditer(r'\b([vp])(\d+)\b', head):
+        out.append(int(m.group(2)) if m.group(1) == 'v' else None)
+    return out
 
 
 def _collect_range_blocks(method_lines):
@@ -995,9 +1044,13 @@ def _permute_registers(method_lines, rng):
 
     安全模型(报错三十二之教训延伸:寄存器类/区不变,只换编号):
       - 只动 .locals 形态的方法;.registers 模式(参数在低端)直接跳过
-      - 置换对象:v0..v{locals-1} 全部局部寄存器(宽度 = max 使用编号+1
-        与 .locals 取大,保证覆盖到所有使用点)
-      - wide 对 (vN, vN+1) 作为整体单元参与置换(单元内两成员始终相邻)
+      - 置换域严格限于局部区 [0, .locals)(报错三十八:参数物理槽
+        v{locals}+ 是 pN 别名的锚点,置换永不重写 pN token,任何以参数槽
+        为源/目标的移动都会与 pN 引用别名冲突 → 整域排除,宁可不置换;
+        文本偶见的越界 vN 一并排除)
+      - wide 对 (vN, vN+1) 作为整体单元参与置换(单元内两成员始终相邻;
+        高端触达参数区的宽对整对锁定——安全网,判定表漏形态时只降覆盖
+        不致崩,报错三十八)
       - 参数 pN 区不在置换范围(物理寄存器号不动,pN 名在 smali 层是
         固定映射,改了会把参数指到错误的物理位置)
       - 每条指令的寄存器操作数同步替换;标签/字符串/.locals 声明不动
@@ -1064,12 +1117,21 @@ def _permute_registers(method_lines, rng):
     # 4-bit 指令编码不下,报错三十三)
     # 域划分:0..15 低域(保守整段划入),16..max_used 高域;
     # range 区间成员、与区间重叠的 wide 对全部锁定
-    low_domain = [r for r in range(min(max_used + 1, 16)) if r not in locked]
-    high_domain = [r for r in range(16, max_used + 1) if r not in locked]
+    # 报错三十八:域上界再切一刀 n_locals——置换域严格限于局部区
+    # [0, .locals)。pN 是物理槽位的固定别名(v(.locals+N)),置换永不重写
+    # pN token,任何以参数槽为源/目标的移动都会与 pN 引用别名冲突
+    # (本案:幽灵宽对 (v4,v5)(v5=p0 槽)成了真宽对落点 → const-wide 写出
+    # 的常量高半段紧被 `if-ge p0` 读走 → High-half Constant VerifyError)。
+    # 文本里偶见的越界 vN(≥ .locals)一律排除在域外,宁可不置换。
+    low_domain = [r for r in range(min(max_used + 1, 16, n_locals)) if r not in locked]
+    high_domain = [r for r in range(16, min(max_used + 1, n_locals)) if r not in locked]
     # wide 对:与 range 区间重叠的 → 整对锁定;跨 16 位边界的 → 放弃置换
     free_pairs = []
     for a, b in wide_pairs:
-        if a in locked or b in locked:
+        if b >= n_locals or a in locked or b in locked:
+            # 报错三十八安全网:宽对高端触达参数物理区(≥ .locals)→ 整对
+            # 锁定。宽对必须整体生活在局部区;判定表将来再漏形态,后果
+            # 也只是"少置换",不会再把宽对骑上 pN 槽位。
             locked.update((a, b))
             low_domain = [r for r in low_domain if r not in (a, b)]
             high_domain = [r for r in high_domain if r not in (a, b)]

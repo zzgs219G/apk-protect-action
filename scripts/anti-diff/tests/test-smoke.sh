@@ -471,4 +471,83 @@ assert ran > 0, '80 个种子都没触发置换,测试无效'
 print(f'  报错三十五回归 ✅ (宽对整体置换,{ran} 个种子验证)')
 PY
 
+# ── 断言 8b:报错三十八回归——移位量不得登记宽对,宽对永不骑参数槽 ──
+# 真机案例(简盒 10-12 闪退包):`shr-long v2, p5, v4` 的移位量 v4 被
+# `for i in (1,2)` 一并登记 → 幽灵宽对 (4,5) 进置换槽位池 → 真宽对
+# (0,1) 被轮换上去,骑住 p0 的物理槽位(.registers 12 / .locals 5 下
+# p0 = v5)→ const-wide v4 写出的常量高半段紧被 `if-ge p0` 读走 →
+# "args to 'if' (High-half Constant, Integer) must be integral" 秒闪退。
+python3 - "$HERE/../anti-diff.py" <<'PY'
+import importlib.util, sys, random, re
+spec = importlib.util.spec_from_file_location('ad', sys.argv[1])
+ad = importlib.util.module_from_spec(spec); spec.loader.exec_module(ad)
+
+# ① 移位形态:移位量(三操作数第三位 / 2addr 第二位)是 32 位单寄存器,
+#    绝不能登记成宽对;pN 占位后位置不得左移
+assert ad._collect_wide_pairs(['    shr-long v2, p5, v4']) == {(2, 3)}, \
+    'shr-long 移位量被登记成幽灵宽对(报错三十八,本案实锤)'
+assert ad._collect_wide_pairs(['    shl-long v4, v0, v2']) == {(4, 5), (0, 1)}, \
+    'shl-long 移位量 v2 被登记 / src 宽对漏登记(报错三十八)'
+assert ad._collect_wide_pairs(['    shl-long p5, v4, v2']) == {(4, 5)}, \
+    'shl-long dst=pN 时 src 宽对必须仍被登记(报错三十八位置感知)'
+assert ad._collect_wide_pairs(['    shl-long p5, p5, v4']) == set(), \
+    'shl-long dst/src 均 pN 时,只剩移位量不得登记成宽对(报错三十八)'
+assert ad._collect_wide_pairs(['    shl-long/2addr v2, v4']) == {(2, 3)}, \
+    'shl-long/2addr 移位量被登记(报错三十八)'
+# ② 同族两处潜伏缺口(本案顺带审计)
+assert ad._collect_wide_pairs(['    and-long/2addr v2, v4']) == {(2, 3), (4, 5)}, \
+    'and-long/2addr 第二源宽对漏登记(报错三十八同族)'
+assert ad._collect_wide_pairs(['    long-to-double v0, v2']) == {(0, 1), (2, 3)}, \
+    'long-to-double 目标宽对漏登记(报错三十八同族)'
+
+# ③ 黑盒:崩溃方法的真实形态(.locals 5,wide 对 + 移位量 + pN 混用)
+#    任意种子下宽对都不得被轮换到骑住参数物理槽的槽位上
+body = ['    .locals 5',
+        '    if-nez p5, :c0',
+        '    goto :c1',
+        '    :c0',
+        '    iget-wide v0, p0, Lvu4;->b:J',
+        '    invoke-static {v0, v1}, Ltv4;->e(J)I',
+        '    move-result p0',
+        '    const-wide v0, 0xffffffffL',
+        '    if-ge p0, p5, :c2',
+        '    int-to-long v2, p3',
+        '    shr-long v2, p5, v4',
+        '    shl-long v0, p5, v4',
+        '    long-to-int p3, v0',
+        '    const/16 v4, 0x20',
+        '    return-void',
+        '    :c1',
+        '    :c2']
+got = ad._collect_wide_pairs(body)
+assert got == {(0, 1), (2, 3)}, f'收集器产出幽灵宽对: {got}(报错三十八)'
+N_LOC = 5
+ran = 0
+for seed in range(300):
+    out, ch = ad._permute_registers(list(body), random.Random(seed))
+    if not ch:
+        continue
+    ran += 1
+    # 行对齐重建映射(只对成对等长 v-token 的行可靠;宽对高半 v3/v1 从不
+    # 出现在文本里,不能拿 mp[b] 判邻接,改判宽对低半的落点)
+    mp = {}
+    for lb, lo in zip(body, out):
+        rb = re.findall(r'\bv(\d+)\b', lb)
+        ro = re.findall(r'\bv(\d+)\b', lo)
+        if len(rb) == len(ro):
+            for a, b in zip(rb, ro):
+                mp[int(a)] = int(b)
+    # 宽对低半只能落在宽对槽位 (0,2);落 4 = 骑上 (v4,p0) 边界对
+    # ——修复前种子 0 的实锤形态(const-wide v4 + if-ge p0 必崩)
+    for base, pr in ((0, (0, 1)), (2, (2, 3))):
+        dest = mp.get(base, base)
+        assert dest in (0, 2), \
+            f'seed={seed} 宽对 {pr} 落点 {dest} 非宽对槽位(报错三十八:落 4 即骑 p0 槽)'
+    # 单寄存器(移位量 v4)不得挤进任何宽对的高半位置
+    assert mp.get(4, 4) not in (mp.get(0, 0) + 1, mp.get(2, 2) + 1), \
+        f'seed={seed} 单寄存器 v4 挤进宽对高半(报错三十八)'
+assert ran > 0, '300 个种子都没触发置换,测试无效'
+print(f'  报错三十八回归 ✅ (移位量零幽灵对,宽对锁定在局部区,{ran} 个种子验证)')
+PY
+
 echo '✅ 冒烟测试全部通过'
