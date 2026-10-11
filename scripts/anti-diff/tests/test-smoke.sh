@@ -550,4 +550,45 @@ assert ran > 0, '300 个种子都没触发置换,测试无效'
 print(f'  报错三十八回归 ✅ (移位量零幽灵对,宽对锁定在局部区,{ran} 个种子验证)')
 PY
 
+# ── 断言 8c:报错四十回归——引用名/字符串里的"伪寄存器 token"绝不被改写 ──
+# 真机实锤(crash.log):R8 混淆方法名恰似寄存器 token,`invoke {v5},
+# Ly00;->v2(Ljava/lang/String;)V` 的方法名 v2 被当寄存器改成 ->v0 →
+# "No virtual method v2(Ljava/lang/String;)V in class Ly00"
+# NoSuchMethodError(后台 Dispatcher 线程触发);字符串 "call v2 api"
+# 同被改写,破坏"字符串内容不可变"红线(实测修复前 3000 种子 84% 损坏)。
+python3 - "$HERE/../anti-diff.py" <<'PY'
+import importlib.util, sys, random
+spec = importlib.util.spec_from_file_location('ad', sys.argv[1])
+ad = importlib.util.module_from_spec(spec); spec.loader.exec_module(ad)
+
+body = ['    .locals 6',
+        '    const/4 v0, 0x1',
+        '    const/4 v1, 0x2',
+        '    const/4 v2, 0x3',
+        '    const/4 v3, 0x4',
+        '    const-string v5, "call v2 api"',
+        '    invoke-virtual {v5}, Ly00;->v2(Ljava/lang/String;)V',
+        '    iget v4, v5, Ly00;->v2:I',
+        '    invoke-static {}, Lq;->p1()V',
+        '    return-void']
+INVARIANTS = ('Ly00;->v2(Ljava/lang/String;)V', 'Ly00;->v2:I',
+              '"call v2 api"', 'Lq;->p1()V')
+ran = 0
+moved = 0
+for seed in range(600):
+    out, ch = ad._permute_registers(list(body), random.Random(seed))
+    if not ch:
+        continue
+    ran += 1
+    text = '\n'.join(out)
+    for inv in INVARIANTS:
+        assert inv in text, f'seed={seed} 引用/字符串被改写: {inv!r} 丢失(报错四十)'
+    # 防过度收紧:真实操作数仍须被置换(至少一个种子出现 const/4 行变化)
+    if any(lo != lb for lb, lo in zip(body, out) if 'const/4' in lb):
+        moved += 1
+assert ran > 0, '600 个种子都没触发置换,测试无效'
+assert moved > 0, '置换不再改动真实操作数(过度收紧)'
+print(f'  报错四十回归 ✅ (引用名/字符串零改写,操作数置换不回归,{ran} 个种子)')
+PY
+
 echo '✅ 冒烟测试全部通过'

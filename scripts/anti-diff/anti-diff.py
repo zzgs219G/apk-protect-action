@@ -28,6 +28,9 @@
     硬约束(报错三十八):置换域严格限于局部区 [0, .locals),宽对/单
     寄存器永不以参数物理槽(v{locals}+)为源或目标;shl/shr/ushr-long
     的移位量是 32 位单寄存器,不得登记成宽对(幽灵对曾致真机闪退)。
+    硬约束(报错四十):替换只作用于指令操作数前段——`->`(方法/字段/
+    注解引用)与 `"`(字符串字面量)之后永不改写;R8 混淆短名恰似寄存器
+    token(如 ->v2(),曾被改写致 NoSuchMethodError)。
   E 条件反转 + 跳转链(阶段 2 增强):方法内的条件分支做"反折"——
       if-eqz vX, :L      →    if-nez vX, :nc新
                                 goto :L
@@ -1202,7 +1205,23 @@ def _permute_registers(method_lines, rng):
             new = mapping.get(num)
             return f'v{new}' if new is not None else tok
 
-        out.append(_REG_TOKEN_RE.sub(_sub, ln))
+        # 报错四十(2026-10-12 crash.log):此前整行替换,把 R8 混淆短名
+        # 恰似寄存器 token 的方法/字段引用(如 `Ly00;->v2(`、`->v2:`)当
+        # 寄存器改写 → NoSuchMethodError(No virtual method v2... in y00,
+        # 后台 Dispatcher 线程触发);同形态也改写了字符串里的 "vN",破坏
+        # "字符串内容不可变"红线。实测 3000 种子 84% 产出此类损坏。
+        # 合法 smali 中寄存器只出现在操作数前段——`->`(方法/字段/注解
+        # 引用箭头)与 `"`(字符串字面量)之后不可能再有寄存器,替换范围
+        # 截到两者最先出现处即天然免疫,真实操作数(含 /range 端点、
+        # .local 调试行的寄存器号)不受影响。
+        q = ln.find('"')
+        a = ln.find('->')
+        cut = len(ln)
+        if q >= 0:
+            cut = min(cut, q)
+        if a >= 0:
+            cut = min(cut, a)
+        out.append(_REG_TOKEN_RE.sub(_sub, ln[:cut]) + ln[cut:])
     return out, True
 
 
