@@ -169,18 +169,28 @@ for m in modules:
             # 不产生任何参数；若网页手填出现了也静默忽略（schema 有定义，不算未知 key）
             continue
 
-        # 子复选框（v1.1）：value_kind=flag → 勾选时把 arg_on 追加进 argv。
-        # 与 text/rules_file 不同：值是布尔、不写规则文件、不进 required 校验；
-        # 未勾选时不追加任何参数（arg_off 形态暂不需要——变换默认开，
-        # 需要显式关的开关出现时再加 arg_off 分支）。
-        # （v1.2 已移除：antidiff.reencode 子复选框随 antidiff 回退 leaf 整体
-        # 下线，变换 F 固定并入模块本体；schema 中已无 flag 型子字段，
-        # 本分支删除，出现 flag 即走下方未知 value_kind 保险丝 c 报错）
+        # 子复选框（v1.1 结构，报错四十三复挂 packer.smaller）：value_kind=flag
+        # → 勾选时把 arg_on 追加进 argv。与 text/rules_file 不同：值是布尔、
+        # 不写规则文件、不进 required 校验；子键缺失按 schema default（布尔）；
+        # 未勾选时不追加任何参数（arg_off 形态暂不需要）。
+        # （v1.2 曾随 antidiff.reencode 下线删除本分支；packer.smaller 复挂后复活）
+        if value_kind == "flag":
+            value = cfg_node.get(ckey, c.get("default", False))
+            if not isinstance(value, bool):
+                die(f"模块 {key}.{ckey} 的值必须是布尔，实际 {value!r}")
+            if not value:
+                continue
+            arg_on = c.get("arg_on", "")
+            if not ARG_RE.fullmatch(arg_on):
+                die(f"模块 {key}.{ckey} 的 arg_on 非法: {arg_on!r}（须匹配 --xxx[-yyy]）")
+            if arg_on not in argv_out:      # 去重追加
+                argv_out.append(arg_on)
+            continue
 
-        value = cfg_node.get(ckey, "")
         # 保险丝 c：未知 value_kind → 报错退出
         if value_kind != "rules_file":
             die(f"模块 {key}.{ckey} 的 value_kind 未知: {value_kind!r}（两端需同步支持）")
+        value = cfg_node.get(ckey, "")
         if not isinstance(value, str):
             die(f"模块 {key}.{ckey} 的值必须是字符串，实际 {value!r}")
 

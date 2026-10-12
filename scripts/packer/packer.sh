@@ -13,7 +13,8 @@
 #   产物命名 → builder/AndroidPackage.buildPackage（-o 传目录 → <base>_unsign.apk）
 #   解压布局 → util/FileUtils.getExecutablePath() + shell/build.gradle
 # v1.0.0 换版时已逐项复核 -f/-o/-x/-r、产物命名、解压布局均与旧版一致）：
-#   java -jar dpt.jar -f <in.apk> -o <outdir> [-x] [-r <rules>] [-c <config>]
+#   java -jar dpt.jar -f <in.apk> -o <outdir> [-x] [-S/--smaller] [-r <rules>] [-c <config>]
+#   - PACKER_SMALLER=1(protect.sh --packer-smaller,体积优化) → 追加 --smaller
 #   - getExecutablePath() = jar 所在目录 → executable/shell-files/ 与
 #     executable/build-key 必须与 executable/dpt.jar 同级，解压布局不能改
 #   - 产物文件名 getNewFileName(x, "unsign") 模板为 `_<suffix>.<ext>`
@@ -93,11 +94,18 @@ mkdir -p "$DPT_OUT"
 
 log_info "加壳: $(basename "$IN_APK") （规则: 包内 dpt-exclude-classes-template.rules）"
 
+# 体积优化(报错四十三):PACKER_SMALLER=1(由 protect.sh 的 --packer-smaller 传入)
+# → 追加 dpt -S/--smaller(方法体填料改统一 0x0e(return-void),产物更小;
+#   填料混淆强度低于默认随机填料。dpt CLI: Const.OPTION_SMALLER="S"/"smaller")
+DPT_EXTRA_ARGS=()
+[[ "${PACKER_SMALLER:-0}" == "1" ]] && DPT_EXTRA_ARGS+=(--smaller)
+
 # dpt.jar 需在 executable/ 下运行才能找到 shell-files/ 与 build-key
 module_cd_run "$DPT_EXE_DIR" java -jar "$DPT_JAR" \
   -f "$IN_APK" \
   -o "$DPT_OUT" \
   -x \
+  ${DPT_EXTRA_ARGS[@]+"${DPT_EXTRA_ARGS[@]}"} \
   -r "$DPT_RULES"
 
 # ── 取产物 ──────────────────────────────────────────────────────────

@@ -34,17 +34,18 @@ echo "== packer.sh 产物提取链路冒烟 =="
 mkdir -p "$STUB_DIR/bin"
 cat > "$STUB_DIR/bin/java" <<'STUB'
 #!/usr/bin/env bash
-out=""; inp=""; rules=""; no_sign=0
+out=""; inp=""; rules=""; no_sign=0; smaller=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -f) inp="$2"; shift 2 ;;
     -r) rules="$2"; shift 2 ;;
     -x) no_sign=1; shift ;;
+    --smaller) smaller=1; shift ;;
     *) shift ;;
   esac
 done
-printf 'IN=%s\nRULES=%s\nNO_SIGN=%s\nCWD=%s\n' "$inp" "$rules" "$no_sign" "$PWD" > "$ARGS_FILE"
+printf 'IN=%s\nRULES=%s\nNO_SIGN=%s\nSMALLER=%s\nCWD=%s\n' "$inp" "$rules" "$no_sign" "$smaller" "$PWD" > "$ARGS_FILE"
 mkdir -p "$out"
 case "$STUB_MODE" in
   one)   : > "$out/com.test.app_unsign.apk" ;;
@@ -96,6 +97,17 @@ echo ""
 echo "" # 输入缺失
 run_stub one "$STUB_DIR/nope.apk" "$STUB_DIR/o.apk"; rc=$?
 check "⑫输入缺失 exit!=0" "$([[ $rc -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+
+echo "" # ⑫b(报错四十三)PACKER_SMALLER=1 → dpt 收到 --smaller(体积优化)
+PACKER_SMALLER=1 run_stub one "$STUB_DIR/in.apk" "$STUB_DIR/o.apk"
+check "⑫b PACKER_SMALLER=1 → dpt 收到 --smaller" \
+  "$(grep -qx 'SMALLER=1' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
+
+# ⑫c 未设置 PACKER_SMALLER → 不带 --smaller(直跑 packer.sh 保持旧行为)
+rm -f "$STUB_DIR/args.txt"
+run_stub one "$STUB_DIR/in.apk" "$STUB_DIR/o.apk"
+check "⑫c 未设置 PACKER_SMALLER → dpt 不带 --smaller" \
+  "$(grep -qx 'SMALLER=0' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
 
 echo ""
 echo "" # ⑬⑭ 编排：protect.sh 接受 --packer，占位报错已下线

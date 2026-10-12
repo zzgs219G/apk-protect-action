@@ -2,7 +2,7 @@
 # protect.sh — 唯一加固总控（勾选式合并版，取代旧三个 pipeline 总控 + run-modules.sh）
 #
 # 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dex2c [规则文件]]
-#           [--stringenc 规则文件] [--envcheck] [--packer] [--anti-diff]
+#           [--stringenc 规则文件] [--envcheck] [--packer] [--packer-smaller] [--anti-diff]
 #   - 输入/输出/规则路径一律 normalize 成绝对路径（报错三教训：dcc 运行时要切目录，
 #     相对输出路径会被写进 dcc 目录）
 #   - 主进程 cwd 全程不漂移：dcc.py 在子 shell 里运行（module_cd_run）
@@ -20,6 +20,7 @@
 #                          删 <clinit> 的 loadLibrary 会让 native 壳直接自爆）→ 回编
 #   --envcheck           → 环境检测(Frida/Xposed/调试器/libc内存CRC/常驻复查)并入 libnc.so(可与其余模块任意组合)
 #   --packer             → 基础加壳(dpt-shell)：必须最后跑，作用于回编并 zipalign
+#   --packer-smaller     → 随 --packer 的子选项(体积优化)：dpt --smaller，填料改统一 0x0e
 #                          之后的成品包；勾了加壳则跳过本脚本的 finish_apk，
 #                          由 packer.sh 的产物直接作为最终输出(加壳包不能二次 zipalign)
 #
@@ -66,6 +67,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
+PACKER_SMALLER=0   # 报错四十三:--packer-smaller(体积优化)→ 环境变量传 packer.sh
 WANT_STRINGENC=0; STRING_RULES=""
 WANT_ANTIDIFF=0
 while [[ $# -gt 0 ]]; do
@@ -83,6 +85,7 @@ while [[ $# -gt 0 ]]; do
                 fi ;;
     --envcheck) WANT_ENVCHECK=1; shift ;;
     --packer)   WANT_PACKER=1; shift ;;
+    --packer-smaller) WANT_PACKER=1; PACKER_SMALLER=1; shift ;;
     --anti-diff) WANT_ANTIDIFF=1; shift ;;
     *)          log_err "未知参数: $1"; usage ;;
   esac
@@ -325,7 +328,9 @@ if [[ $WANT_PACKER -eq 1 ]]; then
   log_step 6 6 "基础加壳（dpt-shell）"
   # packer.sh 产物直接作为最终输出：加壳包不能在本脚本再叠一次 finish_apk
   # （加壳已重写 dex/so/Manifest，二次 zipalign 属二次改写）
-  "$ROOT/scripts/packer/packer.sh" "$ALIGNED" "$OUT_APK"
+  # 体积优化(报错四十三):schema 子复选框 packer.smaller → dpt --smaller
+  # (方法体填料改统一 0x0e,产物更小);经环境变量传入,packer.sh 两参契约不变
+  PACKER_SMALLER="$PACKER_SMALLER" "$ROOT/scripts/packer/packer.sh" "$ALIGNED" "$OUT_APK"
   log_done "完成 ✅ 共 $TOTAL 个模块，产物: $OUT_APK（已加壳，未签名，开发者需自行 apksigner 重签）"
 else
   finish_apk "$WORK/unsigned.apk" "$OUT_APK"

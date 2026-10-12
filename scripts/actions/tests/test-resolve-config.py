@@ -124,6 +124,36 @@ rc, args, files, err = run({"schema_version": 1, "sigcheck": True})
 check("T6d config 缺 packer 键 → 视为 disabled(旧 App 向后兼容)",
       rc == 0 and args == ["--sigcheck"], f"rc={rc} args={args} err={err}")
 
+# T6e(报错四十三)packer 升 parent:子复选框 smaller(体积优化,默认 true)
+rc, args, files, err = run(cfg(packer={"enabled": True, "smaller": True}))
+check("T6e 勾 packer+smaller → --packer --packer-smaller",
+      rc == 0 and args == ["--packer", "--packer-smaller"], f"rc={rc} args={args} err={err}")
+
+# T6f 子键缺失 → 按 schema default(true)
+rc, args, files, err = run(cfg(packer={"enabled": True}))
+check("T6f 缺 smaller 子键 → 按 default(true) 吐 --packer-smaller",
+      rc == 0 and args == ["--packer", "--packer-smaller"], f"rc={rc} args={args} err={err}")
+
+# T6g 显式不勾 smaller → 只吐 --packer
+rc, args, files, err = run(cfg(packer={"enabled": True, "smaller": False}))
+check("T6g smaller=false → 仅 --packer", rc == 0 and args == ["--packer"],
+      f"rc={rc} args={args} err={err}")
+
+# T6h smaller 非布尔 → 报错退出(布尔校验)
+rc, args, files, err = run(cfg(packer={"enabled": True, "smaller": "yes"}))
+check("T6h smaller 非布尔 → 报错退出", rc != 0 and "布尔" in err, f"rc={rc} err={err}")
+
+# T6i parent 整体不勾 → 子字段无效;无任何模块启用时走保险丝 e fail-fast
+rc, args, files, err = run(cfg(packer={"enabled": False, "smaller": True}))
+check("T6i packer 不勾 → 子字段无效,无启用模块走保险丝 e",
+      rc != 0 and "没有任何加固模块被启用" in err, f"rc={rc} err={err}")
+
+# T6j 旧版 App 快照顶层 bool 形态(packer: true)→ 兼容,子字段不参与(旧行为保持,
+# 不吐 --packer-smaller——旧快照提交时无此概念,不引入行为漂移)
+rc, args, files, err = run(cfg(packer=True))
+check("T6j 旧 bool 快照 → 仅 --packer(旧行为,不默认叠加子选项)",
+      rc == 0 and args == ["--packer"], f"rc={rc} args={args} err={err}")
+
 # T7（§10.1 反向）
 rc, args, files, err = run(cfg(unknown_mod=True))
 check("T7 未知顶层 key → 报错退出（保险丝 a）", rc != 0 and "未定义" in err, f"rc={rc} err={err}")
