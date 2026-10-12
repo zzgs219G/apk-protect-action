@@ -30,6 +30,12 @@ public final class Guard {
 
     public static void c(Context ctx) {
         try {
+            /* 报错四十二:so 加载必须是第一步——它排在测量链之后时,测量抛
+               任何非 ULE 异常都会走 catch(Throwable) 静默跳过,ensureLoaded
+               永不执行 → so 永不加载 → sig_check.c constructor 永不运行,
+               两层防线静默全灭(真机实证:删净 so 自带 loadLibrary 注入点后
+               换 key 重签不杀)。先加载后测量,so 层校验不再受测量摆布。 */
+            NcLink.ensureLoaded();
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             PackageManager pm = ctx.getPackageManager();
             String pkg = ctx.getPackageName();
@@ -45,7 +51,6 @@ public final class Guard {
             }
             byte[] fp = md.digest(der);   /* SHA256(certDER) */
             byte[] t1 = md.digest(fp);    /* SHA256(fp) —— 送 so 判决的只有它 */
-            NcLink.ensureLoaded();
             boolean ok = NcLink.ncVerify(t1);
             if (!ok) {
                 kill();
@@ -53,7 +58,7 @@ public final class Guard {
         } catch (UnsatisfiedLinkError e) {
             kill();
         } catch (Throwable e) {
-            /* 静默跳过 */
+            /* 静默跳过(仅损失 Java 判决;so 已加载,constructor 校验照跑) */
         }
     }
 

@@ -254,6 +254,7 @@ def render_guard(wrapper_desc):
     .catch Ljava/lang/Throwable; {{:try_start_0 .. :try_end_0}} :catch_skip
 
     :try_start_0
+    invoke-static {{}}, {BRIDGE_DESC}->ensureLoaded()V
     const-string v0, "SHA-256"
     invoke-static {{v0}}, Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;
     move-result-object v1
@@ -285,7 +286,6 @@ def render_guard(wrapper_desc):
     move-result-object v4
     invoke-virtual {{v1, v4}}, Ljava/security/MessageDigest;->digest([B)[B
     move-result-object v4
-    invoke-static {{}}, {BRIDGE_DESC}->ensureLoaded()V
     invoke-static {{v4}}, {BRIDGE_DESC}->ncVerify([B)Z
     move-result v4
     if-eqz v4, :cond_kill

@@ -177,6 +177,14 @@ check(not has_call('Lcom/test/jc/Big;', 'onCreate'), 'Big 寄存器不安全却�
 gcode = gmethods['c(Landroid/content/Context;)V'].get_code()
 tries = gcode.get_tries() if hasattr(gcode, 'get_tries') else []
 check(len(tries) >= 1, 'Guard.c 缺 try/catch(UnsatisfiedLinkError fail-closed 依赖它)')
+# 报错四十二:ensureLoaded 必须是 Guard.c 的第一条调用——so 加载先于测量。
+# 旧版它排在测量链末尾:测量抛任何非 ULE Throwable → catch_skip 静默返回
+# → ensureLoaded 永不执行 → so 永不加载 → constructor 永不跑,两层防线
+# 静默全灭(真机实证:删净 so 自带 loadLibrary 注入点后换 key 不杀)。
+first_invoke = next((i.get_output() for i in gcode.get_bc().get_instructions()
+                     if i.get_name().startswith('invoke-')), None)
+check(first_invoke is not None and 'ensureLoaded' in first_invoke,
+      f'Guard.c 第一条调用不是 ensureLoaded(报错四十二): {first_invoke}')
 if fails:
     print('\n'.join('❌ ' + f for f in fails)); sys.exit(1)
 print('  ✅ 读回断言全部通过')
