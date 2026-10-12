@@ -591,4 +591,50 @@ assert moved > 0, '置换不再改动真实操作数(过度收紧)'
 print(f'  报错四十回归 ✅ (引用名/字符串零改写,操作数置换不回归,{ran} 个种子)')
 PY
 
+# ── 断言 8d:报错四十一回归——类描述符包段(org/xmlpull/v1/)不得被改写 ──
+# 真机实锤(crash.log 附前后 smali):`check-cast v0, Lorg/xmlpull/v1/
+# XmlPullParser;` 的包段 v1(前邻 '/',不在 lookbehind 排除集)被当寄存器
+# 改成 v0 → ClassNotFoundException: org.xmlpull.v0.XmlPullParser →
+# Compose 首帧 NoClassDefFoundError。该行无 -> 无 "(报错四十锚点双缺),
+# 同方法的 invoke 行因含 -> 幸存 → 保护不一致。修法:字符串与类型描述符
+# (L...;/[L...;)整体掩码后再替换,掩码后残留 [vp]\d+ 全是真寄存器。
+python3 - "$HERE/../anti-diff.py" <<'PY'
+import importlib.util, sys, random
+spec = importlib.util.spec_from_file_location('ad', sys.argv[1])
+ad = importlib.util.module_from_spec(spec); spec.loader.exec_module(ad)
+
+# 崩溃方法 wd.c 的流水线输入形态(.registers 6 == .locals 1,5 参数槽,
+# C0 合法提升 1→4 → 寄存器 6→9,与 crash.log 处理后 .registers 9 一致)
+body = ['    .locals 1',
+        '    iget-object v0, p0, Lwd;->d:Ljava/lang/Object;',
+        '    check-cast v0, Lorg/xmlpull/v1/XmlPullParser;',
+        '    invoke-static {v0, p2}, Lx14;->k(Lorg/xmlpull/v1/XmlPullParser;Ljava/lang/String;)Z',
+        '    move-result p2',
+        '    if-nez p2, :cond_b',
+        '    goto :goto_f',
+        '    :cond_b',
+        '    invoke-virtual {p1, p3, p4}, Landroid/content/res/TypedArray;->getFloat(IF)F',
+        '    move-result p4',
+        '    :goto_f',
+        '    return p4']
+# ① 收集器/解析器:描述符内的伪 token 不得混入
+assert ad._operand_regs('    check-cast v0, Lorg/xmlpull/v1/XmlPullParser;') == [0], \
+    '描述符包段 v1 混入操作数解析(报错四十一)'
+assert ad._operand_regs('    new-array v2, v1, [Lorg/xmlpull/v1/X;') == [2, 1], \
+    '数组描述符 [L...; 形态漏掩码(报错四十一)'
+# ② 黑盒:C0 提升 + D 置换全链,5000 种子描述符逐处完好
+ran = 0
+for seed in range(5000):
+    b1, _ = ad._bump_locals(list(body), '(Landroid/content/res/TypedArray;Ljava/lang/String;IF)F')
+    out, ch = ad._permute_registers(list(b1), random.Random(seed))
+    if not ch:
+        continue
+    ran += 1
+    text = '\n'.join(out)
+    assert text.count('Lorg/xmlpull/v1/XmlPullParser;') == 2, \
+        f'seed={seed} 类描述符包段被改写(报错四十一)'
+assert ran > 0, '5000 个种子都没触发置换,测试无效'
+print(f'  报错四十一回归 ✅ (类描述符包段零改写,C0+D 全链,{ran} 个种子)')
+PY
+
 echo '✅ 冒烟测试全部通过'

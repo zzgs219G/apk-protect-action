@@ -928,6 +928,34 @@ def _wide_operand_bases(name, regs):
 _REG_TOKEN_RE = re.compile(r'(?<![\w.$-])([vp]\d+)(?![\w.$-])')
 # 范围形态 {v1 .. v4} 的端点(换算后仍是连续区间,直接替换端点即可)
 _RANGE_REG_RE = re.compile(r'(\{[^}]*\})')
+# 字符串字面量与类型描述符整体掩码(报错四十一):
+#   - 字符串:支持 \" 转义(报错二十二式教训)
+#   - 描述符:可选 [ 前缀 + L...;(类描述符内部无空格/引号/分号,
+#     baksmali 方法参数表里的空格在描述符之间,不破坏单个描述符匹配)
+# 描述符的包段可恰似寄存器 token(org/xmlpull/v1/ 的 v1 曾被改成 v0 →
+# ClassNotFoundException),字符串内亦然(报错四十)。掩码后行内残留的
+# [vp]\d+ 全部是真寄存器。
+_MASK_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\[?L[^;"\s]*;')
+
+
+def _mask_refs(s):
+    """把字符串字面量与类型描述符掩码为 \\x00N\\x00 占位符。
+
+    返回 (masked, parts);parts 按占位符序号还原。占位符不含 [vp] 前缀,
+    寄存器正则天然不命中;\\x00 自定界,序号 1 与 10/11 不会互相误吞。"""
+    parts = []
+
+    def _m(mm):
+        parts.append(mm.group(0))
+        return f'\x00{len(parts) - 1}\x00'
+
+    return _MASK_RE.sub(_m, s), parts
+
+
+def _unmask_refs(s, parts):
+    for i, part in enumerate(parts):
+        s = s.replace(f'\x00{i}\x00', part)
+    return s
 
 
 def _collect_wide_pairs(method_lines):
@@ -981,10 +1009,12 @@ def _operand_regs(s):
       `shr-long v2, p5, v4` → [2, None, 4]   dst=2 宽 / src 不可见 / 移位量=4 不登记
       `shl-long p5, v4, v2` → [None, 4, 2]   src=4 宽登记 / 移位量=2 不登记
     None 统一在 _wide_operand_bases 末尾过滤。
-    解析范围截到首个 `, L`(字段/方法描述符)为止——寄存器永远在描述符
-    之前,防止字段名恰为 p1/v1 之类的罕见形态混进操作数位。"""
-    cut = s.find(', L')
-    head = s if cut < 0 else s[:cut]
+    报错四十一:先经 _mask_refs 掩码字符串与类型描述符(包段可恰似寄存器
+    token,org/xmlpull/v1/ 的 v1 曾被当寄存器),再截到 '->'(方法/字段名
+    不可见)后解析;替代旧 `, L` 截断——它漏掉 `[L...;` 数组描述符形态。"""
+    masked, _parts = _mask_refs(s)
+    cut = masked.find('->')
+    head = masked if cut < 0 else masked[:cut]
     out = []
     for m in re.finditer(r'\b([vp])(\d+)\b', head):
         out.append(int(m.group(2)) if m.group(1) == 'v' else None)
@@ -1205,23 +1235,18 @@ def _permute_registers(method_lines, rng):
             new = mapping.get(num)
             return f'v{new}' if new is not None else tok
 
-        # 报错四十(2026-10-12 crash.log):此前整行替换,把 R8 混淆短名
-        # 恰似寄存器 token 的方法/字段引用(如 `Ly00;->v2(`、`->v2:`)当
-        # 寄存器改写 → NoSuchMethodError(No virtual method v2... in y00,
-        # 后台 Dispatcher 线程触发);同形态也改写了字符串里的 "vN",破坏
-        # "字符串内容不可变"红线。实测 3000 种子 84% 产出此类损坏。
-        # 合法 smali 中寄存器只出现在操作数前段——`->`(方法/字段/注解
-        # 引用箭头)与 `"`(字符串字面量)之后不可能再有寄存器,替换范围
-        # 截到两者最先出现处即天然免疫,真实操作数(含 /range 端点、
-        # .local 调试行的寄存器号)不受影响。
-        q = ln.find('"')
-        a = ln.find('->')
-        cut = len(ln)
-        if q >= 0:
-            cut = min(cut, q)
-        if a >= 0:
-            cut = min(cut, a)
-        out.append(_REG_TOKEN_RE.sub(_sub, ln[:cut]) + ln[cut:])
+        # 报错四十/四十一:寄存器 token 只存在于指令操作数段。字符串字面量
+        # 与类型描述符整体掩码(描述符包段可恰似寄存器——org/xmlpull/v1/
+        # 的 v1 曾被改成 v0 → ClassNotFoundException,且报错四十的 '->'
+        # 截断造成保护不一致:同方法内 check-cast 的描述符被改、invoke 的
+        # 描述符幸存);掩码后行内残留 [vp]\d+ 全是真寄存器;'->'(方法/
+        # 字段名)之后的尾部原样保留(R8 短名曾当寄存器改写 →
+        # NoSuchMethodError)。
+        masked, parts = _mask_refs(ln)
+        a = masked.find('->')
+        cut = len(masked) if a < 0 else a
+        out.append(_unmask_refs(
+            _REG_TOKEN_RE.sub(_sub, masked[:cut]) + masked[cut:], parts))
     return out, True
 
 
