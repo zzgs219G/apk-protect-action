@@ -187,6 +187,30 @@ for m in modules:
                 argv_out.append(arg_on)
             continue
 
+        # 带值参数标准件（报错四十四）：value_kind=arg_value → 勾选时向 argv
+        # 追加两行（arg_on 一行、arg_value 一行），保持「一行一 token」契约
+        # （mapfile/argv 形状正确，§10.2）。未勾选/缺失按 default 不追加；
+        # 布尔校验同 flag。arg_value 是 schema 静态值：必须无空白（单 token，
+        # 逗号合法——dpt --exclude-abi 逗号分隔），照例字符集白名单校验。
+        if value_kind == "arg_value":
+            value = cfg_node.get(ckey, c.get("default", False))
+            if not isinstance(value, bool):
+                die(f"模块 {key}.{ckey} 的值必须是布尔，实际 {value!r}")
+            if not value:
+                continue
+            arg_on = c.get("arg_on", "")
+            if not ARG_RE.fullmatch(arg_on):
+                die(f"模块 {key}.{ckey} 的 arg_on 非法: {arg_on!r}（须匹配 --xxx[-yyy]）")
+            arg_value = c.get("arg_value", "")
+            if not arg_value or re.search(r"\s", arg_value):
+                die(f"模块 {key}.{ckey} 的 arg_value 必须是无空白的单 token: {arg_value!r}")
+            if not re.fullmatch(r"[A-Za-z0-9_,.\-]+", arg_value):
+                die(f"模块 {key}.{ckey} 的 arg_value 含非法字符: {arg_value!r}")
+            if arg_on not in argv_out:      # 去重追加
+                argv_out.append(arg_on)
+            argv_out.append(arg_value)
+            continue
+
         # 保险丝 c：未知 value_kind → 报错退出
         if value_kind != "rules_file":
             die(f"模块 {key}.{ckey} 的 value_kind 未知: {value_kind!r}（两端需同步支持）")

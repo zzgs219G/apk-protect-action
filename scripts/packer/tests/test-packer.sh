@@ -124,6 +124,21 @@ check "⑫e 双源合并 → --smaller 出现两次 + 自由文本在位" \
     [[ $(grep -o -- '--smaller' "$STUB_DIR/args.txt" | wc -l) -ge 2 ]] && \
     grep -q -- '--use-inmemory-dex' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
 
+# ⑫f(报错四十四)第三源:EXCLUDE_ABI → dpt 收到 --exclude-abi <值>
+rm -f "$STUB_DIR/args.txt"
+EXCLUDE_ABI="x86,x86_64" run_stub one "$STUB_DIR/in.apk" "$STUB_DIR/o.apk"
+check "⑫f EXCLUDE_ABI → dpt 收到 --exclude-abi x86,x86_64" \
+  "$(grep -q -- '--exclude-abi x86,x86_64' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
+
+# ⑫g 三源合并:专线 smaller + exclude + 通用自由文本共存
+rm -f "$STUB_DIR/args.txt"
+PACKER_SMALLER=1 EXCLUDE_ABI="x86,x86_64" DPT_EXTRA_ARGS="--use-inmemory-dex" \
+  run_stub one "$STUB_DIR/in.apk" "$STUB_DIR/o.apk"
+check "⑫g 三源合并 → smaller/exclude/自由文本全部在位" \
+  "$(grep -q 'SMALLER=1' "$STUB_DIR/args.txt" && \
+    grep -q -- '--exclude-abi x86,x86_64' "$STUB_DIR/args.txt" && \
+    grep -q -- '--use-inmemory-dex' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
+
 echo ""
 echo "" # ⑬⑭ 编排：protect.sh 接受 --packer，占位报错已下线
 : > "$STUB_DIR/pin.txt"

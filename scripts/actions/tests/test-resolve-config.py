@@ -154,6 +154,26 @@ rc, args, files, err = run(cfg(packer=True))
 check("T6j 旧 bool 快照 → 仅 --packer(旧行为,不默认叠加子选项)",
       rc == 0 and args == ["--packer"], f"rc={rc} args={args} err={err}")
 
+# T6k(报错四十四)带值参数标准件:勾 exclude_x86 → arg_on 与 arg_value 各占一行
+rc, args, files, err = run(cfg(packer={"enabled": True, "smaller": True, "exclude_x86": True}))
+check("T6k 勾 exclude_x86 → --packer --packer-smaller --exclude-abi x86,x86_64",
+      rc == 0 and args == ["--packer", "--packer-smaller", "--exclude-abi", "x86,x86_64"],
+      f"rc={rc} args={args} err={err}")
+
+# T6l exclude_x86 缺失 → 按 schema default(false) 不追加
+rc, args, files, err = run(cfg(packer={"enabled": True, "smaller": True}))
+check("T6l 缺 exclude_x86 子键 → default(false) 不追加",
+      rc == 0 and args == ["--packer", "--packer-smaller"], f"rc={rc} args={args} err={err}")
+
+# T6m 显式不勾 → 不追加
+rc, args, files, err = run(cfg(packer={"enabled": True, "exclude_x86": False}))
+check("T6m exclude_x86=false → 仅体积优化线",
+      rc == 0 and args == ["--packer", "--packer-smaller"], f"rc={rc} args={args} err={err}")
+
+# T6n exclude_x86 非布尔 → 报错退出(布尔校验同 flag)
+rc, args, files, err = run(cfg(packer={"enabled": True, "exclude_x86": "yes"}))
+check("T6n exclude_x86 非布尔 → 报错退出", rc != 0 and "布尔" in err, f"rc={rc} err={err}")
+
 # T7（§10.1 反向）
 rc, args, files, err = run(cfg(unknown_mod=True))
 check("T7 未知顶层 key → 报错退出（保险丝 a）", rc != 0 and "未定义" in err, f"rc={rc} err={err}")

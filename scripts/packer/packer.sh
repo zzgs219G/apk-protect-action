@@ -16,6 +16,7 @@
 #   java -jar dpt.jar -f <in.apk> -o <outdir> [-x] [-S/--smaller] [-r <rules>] [-c <config>]
 #   - PACKER_SMALLER=1(protect.sh --packer-smaller,体积优化) → 追加 --smaller
 #   - 环境变量 DPT_EXTRA_ARGS(protect.sh --dpt-extra-args) → 自由文本按空格分词追加
+#   - 环境变量 EXCLUDE_ABI(protect.sh --exclude-abi) → 追加 --exclude-abi <值>(报错四十四)
 #   - getExecutablePath() = jar 所在目录 → executable/shell-files/ 与
 #     executable/build-key 必须与 executable/dpt.jar 同级，解压布局不能改
 #   - 产物文件名 getNewFileName(x, "unsign") 模板为 `_<suffix>.<ext>`
@@ -104,6 +105,9 @@ log_info "加壳: $(basename "$IN_APK") （规则: 包内 dpt-exclude-classes-te
 dpt_extra_from_env="${DPT_EXTRA_ARGS:-}"
 DPT_EXTRA_ARGS=()
 [[ "${PACKER_SMALLER:-0}" == "1" ]] && DPT_EXTRA_ARGS+=(--smaller)
+# 源3 带值参数标准件(报错四十四):EXCLUDE_ABI(protect.sh --exclude-abi)
+# → --exclude-abi <值>,剔除 ABI 的 so 目录(如 x86,x86_64 = 只留 arm/arm64)
+[[ -n "${EXCLUDE_ABI:-}" ]] && DPT_EXTRA_ARGS+=(--exclude-abi "$EXCLUDE_ABI")
 if [[ -n "$dpt_extra_from_env" ]]; then
   read -ra _dpt_extra_words <<< "$dpt_extra_from_env"
   DPT_EXTRA_ARGS+=("${_dpt_extra_words[@]}")

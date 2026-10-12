@@ -22,6 +22,7 @@
 #   --packer             → 基础加壳(dpt-shell)：必须最后跑，作用于回编并 zipalign
 #   --packer-smaller     → 随 --packer 的子选项(体积优化)：dpt --smaller，填料改统一 0x0e
 #   --dpt-extra-args 文本 → 通用 dpt 参数通道(空格分隔,随加壳生效;只构成打包参数注入面)
+#   --exclude-abi 值      → 带值参数标准件(报错四十四):剔除 ABI 的 so 目录,经环境变量传 packer.sh
 #                          之后的成品包；勾了加壳则跳过本脚本的 finish_apk，
 #                          由 packer.sh 的产物直接作为最终输出(加壳包不能二次 zipalign)
 #
@@ -70,6 +71,7 @@ trap 'rm -rf "$WORK"' EXIT
 WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 PACKER_SMALLER=0   # 报错四十三:--packer-smaller(体积优化)→ 环境变量传 packer.sh
 DPT_EXTRA_ARGS_TEXT=""  # 通用 dpt 参数通道(报错四十三后方向调整):自由文本,空格分隔
+EXCLUDE_ABI=""          # 带值参数标准件(报错四十四):--exclude-abi 的值,经环境变量传 packer.sh
 WANT_STRINGENC=0; STRING_RULES=""
 WANT_ANTIDIFF=0
 while [[ $# -gt 0 ]]; do
@@ -88,6 +90,15 @@ while [[ $# -gt 0 ]]; do
     --envcheck) WANT_ENVCHECK=1; shift ;;
     --packer)   WANT_PACKER=1; shift ;;
     --packer-smaller) WANT_PACKER=1; PACKER_SMALLER=1; shift ;;
+    --exclude-abi)
+      # 带值参数标准件(报错四十四):schema arg_value 子项的值(x86,x86_64),
+      # 单 token 无空白(resolver 已校验,此处防御性再验)。经环境变量传 packer.sh。
+      if [[ $# -ge 2 ]]; then
+        EXCLUDE_ABI="$2"; shift 2
+        [[ "$EXCLUDE_ABI" =~ ^[A-Za-z0-9_,.\-]+$ ]] || { log_err "--exclude-abi 值非法: $EXCLUDE_ABI"; exit 1; }
+      else
+        log_err "--exclude-abi 缺值"; exit 1
+      fi ;;
     --dpt-extra-args)
       # 通用 dpt 参数通道:值无条件取下一 token(dpt 参数本身合法地以 -- 开头,
       # 不能套 --stringenc 的 "$1" != --* 守卫);缺值视为空(不附加)。
@@ -340,6 +351,7 @@ if [[ $WANT_PACKER -eq 1 ]]; then
   # (方法体填料改统一 0x0e,产物更小);经环境变量传入,packer.sh 两参契约不变
   # 通用通道:--dpt-extra-args 自由文本同经环境变量 DPT_EXTRA_ARGS 传入
   PACKER_SMALLER="$PACKER_SMALLER" DPT_EXTRA_ARGS="$DPT_EXTRA_ARGS_TEXT" \
+    EXCLUDE_ABI="$EXCLUDE_ABI" \
     "$ROOT/scripts/packer/packer.sh" "$ALIGNED" "$OUT_APK"
   log_done "完成 ✅ 共 $TOTAL 个模块，产物: $OUT_APK（已加壳，未签名，开发者需自行 apksigner 重签）"
 else

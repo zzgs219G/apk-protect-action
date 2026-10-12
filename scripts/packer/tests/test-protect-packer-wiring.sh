@@ -28,6 +28,7 @@ printf '%s\n' "$1" > "$PACKER_IN_FILE"
 printf '%s\n' "$2" > "$PACKER_OUT_FILE"
 printf '%s\n' "${PACKER_SMALLER:-unset}" > "$PACKER_ENV_FILE"
 printf '%s\n' "${DPT_EXTRA_ARGS:-unset}" > "$PACKER_XARGS_FILE"
+printf '%s\n' "${EXCLUDE_ABI:-unset}" > "$PACKER_ABI_FILE"
 # 落一个有辨识度的标记：若 protect.sh 在加壳后又对 OUT 跑了一次 finish_apk，
 # 这个标记会被 zipalign 覆盖掉，断言 ④ 就能抓到"二次 finish_apk"。
 printf 'PACKER_OUTPUT_MARKER' > "$2"
@@ -123,6 +124,16 @@ PATH="$STUB_DIR/bin:$PATH" bash "$PROTECT" "$STUB_DIR/in.apk" "$STUB_DIR/out4.ap
   --anti-diff --packer --dpt-extra-args "--use-inmemory-dex -K" >"$STUB_DIR/log4.txt" 2>&1
 check "④d --dpt-extra-args 自由文本 → packer.sh 收到完整文本(报错四十三通用通道)" \
   "$(cat "$STUB_DIR/pxargs.txt" 2>/dev/null)" "--use-inmemory-dex -K"
+
+echo ""
+echo "" # ④e(报错四十四)带值参数标准件:--exclude-abi 值 → packer.sh 收到环境变量
+rm -f "$STUB_DIR/pxabi.txt"
+PACKER_ENV_FILE="$STUB_DIR/penv.txt" PACKER_XARGS_FILE="$STUB_DIR/pxargs.txt" \
+PACKER_ABI_FILE="$STUB_DIR/pxabi.txt" \
+PATH="$STUB_DIR/bin:$PATH" bash "$PROTECT" "$STUB_DIR/in.apk" "$STUB_DIR/out5.apk" \
+  --anti-diff --packer --exclude-abi x86,x86_64 >"$STUB_DIR/log5.txt" 2>&1
+check "④e --exclude-abi 值 → packer.sh 收到 EXCLUDE_ABI(报错四十四)" \
+  "$(cat "$STUB_DIR/pxabi.txt" 2>/dev/null)" "x86,x86_64"
 
 echo ""
 echo "" # ⑤⑥ 不勾加壳：packer 不应被调用
