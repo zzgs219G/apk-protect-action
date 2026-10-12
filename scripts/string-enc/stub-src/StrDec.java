@@ -45,6 +45,23 @@ public final class StrDec {
     /** 全包密钥种子,构建期由 encrypt-strings.py 按结构改写本行初值(8 字节随机)。 */
     private static final long SEED = 0L; /*%SEED_LITERAL%*/
 
+    /** 解密结果缓存(《字符串架构优化.md》L1):key=密文 payload,value=明文。
+     *  命中 ~50-100ns 且零分配,并恢复原生 const-string 的 intern 语义——
+     *  Compose 启动/重组会反复执行同一使用点(实测均值 ~20 次),无缓存时
+     *  5,526 位点 × ~20 次 × 1-3μs ≈ 200ms 冷启动税,命中后归零。
+     *  历史警示:v1 的卡死元凶是"每条 SHA-256 派生"(微秒×万条),不是查表本身;
+     *  S2 已把首次解密降到纳秒级现算,首次成本 = Base64+XOR,缓存重新变得安全。
+     *  【为何用 raw 类型】泛型字段会让 javac 产出 .annotation Signature 块,
+     *  其内容行撞桩骨架"类体顶层裸指令"守卫(报错二十五防线);泛型在此处
+     *  无运行期价值,raw 化是零成本解。
+     */
+    @SuppressWarnings("unchecked")
+    private static final java.util.concurrent.ConcurrentHashMap CACHE
+            = new java.util.concurrent.ConcurrentHashMap();
+
+    /** 缓存上限(防极端:正常全包 ~5,526 条 ≈ 1-2MB;超限不再新增,已缓存的仍命中)。 */
+    private static final int CACHE_CAP = 30000;
+
     private StrDec() {}
 
     /** splitmix64 终混合。Java long 溢出即 mod 2^64,与 Python 的 & MASK64 天然对齐。 */
@@ -60,9 +77,16 @@ public final class StrDec {
         return (int) ((w >>> ((i & 7L) * 8)) & 0xFFL);
     }
 
-    /** 解密:payload = Base64( offset_be24 || cipher )。失败时原样返回(与 v1 兜底一致)。 */
+    /** 解密:payload = Base64( offset_be24 || cipher )。失败时原样返回(与 v1 兜底一致)。
+     *  L1:先查缓存(命中零分配);仅成功结果进缓存,失败结果不缓存(避免毒缓存)。
+     *  缓存读写整体在 try 内:报错二十二守卫禁止向参数寄存器写常量,故不做
+     *  null 特判(null/坏密文的 NPE 自然落 catch → 原样返回,语义与旧版一致)。 */
     public static String d(String payload) {
         try {
+            String hit = (String) CACHE.get(payload);
+            if (hit != null) {
+                return hit;
+            }
             byte[] raw = android.util.Base64.decode(payload, android.util.Base64.NO_WRAP);
             if (raw.length < 4) {
                 return payload;
@@ -94,9 +118,15 @@ public final class StrDec {
                     out[k] = (byte) ((raw[k + 3] & 0xFF) ^ (kb & 0xFF));
                 }
             }
-            return new String(out, "UTF-8");
+            String decrypted = new String(out, "UTF-8");
+            if (CACHE.size() < CACHE_CAP) {   // 上限守卫:racy 检查,极端并发下略超无害
+                CACHE.put(payload, decrypted);
+            }
+            return decrypted;
         } catch (Throwable t) {
-            // 兜底与 v1 一致:解密失败原样返回,绝不让字符串解密把业务炸掉
+            // 兜底与 v1 一致:解密失败原样返回,绝不让字符串解密把业务炸掉。
+            // 注意:失败结果不进缓存(L1 设计边界,§3.2)——原样返回的 payload
+            // 可能是坏密文,缓存它等于把毒缓存住。
             return payload;
         }
     }

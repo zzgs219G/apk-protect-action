@@ -3,12 +3,28 @@
 
 
 # static fields
+.field private static final CACHE:Ljava/util/concurrent/ConcurrentHashMap;
+
+.field private static final CACHE_CAP:I = 0x7530
+
 .field private static final GAMMA:J = -0x61c8864680b583ebL
 
 .field private static final SEED:J = 0x5eed000000000000L
 
 
 # direct methods
+.method static constructor <clinit>()V
+    .locals 1
+
+    new-instance v0, Ljava/util/concurrent/ConcurrentHashMap;
+
+    invoke-direct {v0}, Ljava/util/concurrent/ConcurrentHashMap;-><init>()V
+
+    sput-object v0, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
+
+    return-void
+.end method
+
 .method private constructor <init>()V
     .locals 0
 
@@ -20,9 +36,22 @@
 .method public static d(Ljava/lang/String;)Ljava/lang/String;
     .locals 14
 
+    :try_start_0
+    sget-object v0, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
+
+    invoke-virtual {v0, p0}, Ljava/util/concurrent/ConcurrentHashMap;->get(Ljava/lang/Object;)Ljava/lang/Object;
+
+    move-result-object v0
+
+    check-cast v0, Ljava/lang/String;
+
+    if-eqz v0, :cond_0
+
+    return-object v0
+
+    :cond_0
     const/4 v0, 0x2
 
-    :try_start_0
     invoke-static {p0, v0}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B
 
     move-result-object v1
@@ -31,11 +60,11 @@
 
     const/4 v3, 0x4
 
-    if-ge v2, v3, :cond_0
+    if-ge v2, v3, :cond_1
 
     goto :goto_1
 
-    :cond_0
+    :cond_1
     const/4 v2, 0x0
 
     aget-byte v3, v1, v2
@@ -78,8 +107,8 @@
 
     new-array v6, v0, [B
 
-    :cond_1
-    if-ge v2, v0, :cond_2
+    :cond_2
+    if-ge v2, v0, :cond_3
 
     int-to-long v8, v2
 
@@ -106,9 +135,9 @@
     long-to-int v8, v8
 
     :goto_0
-    if-ge v8, v7, :cond_1
+    if-ge v8, v7, :cond_2
 
-    if-ge v2, v0, :cond_1
+    if-ge v2, v0, :cond_2
 
     mul-int/lit8 v9, v8, 0x8
 
@@ -136,15 +165,28 @@
 
     goto :goto_0
 
-    :cond_2
+    :cond_3
     new-instance v0, Ljava/lang/String;
 
     const-string v1, "UTF-8"
 
     invoke-direct {v0, v6, v1}, Ljava/lang/String;-><init>([BLjava/lang/String;)V
+
+    sget-object v1, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
+
+    invoke-virtual {v1}, Ljava/util/concurrent/ConcurrentHashMap;->size()I
+
+    move-result v2
+
+    const/16 v3, 0x7530
+
+    if-ge v2, v3, :cond_4
+
+    invoke-virtual {v1, p0, v0}, Ljava/util/concurrent/ConcurrentHashMap;->put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
     :try_end_0
     .catchall {:try_start_0 .. :try_end_0} :catchall_0
 
+    :cond_4
     return-object v0
 
     :catchall_0

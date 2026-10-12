@@ -239,9 +239,14 @@ ALL="$WORK/all.smali"
 cat "$DEC"/smali/com/demo/*.smali > "$ALL"
 chk "无 FIELD 型 static_value(非法形态)" "! grep -qE '\.field[^\n]*=[ \t]*Lcom/nc/strdec/StrDec;->F' '$ALL'"
 chk "无 F000000 桩字段残留" "! grep -q 'F000000' '$ALL'"
-chk "桩密钥材料只有 SEED(其余字段均为算法常量)" \
+# 密钥材料不变量的精化(字符串架构优化 L1):安全关切 = SEED 之外不得有
+# 64 位密钥字面量(藏 key 的形态是 long 字段),故按 ":J = <字面量>" 判定;
+# CACHE(对象引用,无字面量)与 CACHE_CAP(I 调优常量)不是密钥材料,放行。
+chk "桩密钥材料只有 SEED(带 long 字面量的字段仅 SEED/GAMMA)" \
     "[ \"\$(grep -E '^[ \t]*\.field' '$STUB' | grep -c 'SEED:J')\" = 1 ] && \
-     [ \"\$(grep -E '^[ \t]*\.field' '$STUB' | grep -cvE '(SEED|GAMMA):J')\" = 0 ]"
+     [ \"\$(grep -E '^[ \t]*\.field' '$STUB' | grep -E ':J[ \t]*=' | grep -cvE '(SEED|GAMMA):J')\" = 0 ]"
+chk "桩含 L1 缓存字段(字符串架构优化 L1)" \
+    "grep -q 'CACHE:Ljava/util/concurrent/ConcurrentHashMap;' '$STUB'"
 chk "桩 SEED 为非 0 真种子" "grep -q \"SEED:J = 0x${SEED}L\" '$STUB'"
 chk "桩零哨兵残留" "! grep -qi '5eed' '$STUB'"
 chk "桩无占位符残留" "! grep -q '%' '$STUB'"
