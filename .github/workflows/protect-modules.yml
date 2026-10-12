@@ -19,6 +19,10 @@ on:
       protect_config:
         description: '加固配置JSON(schema驱动;结构见 configs/v1/config-schema.json)'
         required: true
+      dpt_extra_args:
+        description: '附加 dpt.jar 参数,空格分隔,如 --smaller(自由文本只构成打包参数注入面,最坏打包失败;secrets 不经此路径)'
+        required: false
+        default: 
 
 jobs:
   protect:
@@ -85,13 +89,17 @@ jobs:
       - name: 执行模块编排（固定顺序-签名校验-Dex2C-字符串加密-防对比混淆-环境检测-基础加壳）
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # 通用 dpt 参数通道(报错四十三后方向调整):env 中转防注入,与 protect_config 同款
+          INPUT_DPT_EXTRA_ARGS: ${{ inputs.dpt_extra_args }}
         run: |
           chmod +x scripts/pipelines/protect.sh
           # §10.2：读取时必须过滤空行（禁止直接 mapfile < args.txt）；
           # 一行一个参数 + "${ARGS[@]}" 引用展开，禁止空格分隔单行 + 无引号 $ARGS
           mapfile -t ARGS < <(grep -v '^$' schema_rules/args.txt)
+          EXTRA_ARGS=()
+          [[ -n "${INPUT_DPT_EXTRA_ARGS:-}" ]] && EXTRA_ARGS+=(--dpt-extra-args "$INPUT_DPT_EXTRA_ARGS")
           set -o pipefail
-          ./scripts/pipelines/protect.sh app.apk protected_unsigned.apk "${ARGS[@]}" 2>&1 | tee -a build.log
+          ./scripts/pipelines/protect.sh app.apk protected_unsigned.apk "${ARGS[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a build.log
 
       - name: 上传加固包到 R2
         id: upload-r2

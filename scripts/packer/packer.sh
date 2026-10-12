@@ -15,6 +15,7 @@
 # v1.0.0 换版时已逐项复核 -f/-o/-x/-r、产物命名、解压布局均与旧版一致）：
 #   java -jar dpt.jar -f <in.apk> -o <outdir> [-x] [-S/--smaller] [-r <rules>] [-c <config>]
 #   - PACKER_SMALLER=1(protect.sh --packer-smaller,体积优化) → 追加 --smaller
+#   - 环境变量 DPT_EXTRA_ARGS(protect.sh --dpt-extra-args) → 自由文本按空格分词追加
 #   - getExecutablePath() = jar 所在目录 → executable/shell-files/ 与
 #     executable/build-key 必须与 executable/dpt.jar 同级，解压布局不能改
 #   - 产物文件名 getNewFileName(x, "unsign") 模板为 `_<suffix>.<ext>`
@@ -94,11 +95,19 @@ mkdir -p "$DPT_OUT"
 
 log_info "加壳: $(basename "$IN_APK") （规则: 包内 dpt-exclude-classes-template.rules）"
 
-# 体积优化(报错四十三):PACKER_SMALLER=1(由 protect.sh 的 --packer-smaller 传入)
-# → 追加 dpt -S/--smaller(方法体填料改统一 0x0e(return-void),产物更小;
-#   填料混淆强度低于默认随机填料。dpt CLI: Const.OPTION_SMALLER="S"/"smaller")
+# 双源合并(报错四十三 + 通用通道):
+#   源1 专线:PACKER_SMALLER=1(protect.sh --packer-smaller,体积优化)→ --smaller
+#   源2 通用:环境变量 DPT_EXTRA_ARGS(protect.sh --dpt-extra-args 自由文本,空格分隔)
+# 注意:bash 里环境变量与数组同名会互覆,须先把字符串捕获进独立变量再声明数组。
+# 与专线重复(如勾了 smaller 又手填 --smaller)对 dpt 无害(hasOption 幂等),不去重。
+# 安全边界:自由文本只构成打包参数注入面,最坏打包失败;secrets 不经此路径。
+dpt_extra_from_env="${DPT_EXTRA_ARGS:-}"
 DPT_EXTRA_ARGS=()
 [[ "${PACKER_SMALLER:-0}" == "1" ]] && DPT_EXTRA_ARGS+=(--smaller)
+if [[ -n "$dpt_extra_from_env" ]]; then
+  read -ra _dpt_extra_words <<< "$dpt_extra_from_env"
+  DPT_EXTRA_ARGS+=("${_dpt_extra_words[@]}")
+fi
 
 # dpt.jar 需在 executable/ 下运行才能找到 shell-files/ 与 build-key
 module_cd_run "$DPT_EXE_DIR" java -jar "$DPT_JAR" \

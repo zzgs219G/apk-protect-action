@@ -27,6 +27,7 @@ cat > "$STUB_DIR/record-packer.sh" <<'STUB'
 printf '%s\n' "$1" > "$PACKER_IN_FILE"
 printf '%s\n' "$2" > "$PACKER_OUT_FILE"
 printf '%s\n' "${PACKER_SMALLER:-unset}" > "$PACKER_ENV_FILE"
+printf '%s\n' "${DPT_EXTRA_ARGS:-unset}" > "$PACKER_XARGS_FILE"
 # 落一个有辨识度的标记：若 protect.sh 在加壳后又对 OUT 跑了一次 finish_apk，
 # 这个标记会被 zipalign 覆盖掉，断言 ④ 就能抓到"二次 finish_apk"。
 printf 'PACKER_OUTPUT_MARKER' > "$2"
@@ -89,7 +90,7 @@ printf 'com.test.**\n' > "$STUB_DIR/rules.txt"
 
 echo ""
 echo "" # ① 占位报错已下线：--packer 能被解析
-PACKER_IN_FILE="$STUB_DIR/pin.txt" PACKER_OUT_FILE="$STUB_DIR/pout.txt" PACKER_ENV_FILE="$STUB_DIR/penv.txt" \
+PACKER_IN_FILE="$STUB_DIR/pin.txt" PACKER_OUT_FILE="$STUB_DIR/pout.txt" PACKER_ENV_FILE="$STUB_DIR/penv.txt" PACKER_XARGS_FILE="$STUB_DIR/pxargs.txt" \
 PATH="$STUB_DIR/bin:$PATH" bash "$PROTECT" "$STUB_DIR/in.apk" "$STUB_DIR/out1.apk" \
   --anti-diff --packer >"$STUB_DIR/log1.txt" 2>&1
 rc=$?
@@ -108,11 +109,20 @@ check "④b未传 --packer-smaller → PACKER_SMALLER=0(显式关,报错四十�
 echo ""
 echo "" # ④c 勾 --packer-smaller:packer.sh 必须收到 PACKER_SMALLER=1
 rm -f "$STUB_DIR/penv.txt"
-PACKER_IN_FILE="$STUB_DIR/pin.txt" PACKER_OUT_FILE="$STUB_DIR/pout.txt" PACKER_ENV_FILE="$STUB_DIR/penv.txt" \
+PACKER_IN_FILE="$STUB_DIR/pin.txt" PACKER_OUT_FILE="$STUB_DIR/pout.txt" PACKER_ENV_FILE="$STUB_DIR/penv.txt" PACKER_XARGS_FILE="$STUB_DIR/pxargs.txt" \
 PATH="$STUB_DIR/bin:$PATH" bash "$PROTECT" "$STUB_DIR/in.apk" "$STUB_DIR/out3.apk" \
   --anti-diff --packer --packer-smaller >"$STUB_DIR/log3.txt" 2>&1
 check "④c传 --packer-smaller → packer.sh 收到 PACKER_SMALLER=1(报错四十三)" \
   "$(cat "$STUB_DIR/penv.txt" 2>/dev/null)" "1"
+
+echo ""
+echo "" # ④d(通用通道)--dpt-extra-args 自由文本 → packer.sh 收到完整环境变量
+rm -f "$STUB_DIR/pxargs.txt"
+PACKER_ENV_FILE="$STUB_DIR/penv.txt" PACKER_XARGS_FILE="$STUB_DIR/pxargs.txt" \
+PATH="$STUB_DIR/bin:$PATH" bash "$PROTECT" "$STUB_DIR/in.apk" "$STUB_DIR/out4.apk" \
+  --anti-diff --packer --dpt-extra-args "--use-inmemory-dex -K" >"$STUB_DIR/log4.txt" 2>&1
+check "④d --dpt-extra-args 自由文本 → packer.sh 收到完整文本(报错四十三通用通道)" \
+  "$(cat "$STUB_DIR/pxargs.txt" 2>/dev/null)" "--use-inmemory-dex -K"
 
 echo ""
 echo "" # ⑤⑥ 不勾加壳：packer 不应被调用

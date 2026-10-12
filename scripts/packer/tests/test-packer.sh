@@ -34,6 +34,7 @@ echo "== packer.sh 产物提取链路冒烟 =="
 mkdir -p "$STUB_DIR/bin"
 cat > "$STUB_DIR/bin/java" <<'STUB'
 #!/usr/bin/env bash
+raw_args="$*"          # 入口捕获(shift 会改 $*)
 out=""; inp=""; rules=""; no_sign=0; smaller=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,7 +46,7 @@ while [[ $# -gt 0 ]]; do
     *) shift ;;
   esac
 done
-printf 'IN=%s\nRULES=%s\nNO_SIGN=%s\nSMALLER=%s\nCWD=%s\n' "$inp" "$rules" "$no_sign" "$smaller" "$PWD" > "$ARGS_FILE"
+printf 'IN=%s\nRULES=%s\nNO_SIGN=%s\nSMALLER=%s\nCWD=%s\nRAW=%s\n' "$inp" "$rules" "$no_sign" "$smaller" "$PWD" "$raw_args" > "$ARGS_FILE"
 mkdir -p "$out"
 case "$STUB_MODE" in
   one)   : > "$out/com.test.app_unsign.apk" ;;
@@ -108,6 +109,20 @@ rm -f "$STUB_DIR/args.txt"
 run_stub one "$STUB_DIR/in.apk" "$STUB_DIR/o.apk"
 check "⑫c 未设置 PACKER_SMALLER → dpt 不带 --smaller" \
   "$(grep -qx 'SMALLER=0' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
+
+# ⑫d(通用通道)DPT_EXTRA_ARGS 自由文本 → 按空格分词追加进 dpt 命令行
+rm -f "$STUB_DIR/args.txt"
+DPT_EXTRA_ARGS="--use-inmemory-dex -K" run_stub one "$STUB_DIR/in.apk" "$STUB_DIR/o.apk"
+check "⑫d DPT_EXTRA_ARGS 两参数 → dpt 原样收到" \
+  "$(grep -q 'RAW=.*--use-inmemory-dex -K' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
+
+# ⑫e 双源合并:专线 smaller + 通用自由文本共存(重复对 dpt 无害)
+rm -f "$STUB_DIR/args.txt"
+PACKER_SMALLER=1 DPT_EXTRA_ARGS="--smaller --use-inmemory-dex" run_stub one "$STUB_DIR/in.apk" "$STUB_DIR/o.apk"
+check "⑫e 双源合并 → --smaller 出现两次 + 自由文本在位" \
+  "$(grep -q 'SMALLER=1' "$STUB_DIR/args.txt" && \
+    [[ $(grep -o -- '--smaller' "$STUB_DIR/args.txt" | wc -l) -ge 2 ]] && \
+    grep -q -- '--use-inmemory-dex' "$STUB_DIR/args.txt" && echo yes || echo no)" "yes"
 
 echo ""
 echo "" # ⑬⑭ 编排：protect.sh 接受 --packer，占位报错已下线

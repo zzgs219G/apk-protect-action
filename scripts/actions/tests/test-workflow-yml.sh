@@ -16,8 +16,11 @@ d = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
 # PyYAML 把裸 on 解析成布尔 True 键（YAML 1.1），两种键都接受
 trigger = d.get("on", d.get(True, {}))
 inputs = trigger["workflow_dispatch"]["inputs"]
-assert set(inputs) == {"apk_url", "protect_config"}, f"inputs 应只剩 apk_url+protect_config: {list(inputs)}"
+assert set(inputs) == {"apk_url", "protect_config", "dpt_extra_args"}, \
+    f"inputs 应为 apk_url+protect_config+dpt_extra_args: {list(inputs)}"
 assert inputs["protect_config"]["required"] is True
+assert inputs["dpt_extra_args"]["required"] is False, "dpt_extra_args 应可选(报错四十三通用通道)"
+assert "dpt.jar" in inputs["dpt_extra_args"]["description"], "dpt_extra_args 描述缺用途说明"
 steps = d["jobs"]["protect"]["steps"]
 names = [s.get("name", "") for s in steps]
 assert any("resolve-config.py" in (s.get("run") or "") for s in steps), "缺解析 step"
@@ -30,6 +33,8 @@ else
 fi
 
 grep -q 'INPUT_PROTECT_CONFIG: ${{ inputs.protect_config }}' "$YML" || { echo "❌ 缺 env 中转"; fail=1; }
+grep -q 'INPUT_DPT_EXTRA_ARGS: ${{ inputs.dpt_extra_args }}' "$YML" || { echo "❌ 缺 dpt_extra_args env 中转(报错四十三通用通道)"; fail=1; }
+grep -F -- '--dpt-extra-args' "$YML" >/dev/null || { echo "❌ 未向 protect.sh 传 --dpt-extra-args"; fail=1; }
 grep -q 'mapfile -t ARGS < <(grep -v .\^$.\? schema_rules/args.txt)' "$YML" 2>/dev/null || \
   grep -F 'grep -v' "$YML" | grep -q 'args.txt' || { echo "❌ mapfile 未过滤空行（§10.2）"; fail=1; }
 grep -F '"${ARGS[@]}"' "$YML" >/dev/null || { echo "❌ ARGS 未用引用展开"; fail=1; }
