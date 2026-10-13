@@ -143,8 +143,11 @@ def load_stub_skeleton() -> str:
             f'   先运行 scripts/string-enc/build-stub.sh 生成(它把 '
             f'{STUB_SRC} 编译为 smali)。')
     find_stub_seed_anchors(tpl)      # 锚点自检(失败即抛 SystemExit)
-    # 防线(报错二十二):骨架必须过参数寄存器自检
-    _check_stub_registers(tpl)
+    # 防线(报错二十二):骨架必须过参数寄存器自检。锚定骨架真名 'd' ——
+    # 骨架恒为 build-stub.sh 的 legacy 编译产物,方法名随机化只发生在
+    # write_stub 的文本替换(寄存器布局不变);若按全局随机名找方法,
+    # 守卫找不到目标方法 → 整条防线静默失效(报错四十八)。
+    _check_stub_registers(tpl, 'd')
     # 防线(报错二十五):类体顶层(非 .method 区)不许出现裸指令。
     # 骨架是编译产物,理论上不会违规;这条兜底拦住任何"把指令写进类体顶层"
     # 的回归(该形态 smali 汇编器报 no viable alternative)。
@@ -338,8 +341,15 @@ def _param_reg_count(arg_desc: str, is_static: bool) -> int:
             return -1
     return n
 
-def _check_stub_registers(smali_text: str) -> None:
-    """构建期断言:桩内无指令把参数寄存器当目标覆盖。违反即 fail-fast。"""
+def _check_stub_registers(smali_text: str, decrypt_method: str = None) -> None:
+    """构建期断言:桩内无指令把参数寄存器当目标覆盖。违反即 fail-fast。
+
+    decrypt_method:被守卫锚定的解密主方法名,缺省跟随全局 STUB_DECRYPT_METHOD。
+    检查【骨架】时必须显式传 'd':骨架是 build-stub.sh 的 legacy 编译产物,
+    方法名随机化只发生在 write_stub 的文本替换(寄存器布局不变);若按全局
+    随机名找方法,骨架里不存在该方法,整条守卫静默失效(报错四十八)。"""
+    if decrypt_method is None:
+        decrypt_method = STUB_DECRYPT_METHOD
     lines = smali_text.splitlines()
     i, n = 0, len(lines)
     while i < n:
@@ -401,7 +411,7 @@ def _check_stub_registers(smali_text: str) -> None:
             #   * 对 mix64/keyByte 这类【纯算数内部方法】放行 —— 它们不调用任何
             #     外部工具,形参读写是编译器正常产物(如 `seed += ...`),
             #     拦它只会误伤,不带来任何安全性。
-            if method != STUB_DECRYPT_METHOD:
+            if method != decrypt_method:
                 continue
             if dst.startswith('p') or dst.startswith('v'):
                 vnum = total - nparams if dst.startswith('p') else int(dst[1:])
@@ -654,32 +664,45 @@ def class_desc_of(content: str):
                 return m.group(0)
     return None
 
-STUB_DOT = STUB_DESC[1:-1].replace('/', '.')
+def _rebuild_desc_derived():
+    """由当前 STUB_DESC/STUB_DECRYPT_METHOD 重建 import 期派生物(报错四十八)。
 
-# 已加密条目的形态:const-string 紧跟本桩的 invoke-static(用于续跑时续 offset)。
-# 必须同时认 `invoke-static {..}` 与 `invoke-static/range {.. .. ..}` 两种形态
-# (报错二十一改注入形态后,/range 是新产物;若这里只认旧形态,max_existing_idx
-# 会漏算 → 续跑 offset 从 0 重来 → 共享密钥表区段复用)
-_PAYLOAD_RE = re.compile(
-    r'const-string(?:/jumbo)?[ \t]+(?:v\d+|p\d+)[ \t]*,[ \t]*"([^"\n]*)"\n'
-    r'[ \t]*invoke-static(?:/range)? \{[^}\n]*\}, ' + re.escape(STUB_DESC) + r'->d\(')
+    【为什么必须存在】STUB_DOT 与下面三个正则都是从"主变量"派生的,而主变量
+    会被 apply_stub_identifiers(桩随机化)在运行期改写——派生物若不同源重建,
+    全部停留在 legacy 名上:续跑水位线失明(_PAYLOAD_RE/_FIELD_REF_RE 认不出
+    随机名密文 → offset 复用 → 静默乱码)、** 规则下桩被当业务类二次加密
+    (STUB_DOT 失明)、报错二十四断言失明。模块加载时建一次(legacy 名),
+    apply_stub_identifiers 改名后再建一次。"""
+    global STUB_DOT, _PAYLOAD_RE, _FIELD_REF_RE, _ILLEGAL_FIELD_INIT_RE
+    STUB_DOT = STUB_DESC[1:-1].replace('/', '.')
 
-# 字段常量回填引用(报错二十四改形态后):<clinit> 里的
-#   sget-object vX, 本桩 ->F\d+
-# (续跑时字段占用的表区间也要计入,否则新字段 offset 从 0 重来 → 密钥区段复用。
-# 旧形态 `= StrDec;->F\d+:` 是报错二十四的非法 FIELD 型 static_value,已废弃,
-# 且被 _ILLEGAL_FIELD_INIT_RE 构建期断言拦截。v2 里 F 编号与表 offset 同源递增,
-# F(\d+) 读出的编号本身即"该字段占用的下一个 offset 下界"——字段名在分配时
-# 用占用前的 offset 命名,故引用计数语义 = offset+len 由分配器统一维护)
-_FIELD_REF_RE = re.compile(
-    # 回填引用形态(报错二十四):<clinit> 里的 sget-object vX, StrDec;->FNNNNNN
-    r'sget-object[ \t]+(?:v\d+|p\d+),[ \t]*' + re.escape(STUB_DESC) + r'->F(\d+):')
+    # 已加密条目的形态:const-string 紧跟本桩的 invoke-static(用于续跑时续 offset)。
+    # 必须同时认 `invoke-static {..}` 与 `invoke-static/range {.. .. ..}` 两种形态
+    # (报错二十一改注入形态后,/range 是新产物;若这里只认旧形态,max_existing_idx
+    # 会漏算 → 续跑 offset 从 0 重来 → 共享密钥表区段复用)
+    _PAYLOAD_RE = re.compile(
+        r'const-string(?:/jumbo)?[ \t]+(?:v\d+|p\d+)[ \t]*,[ \t]*"([^"\n]*)"\n'
+        r'[ \t]*invoke-static(?:/range)? \{[^}\n]*\}, ' + re.escape(STUB_DESC)
+        + r'->' + re.escape(STUB_DECRYPT_METHOD) + r'\(')
 
-# 非法形态断言(报错二十四):.field 初值绝不允许是 StrDec 字段引用。
-# 该形态会被 smali 汇编成 FIELD 型(0x19) encoded static_value —— dex 规范
-# 不允许的初值类型,ART 类初始化阶段(字节码执行之前)即失败 → 秒闪退且无日志。
-_ILLEGAL_FIELD_INIT_RE = re.compile(
-    r'^[ \t]*\.field[^\n]*=[ \t]*' + re.escape(STUB_DESC) + r'->F\d+:', re.M)
+    # 字段常量回填引用(报错二十四改形态后):<clinit> 里的
+    #   sget-object vX, 本桩 ->F\d+
+    # (续跑时字段占用的表区间也要计入,否则新字段 offset 从 0 重来 → 密钥区段复用。
+    # 旧形态 `= StrDec;->F\d+:` 是报错二十四的非法 FIELD 型 static_value,已废弃,
+    # 且被 _ILLEGAL_FIELD_INIT_RE 构建期断言拦截。v2 里 F 编号与表 offset 同源递增,
+    # F(\d+) 读出的编号本身即"该字段占用的下一个 offset 下界"——字段名在分配时
+    # 用占用前的 offset 命名,故引用计数语义 = offset+len 由分配器统一维护)
+    _FIELD_REF_RE = re.compile(
+        # 回填引用形态(报错二十四):<clinit> 里的 sget-object vX, StrDec;->FNNNNNN
+        r'sget-object[ \t]+(?:v\d+|p\d+),[ \t]*' + re.escape(STUB_DESC) + r'->F(\d+):')
+
+    # 非法形态断言(报错二十四):.field 初值绝不允许是 StrDec 字段引用。
+    # 该形态会被 smali 汇编成 FIELD 型(0x19) encoded static_value —— dex 规范
+    # 不允许的初值类型,ART 类初始化阶段(字节码执行之前)即失败 → 秒闪退且无日志。
+    _ILLEGAL_FIELD_INIT_RE = re.compile(
+        r'^[ \t]*\.field[^\n]*=[ \t]*' + re.escape(STUB_DESC) + r'->F\d+:', re.M)
+
+_rebuild_desc_derived()
 
 # 字段去初值断言(2026-09-12):目标类的 String/String[] 字段初值绝不允许是
 # 明文字面量 —— 否则 `strings` 扫产物照样命中(本次改动的存在理由)。
@@ -831,6 +854,7 @@ def apply_stub_identifiers(pkg_dot: str, cls: str, method: str) -> None:
     STUB_FILE = cls + '.smali'
     STUB_DESC = 'L' + '/'.join(parts) + '/' + cls + ';'
     STUB_DECRYPT_METHOD = method
+    _rebuild_desc_derived()   # 报错四十八:派生物必须与主变量同源重建
 
 def parse_stub_name(spec: str) -> tuple:
     """解析 --stub-name 'pkg.Cls:method'(method 可省,省略即 'd')。
