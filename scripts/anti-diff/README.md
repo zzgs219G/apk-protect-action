@@ -5,7 +5,7 @@
 
 ## 是什么
 
-在现有加固流水线(sigcheck/dex2c)基础上,新增的一层 **dex 层结构噪声**。
+在现有加固流水线(sigcheck/dex2c/stringenc)基础上,新增的一层 **dex 层结构噪声**。
 攻击者同时拿到原版 APK 与处理过的 APK,反编译后做逐文件 diff 时,
 被抽/被改的类"稀疏、可定位";本模块让全量 smali 带上零语义无损的变换,
 使 diff 结果"整包全红、像不同编译版本",掩盖真正被保护的那一个类。
@@ -35,7 +35,7 @@
 > 双变,归一化脚本无法抹平(R8 编译器从不做这种重编码)。
 
 白名单:android./androidx./kotlin./okhttp3./org.jsoup. 等系统与第三方依赖
-类硬排除(名单风格沿用已下线 stringenc 的 `SYSTEM_CLASS_PREFIXES`,见
+类硬排除(与 stringenc `SYSTEM_CLASS_PREFIXES` 同型名单,见
 `anti-diff.py` 的 `SKIP_CLASS_PREFIXES`)。
 
 红线(开发文档 §2.2):不改名 / 不改签名 / 不改字符串 / 不注死代码 / 不填 nop /
@@ -60,7 +60,8 @@ anti-diff.py <解包目录> [--seed-hex HEX] [--level 1] [--max-per-method N] [-
 mark-native.py → encrypt-strings.py → 【anti-diff.py】→ repack_build
 ```
 
-放模块序列最后(dex 层变换全部落定后再上噪声),
+放最后的原因:stringenc 会改 `const-string` 并插桩,若 anti-diff 先做、
+stringenc 后做,stringenc 的新差异会落在 anti-diff 的"已处理"区域上,
 削弱防对比效果。见 `scripts/pipelines/protect.sh` 中 `--anti-diff` 分支。
 
 ## 测试

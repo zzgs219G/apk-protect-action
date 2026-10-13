@@ -1,0 +1,133 @@
+/**
+ * StrDec — dex 层字符串常量解密桩(v2/S2: 纯 XOR + splitmix64 种子现算密钥流)
+ *
+ * 【本文件是唯一源码真相】
+ * smali 由 scripts/string-enc/build-stub.sh 自动生成(javac → d8 → baksmali),
+ * 人永远不要手改 StrDec.smali(历史: 报错二十一/二十二/二十五)。
+ * 改算法只改本文件,然后重跑 build-stub.sh。
+ *
+ * 【为什么从 v1 改成 S2】
+ * v1 每条解密 = Base64.decode + N 次 MessageDigest.update/digest + intern +
+ * ConcurrentHashMap 查表,全包 1.3 万条在 debuggable 解释执行下把冷启动首帧
+ * 卡死(2026-09-11 排查结论,见 docs/字符串加密v2重构方案.md §1)。
+ * S1 把密钥流预生成为一张全包共享的 byte[] 表(KEYS),运行期读表 XOR;
+ * S2 更进一步: 表也不要,只存 8 字节种子,运行期用 splitmix64 现算密钥字节。
+ * 全包仅 1 个解密方法 + 0 张表,比第三方方案(每类一张 short[])更轻。
+ *
+ * 【密文形态(构建期 encrypt-strings.py 生成)】
+ *   const-string vX, "<b64>"
+ *   invoke-static/range {vX .. vX}, Lcom/nc/strdec/StrDec;->d(Ljava/lang/String;)Ljava/lang/String;
+ * 其中 b64 = Base64( offset_be24 || cipher_bytes )
+ *   offset  — 该条明文的 UTF-8 字节在'全包虚拟密钥流'里的起始下标(3 字节大端)
+ *   cipher  — plain_utf8[k] ^ keyByte(SEED, offset + k)
+ * 分配器保证全包各条密文的 [offset, offset+len) 区段互不重叠。
+ *
+ * 【密钥流定义(Python/Java 必须逐字节一致,由 P3 对拍锁定)】
+ *   splitmix64:  z ^= z >>> 30; z *= 0xBF58476D1CE4E5B9L;
+ *                z ^= z >>> 27; z *= 0x94D049BB133111EBL; return z ^ (z >>> 31);
+ *   keyByte(seed, i) = (mix64(seed + (i >>> 3) * GAMMA) >>> ((i & 7) * 8)) & 0xFF
+ *   GAMMA = 0x9E3779B97F4A7C15L
+ * 易错点: ① Java 用 >>>(无符号右移),long 溢出天然 = mod 2^64;
+ *         ② Python 侧每步 & MASK64,且 >> 只作用在已掩码的非负数上。
+ *
+ * 【SEED 的注入方式(结构性约束,勿改形态)】
+ * build-stub.sh 只在编译期用 0L 顶位,smali 里长这样:
+ *   .field private static final SEED:J = 0x0L
+ * encrypt-strings.py 按此结构定位该行、只替换初值字面量(不新增字段)。
+ * 绝不允许把种子写成运行期回填: 那需要把解密提前到 <clinit>,而字段常量
+ * 回填链必须在 SEED 就绪之后执行 —— 顺序会被迫打乱(报错二十四同型)。
+ */
+public final class StrDec {
+
+    /** splitmix64 黄金比例增量,与 Python 侧 GAMMA 同常量。 */
+    private static final long GAMMA = 0x9E3779B97F4A7C15L;
+
+    /** 全包密钥种子,构建期由 encrypt-strings.py 按结构改写本行初值(8 字节随机)。 */
+    private static final long SEED = 0L; /*%SEED_LITERAL%*/
+
+    /** 解密结果缓存(《字符串架构优化.md》L1):key=密文 payload,value=明文。
+     *  命中 ~50-100ns 且零分配,并恢复原生 const-string 的 intern 语义——
+     *  Compose 启动/重组会反复执行同一使用点(实测均值 ~20 次),无缓存时
+     *  5,526 位点 × ~20 次 × 1-3μs ≈ 200ms 冷启动税,命中后归零。
+     *  历史警示:v1 的卡死元凶是"每条 SHA-256 派生"(微秒×万条),不是查表本身;
+     *  S2 已把首次解密降到纳秒级现算,首次成本 = Base64+XOR,缓存重新变得安全。
+     *  【为何用 raw 类型】泛型字段会让 javac 产出 .annotation Signature 块,
+     *  其内容行撞桩骨架"类体顶层裸指令"守卫(报错二十五防线);泛型在此处
+     *  无运行期价值,raw 化是零成本解。
+     */
+    @SuppressWarnings("unchecked")
+    private static final java.util.concurrent.ConcurrentHashMap CACHE
+            = new java.util.concurrent.ConcurrentHashMap();
+
+    /** 缓存上限(防极端:正常全包 ~5,526 条 ≈ 1-2MB;超限不再新增,已缓存的仍命中)。 */
+    private static final int CACHE_CAP = 30000;
+
+    private StrDec() {}
+
+    /** splitmix64 终混合。Java long 溢出即 mod 2^64,与 Python 的 & MASK64 天然对齐。 */
+    private static long mix64(long z) {
+        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+        return z ^ (z >>> 31);
+    }
+
+    /** 密钥流第 i 个字节,O(1) 现算,无需任何表。 */
+    private static int keyByte(long seed, long i) {
+        long w = mix64(seed + (i >>> 3) * GAMMA);
+        return (int) ((w >>> ((i & 7L) * 8)) & 0xFFL);
+    }
+
+    /** 解密:payload = Base64( offset_be24 || cipher )。失败时原样返回(与 v1 兜底一致)。
+     *  L1:先查缓存(命中零分配);仅成功结果进缓存,失败结果不缓存(避免毒缓存)。
+     *  缓存读写整体在 try 内:报错二十二守卫禁止向参数寄存器写常量,故不做
+     *  null 特判(null/坏密文的 NPE 自然落 catch → 原样返回,语义与旧版一致)。 */
+    public static String d(String payload) {
+        try {
+            String hit = (String) CACHE.get(payload);
+            if (hit != null) {
+                return hit;
+            }
+            byte[] raw = android.util.Base64.decode(payload, android.util.Base64.NO_WRAP);
+            if (raw.length < 4) {
+                return payload;
+            }
+            long offset = ((long) (raw[0] & 0xFF) << 16)
+                    | ((long) (raw[1] & 0xFF) << 8)
+                    | (long) (raw[2] & 0xFF);
+            int len = raw.length - 3;
+            // 必须用 byte[] + new String(byte[], "UTF-8"):v1/S1 草稿用 char[] +
+            // new String(char[]) 的语义是 Latin-1,中文/emoji 多字节 UTF-8 会乱码。
+            byte[] out = new byte[len];
+            // 【块展开 (2026-09-12)】一个 mix64 产出 8 字节密钥流(w 的 j*8 位起),
+            // 旧写法每字节调一次 keyByte → 同一块被重算 8 次。这里按块算一次、
+            // 块内取 8 个字节,调用次数 len → ceil(len/8)。
+            //
+            // 【对齐(易错点)】内层 j 绝不能固定从 0 开始:offset 未必是 8 的倍数,
+            // 而块索引按 offset+k 算,块内起始位是 (offset+k)&7 而非 0 —— j 从 0
+            // 起会让 offset%8!=0 的每条字符串全部解错(计划书 §2.3 原样代码的缺陷)。
+            // 同理该块内密钥最多覆盖 len 的头部;尾部不足 8 字节时多余的位丢弃。
+            for (int k = 0; k < len; ) {
+                long w = mix64(SEED + ((offset + k) >>> 3) * GAMMA);
+                for (int j = (int) ((offset + k) & 7L); j < 8 && k < len; j++, k++) {
+                    // 【优化① (2026-09-12)】原写法 (int)((w >>> (j*8)) & 0xFFL) 会让
+                    // d8 在循环体里留一条 const-wide/16 v,0xff + and-long,每字节重载
+                    // 一次 64 位常量。改成先 long-to-int 再 int & 0xFF(and-int/lit16,
+                    // 立即数不占寄存器)→ 每字节少 1 条指令。位语义等价(高 32 位被丢弃前
+                    // 已先右移截断,与原来 &0xFFL 结果逐位相同)。
+                    int kb = (int) (w >>> (j * 8));
+                    out[k] = (byte) ((raw[k + 3] & 0xFF) ^ (kb & 0xFF));
+                }
+            }
+            String decrypted = new String(out, "UTF-8");
+            if (CACHE.size() < CACHE_CAP) {   // 上限守卫:racy 检查,极端并发下略超无害
+                CACHE.put(payload, decrypted);
+            }
+            return decrypted;
+        } catch (Throwable t) {
+            // 兜底与 v1 一致:解密失败原样返回,绝不让字符串解密把业务炸掉。
+            // 注意:失败结果不进缓存(L1 设计边界,§3.2)——原样返回的 payload
+            // 可能是坏密文,缓存它等于把毒缓存住。
+            return payload;
+        }
+    }
+}

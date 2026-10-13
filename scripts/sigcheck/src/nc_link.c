@@ -54,7 +54,7 @@ int nc_verify_t1(const unsigned char *t1, int len)
 
 #ifndef NCLINK_HOST_TEST
 /* JNI 入口:Java_com_nc_link_NcLink_ncVerify([B)Z
- * 类名固定 com.nc.link.NcLink(桥接类,工具基础设施命名;命名先例:原 StrDec 桩,已随 stringenc 下线),
+ * 类名固定 com.nc.link.NcLink(桥接类,与 StrDec 同为工具基础设施命名),
  * JNI 短名绑定构建期即可确定,无需 RegisterNatives。 */
 JNIEXPORT jboolean JNICALL
 Java_com_nc_link_NcLink_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)

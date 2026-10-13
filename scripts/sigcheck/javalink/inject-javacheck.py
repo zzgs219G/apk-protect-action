@@ -11,7 +11,7 @@ CLI 契约:
   - fail-closed:so 缺失(UnsatisfiedLinkError)→ 杀 —— loadLibrary 成为承重墙,
     "删开关静默绕过"这个 sigcheck-only 最大缺口由此关闭。
   - 测量环境异常(其他 Throwable)→ 静默跳过(so 独立校验仍是权威,防误杀)。
-  - 固定桥接类 Lcom/nc/link/NcLink;(JNI 短名绑定要求;命名先例:原 StrDec 桩,已随 stringenc 下线, 工具命名先例)
+  - 固定桥接类 Lcom/nc/link/NcLink;(JNI 短名绑定要求,同 StrDec 工具命名先例)
     + 自适应命名逻辑类(R8 混淆包 → 短名风格;普通包 → app 包名派生,用户拍板)。
   - 幂等:类文件带 # nc-javacheck-applied v1 标记 + javacheck-components.json;
   - 零寄存器手术:调用点只插 `invoke-static {p0}, ...`(p0 为现成参数寄存器,

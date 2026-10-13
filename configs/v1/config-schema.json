@@ -33,6 +33,26 @@
       ]
     },
     {
+      "key": "stringenc",
+      "label": "字符串加密",
+      "desc": "dex字符串加密（防字符串搜索）",
+      "type": "parent",
+      "default": false,
+      "arg": "--stringenc",
+      "children": [
+        {
+          "key": "rules_file",
+          "label": "类名规则",
+          "type": "text",
+          "multiline": true,
+          "default": "",
+          "value_kind": "rules_file",
+          "required": { "when": "always" },
+          "hint": "每行一条，支持 **/com.test.** / activity*"
+        }
+      ]
+    },
+    {
       "key": "antidiff",
       "label": "防对比混淆",
       "desc": "dex层结构噪声",
