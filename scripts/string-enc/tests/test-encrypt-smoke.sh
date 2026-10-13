@@ -45,7 +45,7 @@ printf 'com.demo.**\n' > "$WORK/rules.txt"
 
 SEED=0123456789abcdef
 echo "══ 第 1 次运行(指定种子 $SEED)══"
-python3 "$_ENC" "$WORK/decompiled" "$WORK/rules.txt" --seed-hex "$SEED"
+python3 "$_ENC" "$WORK/decompiled" "$WORK/rules.txt" --seed-hex "$SEED" --stub-name com.nc.strdec.StrDec:d
 DEMO="$WORK/decompiled/smali/com/demo/Demo.smali"
 STUB="$WORK/decompiled/smali/com/nc/strdec/StrDec.smali"
 
@@ -109,14 +109,14 @@ fi
 echo
 echo "══ 第 2 次运行(幂等: 不指定种子)══"
 BEFORE="$(cat "$DEMO" "$STUB" | md5sum)"
-python3 "$_ENC" "$WORK/decompiled" "$WORK/rules.txt" --quiet
+python3 "$_ENC" "$WORK/decompiled" "$WORK/rules.txt" --stub-name com.nc.strdec.StrDec:d --quiet
 AFTER="$(cat "$DEMO" "$STUB" | md5sum)"
 chk "产物字节完全一致(幂等)" "[ '$BEFORE' = '$AFTER' ]"
 chk "种子被复用(未重新生成)" "grep -q 'SEED:J = 0x${SEED}L' '$STUB'"
 
 echo
 echo "══ 第 3 次运行(显式冲突种子应被已有桩覆盖)══"
-python3 "$_ENC" "$WORK/decompiled" "$WORK/rules.txt" --seed-hex ffffffffffffffff --quiet
+python3 "$_ENC" "$WORK/decompiled" "$WORK/rules.txt" --seed-hex ffffffffffffffff --stub-name com.nc.strdec.StrDec:d --quiet
 chk "已有桩的种子优先(旧密文仍可解)" "grep -q 'SEED:J = 0x${SEED}L' '$STUB'"
 
 echo

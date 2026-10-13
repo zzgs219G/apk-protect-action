@@ -35,6 +35,13 @@ _INJECT = _load_module('inject_loadlib', 'scripts/inject/inject-loadlib.py')
 SMALI_DIR_RE = _INJECT.SMALI_DIR_RE
 
 # ── 解密桩约定 ──────────────────────────────────────────────────────
+# 【桩随机化】以下 STUB_DESC/STUB_PKG_DIR/STUB_FILE/STUB_DECRYPT_METHOD 是
+# 「legacy 默认值」;生产运行(未传 --stub-name)时 main() 会生成每包随机的
+# 包名/类名/方法名并覆盖这四个变量,使杀毒引擎无法用固定签名
+# (Lcom/nc/strdec/StrDec;->d)命中。所有下游引用必须走变量而非字面量。
+# 随机名续跑复用:从组件标记(stringenc-components.json)的 desc/src 读回,
+# 与种子复用同机制;字段名(SEED/CACHE 等)与私有方法名(mix64/keyByte)不随机
+# —— SEED 是双锚点契约的一部分,keyByte/mix64 是 P3 对拍的反射锚点。
 STUB_DESC = 'Lcom/nc/strdec/StrDec;'
 STUB_PKG_DIR = ('com', 'nc', 'strdec')
 STUB_FILE = 'StrDec.smali'
@@ -795,8 +802,101 @@ def max_existing_idx(content: str) -> int:
         biggest = max(biggest, int(m.group(1), 10))
     return biggest
 
+def _rand_ident(rng) -> str:
+    """1-2 字符 R8 混淆风标识符(小写字母开头,可带数字)。
+
+    业务 App 通常过 R8/proguard,包名类名本就是短混淆名 —— 桩伪装成混淆产物
+    的一部分比随机长名更隐蔽。"""
+    first = rng.choice('abcdefghijklmnopqrstuvwxyz')
+    tail = rng.choice('abcdefghijklmnopqrstuvwxyz0123456789')
+    return first + tail
+
+def generate_stub_identifiers() -> tuple:
+    """生成每包随机的桩标识:(点分包名, 类名, 方法名)。
+
+    包名 3 段、类名/方法名各 1 段,全部 R8 混淆风。组合空间 >10^5,
+    防的是引擎【精确签名】(固定 desc+method 哈希命中),不是暴力枚举。"""
+    import random as _random
+    rng = _random.SystemRandom()
+    pkg = '.'.join(_rand_ident(rng) for _ in range(3))
+    cls = _rand_ident(rng)
+    method = _rand_ident(rng)
+    return pkg, cls, method
+
+def apply_stub_identifiers(pkg_dot: str, cls: str, method: str) -> None:
+    """把随机桩名写进模块级四个变量(全部下游引用自动跟随)。"""
+    global STUB_DESC, STUB_PKG_DIR, STUB_FILE, STUB_DECRYPT_METHOD
+    parts = tuple(pkg_dot.split('.'))
+    STUB_PKG_DIR = parts
+    STUB_FILE = cls + '.smali'
+    STUB_DESC = 'L' + '/'.join(parts) + '/' + cls + ';'
+    STUB_DECRYPT_METHOD = method
+
+def parse_stub_name(spec: str) -> tuple:
+    """解析 --stub-name 'pkg.Cls:method'(method 可省,省略即 'd')。
+    返回 (点分包名, 类名, 方法名),与 generate_stub_identifiers 同构。"""
+    if ':' in spec:
+        name, method = spec.split(':', 1)
+    else:
+        name, method = spec, 'd'
+    if '.' not in name or not name.split('.')[-1]:
+        raise SystemExit(f"❌ --stub-name 形态必须是 '包名.类名[:方法名]',收到: {spec}")
+    pkg_dot, cls = name.rsplit('.', 1)
+    return pkg_dot, cls, method
+
+def read_components_stamp(decompiled_dir: str):
+    """读组件标记(报错十八式元数据)。不存在/损坏返回 None。"""
+    path = os.path.join(decompiled_dir, COMPONENTS_FILE)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as fp:
+            data = json.load(fp)
+        cls = (data.get('classes') or [None])[0]
+        if not cls or 'desc' not in cls or 'src' not in cls:
+            return None
+        return cls
+    except (OSError, ValueError):
+        return None
+
+def recover_identifiers_from_stamp(decompiled_dir: str) -> bool:
+    """续跑复用:从组件标记 + 桩文件内容恢复随机桩名。
+
+    返回 True=已恢复(下游全部走恢复名);False=标记缺失/损坏(首次跑或旧产物)。
+    标记在但恢复失败 → raise(fail-fast,绝不悄悄换名 —— 换名=旧调用点全部
+    指向不存在的类,运行期 NoClassDefFoundError)。"""
+    cls = read_components_stamp(decompiled_dir)
+    if cls is None:
+        return False
+    desc = cls['desc']
+    m = re.match(r'^L(.+)/([^/]+);$', desc)
+    if not m:
+        raise SystemExit(f'❌ 组件标记里的桩描述符无法解析: {desc}')
+    pkg_slash, cls_name = m.group(1), m.group(2)
+    src = os.path.join(decompiled_dir, cls['src'])
+    if not os.path.isfile(src):
+        raise SystemExit(f'❌ 组件标记指向的桩文件不存在: {src}\n'
+                         f'   解包目录可能被重建过,请 clean 后重新加密。')
+    with open(src, encoding='utf-8') as fp:
+        content = fp.read()
+    if STUB_GEN_MARK not in content:
+        raise SystemExit(f'❌ 组件标记指向的文件不是本工具生成的桩: {src}')
+    mm = re.search(r'^\.method public static (\S+)\(Ljava/lang/String;\)Ljava/lang/String;',
+                   content, re.M)
+    if not mm:
+        raise SystemExit(f'❌ 桩文件里找不到解密主方法(签名形态变了?): {src}')
+    apply_stub_identifiers(pkg_slash.replace('/', '.'), cls_name, mm.group(1))
+    return True
+
 def find_stub_path(decompiled_dir: str):
-    """在 smali*/ 里找桩文件(只有解包目录下、且位于桩包路径中的才算)。"""
+    """在 smali*/ 里找桩文件(只有解包目录下、且位于桩包路径中的才算)。
+
+    定位顺序:组件标记(随机名续跑的唯一可靠依据)→ 固定名兜底(旧产物/测试)。"""
+    cls = read_components_stamp(decompiled_dir)
+    if cls is not None:
+        src = os.path.join(decompiled_dir, cls['src'])
+        if os.path.isfile(src):
+            return src
     for root, _dirs, files in os.walk(decompiled_dir):
         parts = root[len(decompiled_dir):].lstrip(os.sep).split(os.sep)
         if not any(SMALI_DIR_RE.match(p) for p in parts if p):
@@ -871,7 +971,7 @@ def clean_components(decompiled_dir: str) -> int:
                 content = fp.read()
         except OSError:
             continue
-        if CLASS_MARK in content and (STUB_DESC + '->d(' in content
+        if CLASS_MARK in content and (STUB_DESC + '->' + STUB_DECRYPT_METHOD + '(' in content
                                       or _FIELD_REF_RE.search(content)):
             tainted.append(cls_path)
     if tainted:
@@ -917,6 +1017,32 @@ def write_stub(decompiled_dir: str, seed: bytes) -> str:
     skeleton = load_stub_skeleton()
     seed_word = f'0x{int.from_bytes(seed, "big"):016x}L'
     content = inject_stub_seed(skeleton, seed_word)
+
+    # 桩随机化:骨架(缓存产物)固定名 → 本次构建的随机/指定名。
+    # 只改 .class 描述符(含桩内全部自引用:CACHE/mix64 共 6 处)与解密主方法名;
+    # 字段名(SEED/CACHE)与私有方法名(mix64/keyByte)是锚点/对拍契约,不动。
+    # 计数守恒:描述符替换前后总次数必须相等(全量同改,不多不少),
+    # 否则说明骨架形态漂移,拒绝产物。
+    legacy_method = re.search(
+        r'^\.method public static (\S+)\(Ljava/lang/String;\)Ljava/lang/String;',
+        content, re.M)
+    if legacy_method is None:
+        raise SystemExit('❌ 桩骨架自检失败:找不到解密主方法定义(形态漂移?)')
+    old_method = legacy_method.group(1)
+    n_desc = content.count('Lcom/nc/strdec/StrDec;')
+    if n_desc == 0:
+        raise SystemExit('❌ 桩骨架自检失败:找不到 legacy 描述符(骨架形态漂移?)')
+    if STUB_DESC != 'Lcom/nc/strdec/StrDec;':   # legacy 固定名(--stub-name)时无需改名
+        content = content.replace('Lcom/nc/strdec/StrDec;', STUB_DESC)
+        if content.count(STUB_DESC) != n_desc \
+                or 'Lcom/nc/strdec/StrDec;' in content:
+            raise SystemExit('❌ 桩随机化替换终检失败:描述符没换干净/误伤')
+    content = content.replace(
+        f'.method public static {old_method}(Ljava/lang/String;)Ljava/lang/String;',
+        f'.method public static {STUB_DECRYPT_METHOD}(Ljava/lang/String;)Ljava/lang/String;',
+        1)
+    if f'.method public static {STUB_DECRYPT_METHOD}(' not in content:
+        raise SystemExit('❌ 桩随机化替换终检失败:方法名没换干净')
 
     # 生成标记(非注释行的行首注释即可,注释不进 dex)。必须存在:
     # 续跑时靠它区分"本工具生成的桩"与"用户同名类",决定是复用还是拒绝。
@@ -1038,7 +1164,7 @@ def process_file(path: str, cls_desc: str, includes, excludes,
 
         # 已加密条目(解密桩可能来自上一次运行)→ 跳过,并续用表区段,
         # 避免把密文当明文再加密一次
-        if STUB_DESC + '->d(' in line:
+        if STUB_DESC + '->' + STUB_DECRYPT_METHOD + '(' in line:
             out.append(line)
             midx = max_existing_idx(line + '\n')
             if midx >= 0:
@@ -1052,7 +1178,7 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         # 逐行前瞻防二次加密(报错二十式双保险):即使类标记被外部工具删掉,
         # 密文 const-string 的下一行必是本桩的 invoke-static ...->d(...),
         # 命中即连同密文行原样保留(与上方 ->d( 分支同样的续 offset 语义)
-        if li < n_lines and STUB_DESC + '->d(' in lines[li]:
+        if li < n_lines and STUB_DESC + '->' + STUB_DECRYPT_METHOD + '(' in lines[li]:
             out.append(line)
             midx = max_existing_idx(line + '\n' + lines[li] + '\n')
             if midx >= 0:
@@ -1095,7 +1221,7 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         # 统一用 /range:单寄存器 range 恒连续、dex 中同为 3 个 code unit(无体积
         # 代价),且对 v/p 两种写法都合法 → 无需解析 .registers/.locals 做换算。
         out.append(f'{indent}invoke-static/range {{{dst} .. {dst}}}, '
-                   f'{STUB_DESC}->d(Ljava/lang/String;)Ljava/lang/String;')
+                   f'{STUB_DESC}->{STUB_DECRYPT_METHOD}(Ljava/lang/String;)Ljava/lang/String;')
         out.append(f'{indent}move-result-object {dst}')
         idx += len(enc)                     # 消费对应表区段(不重叠分配)
         hits += 1
@@ -1161,7 +1287,7 @@ def inject_clinit_backfills(path: str, backfills) -> bool:
         ty = bf['type']
         fill_lines.append(f'    const-string v0, "{payload}"')
         fill_lines.append(f'    invoke-static/range {{v0 .. v0}}, '
-                          f'{STUB_DESC}->d(Ljava/lang/String;)Ljava/lang/String;')
+                          f'{STUB_DESC}->{STUB_DECRYPT_METHOD}(Ljava/lang/String;)Ljava/lang/String;')
         fill_lines.append('    move-result-object v0')
         # 【intern (2026-09-12)】字段去初值后,常量的 interned 实例来自这里,
         # 必须保持"解密结果 == 编译期字面量"的引用语义(历史 §3.7.4 曾依赖它)。
@@ -1219,6 +1345,9 @@ def main():
     ap.add_argument('--exclude-methods',
                     help='compiled_methods.txt:这些方法将被 dex2c 抽走,跳过不加密')
     ap.add_argument('--seed-hex', help='固定种子(8 字节 hex),仅供测试/复现')
+    ap.add_argument('--stub-name',
+                    help="固定桩名 '包名.类名[:方法名]'(如 com.nc.strdec.StrDec:d),"
+                         "仅供测试/复现;不传 = 每包随机生成(生产默认,防引擎固定签名)")
     ap.add_argument('--quiet', action='store_true', help='只打错误')
     args = ap.parse_args(argv)
 
@@ -1240,6 +1369,39 @@ def main():
             print(f'❌ --exclude-methods 文件不存在: {args.exclude_methods}', file=sys.stderr)
             return 1
         exclude_methods = parse_compiled_methods(args.exclude_methods)
+
+    # ── 桩随机化:确定本次的包名/类名/方法名 ──────────────────────────
+    # 优先级:组件标记里的既有名(续跑复用,与种子同机制)> --stub-name(测试)
+    # > 每包随机(生产默认)。冲突检查:随机名目标文件已存在 = 与用户类撞名,
+    # 换一批重试;多次撞名(几乎不可能)fail-fast。
+    stub_name_explicit = None
+    if args.stub_name:
+        stub_name_explicit = parse_stub_name(args.stub_name)
+    recovered = recover_identifiers_from_stamp(args.decompiled)
+    if recovered:
+        if stub_name_explicit:
+            pkg_dot, cls, _m = stub_name_explicit
+            want_desc = 'L' + pkg_dot.replace('.', '/') + '/' + cls + ';'
+            if want_desc != STUB_DESC:
+                raise SystemExit(
+                    f'❌ --stub-name({stub_name_explicit[0]})与已有桩({STUB_DESC})不一致 ——\n'
+                    f'   旧密文的调用点指向已有桩,换名即全包乱码。'
+                    f'要改名请先 clean 再重新加密。')
+        if not args.quiet:
+            print(f'  🔁 复用已有桩: {STUB_DESC}->{STUB_DECRYPT_METHOD}()')
+    elif stub_name_explicit:
+        apply_stub_identifiers(*stub_name_explicit)
+    else:
+        for _ in range(16):
+            pkg_dot, cls, method = generate_stub_identifiers()
+            apply_stub_identifiers(pkg_dot, cls, method)
+            target = os.path.join(_pick_smali_root(args.decompiled), *STUB_PKG_DIR, STUB_FILE)
+            if not os.path.exists(target):
+                break
+        else:
+            raise SystemExit('❌ 随机桩名连续 16 次与解包目录现有文件冲突,请人工检查解包目录')
+        if not args.quiet:
+            print(f'  🎲 桩随机化: {STUB_DESC}->{STUB_DECRYPT_METHOD}()')
 
     if args.seed_hex:
         try:

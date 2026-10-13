@@ -58,7 +58,7 @@ fail=0
 chk() { if eval "$2"; then echo "  ✅ $1"; else echo "  ❌ $1"; fail=$((fail+1)); fi; }
 
 echo "══ 第一轮(2 个类,固定种子 $SEED)══"
-python3 "$_SENC" "$DEC" "$WORK/rules.txt" --seed-hex "$SEED" --quiet
+python3 "$_SENC" "$DEC" "$WORK/rules.txt" --seed-hex "$SEED" --stub-name com.nc.strdec.StrDec:d --quiet
 STUB="$DEC/smali/com/nc/strdec/StrDec.smali"
 [ -f "$STUB" ] || { echo "❌ 桩未注入" >&2; exit 1; }
 
@@ -176,7 +176,7 @@ cat > "$DEC/smali/com/demo/A3.smali" <<'SMALI'
     return-void
 .end method
 SMALI
-python3 "$_SENC" "$DEC" "$WORK/rules.txt" --quiet
+python3 "$_SENC" "$DEC" "$WORK/rules.txt" --stub-name com.nc.strdec.StrDec:d --quiet
 
 # 旧类必须字节不变(幂等:不重复加密)
 collect_ciphers "$WORK/c2.txt" > /dev/null

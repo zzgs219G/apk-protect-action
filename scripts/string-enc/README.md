@@ -196,7 +196,27 @@ CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
   非冷启动主因（详见 `docs/字符串架构优化.md` 与简盒报告 §六）；L1 保留的理由是
   无回归 + CPU/PSS 改善 + intern 语义，而非当初的 ~200ms 假设
 
+## 桩随机化（2026-10-13,防引擎固定签名）
+
+字符串加密防住了「字符串内容特征」,但桩自身曾是新特征:固定类名
+`com.nc.strdec.StrDec` + 固定方法名 `d` 全包统一 —— 杀毒引擎可直接收录
+`Lcom/nc/strdec/StrDec;->d` 精确签名,一查一个准。**桩随机化**消灭它:
+
+- 生产默认(不传参数):每包随机生成包名(3 段)/类名/方法名,R8 混淆风短名
+  (如 `La7x/k2m/Q9;->b3`),伪装成混淆产物的一部分;组合空间 >10^5,防精确签名
+- `--stub-name '包名.类名[:方法名]'`:固定名,仅供测试/复现(三个既有测试传
+  `com.nc.strdec.StrDec:d` 复现 legacy,断言零改动)
+- 续跑复用:随机名写入组件标记(stringenc-components.json 的 desc/src),
+  二次跑从标记+桩文件读回 —— 与种子复用同机制;标记在但恢复失败 = fail-fast
+  (悄悄换名 = 旧调用点全部指向不存在的类)
+- 替换范围:仅 .class 描述符(含桩内自引用全量 6 处)与解密主方法名;
+  字段名(SEED/CACHE)与私有方法名(mix64/keyByte)是双锚点/P3 对拍契约,不动
+- 语义不变:算法、种子注入、缓存、落点形态全部与 legacy 相同 —— 随机的是名字,
+  不是行为。验收:`tests/test-stub-randomize.sh`(随机生效/零痕迹/续跑复用/
+  改名拒绝 四断言)
 ## 历史教训索引
+
+
 
 | 事件 | 教训 |
 |---|---|
@@ -221,3 +241,4 @@ CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
 | `tests/test-encrypt-smoke.sh` | 全链加密→解密往返 + 桩自检（27 断言） |
 | `tests/test-keystream-crosscheck.sh` | Python ↔ Java 对拍：第 1 层反射 keyByte/mix64 纯算术；**第 2 层真实编译桩 d() 全链往返**（4 种子 × 117 例，offset 覆盖 %8 全部 8 个 residue） |
 | `tests/test-structure-resume.sh` | 续跑（offset 分配器）/ 桩结构不变量（含 L1 缓存断言） |
+| `tests/test-stub-randomize.sh` | 桩随机化：随机生效/产物零 legacy 痕迹/续跑复用随机名/改名 fail-fast（4 断言组） |
