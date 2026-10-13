@@ -1,65 +1,12 @@
 #!/usr/bin/env python3
 """encrypt-strings.py — dex 层字符串常量加密(构建期异或 + 运行期 Java 解密桩)
 
-【这是什么】
-把「用户选中类」里 dex 的字符串常量(const-string 字面量)在构建期加密,
-运行期由注入的纯 Java 解密桩解密。目标是让 `strings`/静态特征扫描看不到
-源码里写死的明文(URL/API key/日志文案等),提高人工逆向成本。
-
-【边界(必须知道)】
-  * 加密粒度 = 指令级字面量。只改 `const-string` / `const-string/jumbo`。
-  * 字段的字符串值(`static final String S = "x"`)编译后就是 <clinit> 里的
-    const-string + sput-object(R8 内联时是每个使用点各一条),**天然被覆盖**,
-    不需要为字段写任何专门逻辑。
-  * 字段名 / 方法名 / 类名 / 类型描述符属于 dex 结构引用,永不触碰。
-  * 注解值(value = "x")不是 const-string 指令,天然不在扫描面。
-  * 这是「防静态可见性」,不是密码学安全:密钥流派生材料同在包内,
-    懂格式者仍可解。真正的密钥材料请走服务端/白盒方案。
-
-【选类范围】
-完全复用 dcc 那套规则解析(scripts/filter/rules-to-filter.py),语法一致:
-  精确类名 com.app.MainActivity / com.test.** / com.test.* / com.test*
-  activity*(需 --classes) / !排除 / # 注释 / 空行
-
-【硬排除(用户要求:全量通配也不许动)】
-即使规则写了 `**`,下列前缀的类一律不加密(系统类与框架依赖):
-  android. androidx. android.support. com.android. com.google.android.
-  dalvik. java. javax. kotlin. kotlinx. org.jetbrains.
-  org.apache. org.json. org.w3c. org.xml. sun.
-外加解密桩自身。`!` 排除行在非系统类范围内优先级最高;
-命中系统前缀的类无条件硬排除(与 classify 的实际判定顺序一致)。
-
-常用第三方依赖(反射/注解序列化/网络协议/跨进程绑定库)同列硬排除——
-此类库的 const-string 承载类名/字段名/协议/序列化标记(反射与注解处理必需),
-加密后 `Class.forName`/`getAnnotation`/序列化匹配、甚至网络协议会失效;
-加固只保护自家代码(com.xixin.box.*),第三方字符串本非重要资产。当前追加:
-  okhttp3. okio. com.google.gson. org.jsoup. org.commonmark.
-  io.ktor. coil3. moe.shizuku.
-
-【算法 v2/S2(与 stub 里的 Java 实现必须逐字节一致,靠对拍测试锁定)】
-  seed        : 8 字节随机(secrets.token_bytes(8);--seed-hex 供复现)
-  payload     : Base64( offset_be24 || cipher )
-                offset = 本构建内该明文的 UTF-8 字节在'全包虚拟密钥流'里的起始下标
-  keystream   : splitmix64 现算,O(1) 取第 i 个字节(零表,见 §3.3)
-                key_byte(seed, i) = (mix64(seed + (i>>3)*GAMMA) >> ((i&7)*8)) & 0xFF
-                cipher[k] = plain[k] ^ key_byte(seed, offset + k)
-  stub        : 注入 Lcom/nc/strdec/StrDec;,d(String) 解密(纯 XOR + UTF-8)
-  分配器      : 全包按顺序为每条密文分配不重叠区段 [offset, offset+len)
-
-  【与 v1 的关系】v1 运行期每条做 N 次 SHA-256 派生密钥,全包 1.3 万条在
-  debuggable 下把冷启动首帧卡死。S2 把密钥"生产"变成纯算术现算(纳秒级),
-  全包仅 1 个解密方法、0 张表、只存 8 字节种子。
-
-【幂等】
-  * 已加密的类插入了标记注释 `# nc-strdec-encrypted`(注释不进 dex),
-    重跑时整类跳过,输出稳定。
-  * 桩文件已存在时:解析回其中的 SEED 继续使用,保证旧密文仍可解;
-    若不是本工具生成的同名文件则 fail-fast,拒绝覆盖用户代码。
-
-用法:
-  encrypt-strings.py <解包目录> <规则文件> [--classes 类列表] \\
-                     [--exclude-methods compiled_methods.txt] [--seed-hex HEX]
+把「用户选中类」的 const-string 字面量构建期加密,运行期由注入的纯 Java 解密桩
+(Lcom/nc/strdec/StrDec;)解密。定位是防静态可见性,不是密码学安全。
+模块的完整契约(密文形态/密钥流/SEED 双锚点注入/硬排除清单/L1 缓存/历史教训)
+见同目录 README.md,改本文件前必读。
 """
+
 import argparse
 import base64
 import importlib.util
@@ -69,10 +16,8 @@ import re
 import secrets
 import sys
 
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))          # scripts/string-enc → 仓库根
-
 
 def _load_module(name: str, rel_path: str):
     """文件名带连字符,不能常规 import → 与 mark-native.py 同款 importlib 加载。
@@ -82,7 +27,6 @@ def _load_module(name: str, rel_path: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
 
 # 规则解析复用 dcc 侧同一脚本(用户要求"语法与 dex2c_rules 完全一致")
 _RULES = _load_module('rules_to_filter', 'scripts/filter/rules-to-filter.py')
@@ -151,23 +95,15 @@ _SKIP_STRING_PREFIXES = (
     '$i$f$', '$i$a$', '$this$', '$changed', '$stable', '$-',
 )
 
-
 def is_instrumentation_string(plain: str) -> bool:
     """编译器调试/内联标记串判定:命中即跳过加密(保留明文,不占 idx)。"""
     return plain.startswith(_SKIP_STRING_PREFIXES)
 
-
 # ── 解密桩骨架(纯 Java 编译产物,零表零占位符) ────────────────────────
 #
-# 【SEED 双锚点注入契约(与 build-stub.sh 共同维护,勿单方面改)】
-# build-stub.sh 用哨兵种子 0x5EED000000000000 编译 StrDec.java,d8 的实测行为:
-#   ① 种子非 0 → smali 里保留 `.field private static final SEED:J = 0x...L`
-#   ② 同时把该常量【内联】到每个使用点(如 `const-wide/high16 v9, 0x...L`)
-# 所以种子必须【同时】改写这两处,且数量守恒:
-#   只改 .field → 运行期 d() 用的是内联常量,种子没生效;
-#   只改内联   → 复用桩时读不回种子,续跑时构建期/运行期不一致。
-# 两者不一致的后果:全包字符串乱码(且不是崩溃,是静默错误)。
-# 下面 SENTINEL_SEED 是与 build-stub.sh 约定的哨兵值。
+# SEED 双锚点注入契约(与 build-stub.sh 共同维护,勿单方面改;全文见 README.md):
+#   哨兵 0x5EED… 编译 → d8 保留 .field 初值并内联到使用点 → 本脚本对两类锚点
+#   做一致性改写(数量守恒,错一个 = 全包乱码)。锚点正则如下。
 SENTINEL_SEED = '0x5eed000000000000L'
 
 _FIELD_SEED_RE = re.compile(
@@ -178,7 +114,6 @@ _INLINE_SEED_RE = re.compile(
     r'^(?P<indent>[ \t]*)const-wide(?P<variant>/\w+)?[ \t]+'
     r'(?P<reg>[vp]\d+)[ \t]*,[ \t]*(?P<val>0x[0-9a-fA-F]+L?)[ \t]*(?P<tail>#[^\n]*)?$',
     re.M)
-
 
 def load_stub_skeleton() -> str:
     """加载 build-stub.sh 产出的桩骨架(无占位符,可直接汇编)。
@@ -220,7 +155,6 @@ def load_stub_skeleton() -> str:
                 f'   指令只允许出现在 .method .. .end method 之间(报错二十五)。')
     return tpl
 
-
 def find_stub_seed_anchors(content: str, expect_sentinel: bool = True):
     """按结构定位骨架里的 SEED 锚点。
     返回 (字段行 match, 内联常量 match 列表)。缺失即 fail-fast。
@@ -252,7 +186,6 @@ def find_stub_seed_anchors(content: str, expect_sentinel: bool = True):
             f'   d8 的常量内联行为可能变了,或骨架与 build-stub.sh 不同步。\n'
             f'   重跑 build-stub.sh;若仍失败,需重审本文件的注入契约。')
     return fm, inlines
-
 
 def inject_stub_seed(skeleton: str, seed_word: str) -> str:
     """把骨架里的哨兵种子【双锚点同时】改写为真种子。
@@ -334,7 +267,6 @@ def inject_stub_seed(skeleton: str, seed_word: str) -> str:
             f'期望 {seed_word}')
     return skeleton
 
-
 def read_stub_seed(content: str) -> bytes:
     """从已存在的桩里读回 8 字节种子(续跑/复用桩时用,否则旧密文解不开)。"""
     fm = _FIELD_SEED_RE.search(content)
@@ -346,8 +278,6 @@ def read_stub_seed(content: str) -> bytes:
     except ValueError:
         raise SystemExit(f'❌ 桩文件的 SEED 初值不是十六进制字面量: {fm.group("val")}')
     return (val & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'big')
-
-
 
 # ── 解密桩自检:参数寄存器不得被当临时槽覆盖(报错二十二) ──────────────
 #
@@ -367,7 +297,6 @@ _METHOD_HDR_RE = re.compile(
     r'^\.method\b[^\n]*?\b([A-Za-z_$][\w$]*|<init>|<clinit>)?\s*'
     r'\((?P<args>[^)]*)\)[^\n]*$')
 _REGS_RE = re.compile(r'^[ \t]*\.(?P<kind>registers|locals)[ \t]+(?P<n>\d+)[ \t]*$')
-
 
 def _param_reg_count(arg_desc: str, is_static: bool) -> int:
     """方法形参占用的寄存器数(J/D 占 2 个,this 占 1 个)。"""
@@ -401,7 +330,6 @@ def _param_reg_count(arg_desc: str, is_static: bool) -> int:
         else:
             return -1
     return n
-
 
 def _check_stub_registers(smali_text: str) -> None:
     """构建期断言:桩内无指令把参数寄存器当目标覆盖。违反即 fail-fast。"""
@@ -478,7 +406,6 @@ def _check_stub_registers(smali_text: str) -> None:
                         f'   请改用方法内确无依赖的局部寄存器槽。')
         i = j + 1
 
-
 # ── smali 字符串字面量转义表(与 smali 汇编器的 unescape 对齐) ──────────
 _UNESCAPE = {
     'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f',
@@ -500,7 +427,6 @@ _FIELD_RE = re.compile(
 
 # 值得加密的字段类型:String 本身,以及 String 数组(元素值同样是明文)
 FIELD_STRING_TYPES = ('Ljava/lang/String;', '[Ljava/lang/String;')
-
 
 def smali_unescape(text: str) -> str:
     """解码 smali 字符串字面量内容(两侧引号已剥掉)。
@@ -555,7 +481,6 @@ def smali_unescape(text: str) -> str:
             raise ValueError(f'未知转义 \\{esc}')
     return ''.join(out)
 
-
 def parse_const_string(line: str):
     """解析一条 const-string 指令行。
     返回 (match, literal_text, tail) 或 None(不是该指令/引号不闭合)。"""
@@ -575,7 +500,6 @@ def parse_const_string(line: str):
     else:
         return None                                   # 引号不闭合,当异常行跳过
     return m, rest[:i], rest[i + 1:]
-
 
 def parse_field_string(line: str):
     """解析携带字符串字面量的 .field 行(R8 折叠的 static final 常量)。
@@ -598,7 +522,6 @@ def parse_field_string(line: str):
     else:
         return None
     return m, rest[:i], rest[i + 1:]
-
 
 def _strip_field_literal(line: str, m) -> 'str | None':
     """字段去初值(2026-09-12):`.field ... X:Ljava/lang/String; = "明文"` → `.field ... X:...;`
@@ -631,7 +554,6 @@ def _strip_field_literal(line: str, m) -> 'str | None':
     head = re.sub(r'[ \t]*=[ \t]*$', '', head)
     return head.rstrip() + tail
 
-
 # ── splitmix64 密钥流(Python 侧参考实现;与 StrDec.java 逐字节一致) ──────
 # 【易错点,改这两行前先读】
 #  ① Python 的 >> 是算术右移,必须保证操作数是已掩码的非负数(每步 & MASK64);
@@ -643,7 +565,6 @@ GAMMA = 0x9E3779B97F4A7C15
 _M1 = 0xBF58476D1CE4E5B9
 _M2 = 0x94D049BB133111EB
 
-
 def _mix64(z: int) -> int:
     z = (z ^ (z >> 30)) & MASK64
     z = (z * _M1) & MASK64
@@ -651,17 +572,14 @@ def _mix64(z: int) -> int:
     z = (z * _M2) & MASK64
     return (z ^ (z >> 31)) & MASK64
 
-
 def key_byte(seed: int, i: int) -> int:
     """虚拟密钥流第 i 个字节,O(1) 现算(对应 StrDec.keyByte)。"""
     w = _mix64((seed + (i >> 3) * GAMMA) & MASK64)
     return (w >> ((i & 7) * 8)) & 0xFF
 
-
 def read_seed_bytes() -> bytes:
     """新构建的种子:8 字节随机。"""
     return secrets.token_bytes(8)
-
 
 def encrypt_payload_v2(seed: int, offset: int, plain: bytes) -> str:
     """v2 明文 → Base64( offset_be24 || cipher ),cipher[k] = plain[k] ^ key_byte(seed, offset+k)。"""
@@ -669,11 +587,9 @@ def encrypt_payload_v2(seed: int, offset: int, plain: bytes) -> str:
     cipher = bytes(p ^ key_byte(seed, offset + k) for k, p in enumerate(plain))
     return base64.b64encode(head + cipher).decode('ascii')
 
-
 def desc_to_dot(desc: str) -> str:
     """Lcom/x/Y; → com.x.Y"""
     return desc[1:-1].replace('/', '.')
-
 
 def build_matchers(rules_path: str, classes_file):
     """规则文件 → (include 正则表, exclude 正则表)。语法与 dcc 侧完全一致。"""
@@ -701,7 +617,6 @@ def build_matchers(rules_path: str, classes_file):
         (excludes if negate else includes).append(re.compile(pat))
     return includes, excludes, activity_mode
 
-
 def parse_compiled_methods(path: str):
     """compiled_methods.txt → {(类名, 方法名, 原型)}(格式同 §4.2,无箭头)。"""
     result = set()
@@ -715,7 +630,6 @@ def parse_compiled_methods(path: str):
                 result.add((m.group(1), m.group(2), m.group(3)))
     return result
 
-
 def iter_smali_files(decompiled_dir: str):
     for root, _dirs, files in os.walk(decompiled_dir):
         parts = root[len(decompiled_dir):].lstrip(os.sep).split(os.sep)
@@ -723,7 +637,6 @@ def iter_smali_files(decompiled_dir: str):
             for f in files:
                 if f.endswith('.smali'):
                     yield os.path.join(root, f)
-
 
 def class_desc_of(content: str):
     """取 .class 行的类描述符(同 mark-native.py 的取法)。"""
@@ -733,7 +646,6 @@ def class_desc_of(content: str):
             if m:
                 return m.group(0)
     return None
-
 
 STUB_DOT = STUB_DESC[1:-1].replace('/', '.')
 
@@ -771,11 +683,9 @@ _FIELD_STRING_LITERAL_RE = re.compile(
     r'^[ \t]*\.field[^\n]*[A-Za-z_$][\w$]*:(?:Ljava/lang/String;|\[Ljava/lang/String;)'
     r'[ \t]*=[ \t]*"')
 
-
 def _scope_allows_field_scan(content: str) -> bool:
     """该文件是否属于"本模块的加密面"(据此决定字段初值断言是否适用)。"""
     return CLASS_MARK in content or STUB_DESC in content
-
 
 def field_literal_is_skipped(plain: str) -> bool:
     """字段分支【按设计保留明文初值、不进加密面】的判定(只看已解析出的明文值)。
@@ -794,7 +704,6 @@ def field_literal_is_skipped(plain: str) -> bool:
     本函数【只判值本身】,"值解析不出来"的情况见 `_field_literal_parse_failed`。
     """
     return (not plain) or is_instrumentation_string(plain)
-
 
 def _scan_illegal_field_literals(content: str):
     """加密面内的"去初值漏改"字段行(逐行判定,与字段分支同源)。
@@ -849,11 +758,9 @@ def _scan_illegal_field_literals(content: str):
         hits.append((line, m))
     return hits
 
-
 def is_system_class(cls_dot: str) -> bool:
     """系统类/框架依赖前缀判定(带点号前缀,不误伤 androidXxx 这种同前缀类)。"""
     return cls_dot.startswith(SYSTEM_CLASS_PREFIXES)
-
 
 def classify(cls_dot: str, cls_desc: str, includes, excludes) -> str:
     """给类定性:no-match / system / excluded / stub / target。
@@ -870,7 +777,6 @@ def classify(cls_dot: str, cls_desc: str, includes, excludes) -> str:
     if any(r.search(cls_desc) for r in excludes):
         return 'excluded'
     return 'target'
-
 
 def max_existing_idx(content: str) -> int:
     """v2: 已加密类里占用过的最大表区间末尾(续跑时接着分配,避免密钥区段复用)。
@@ -889,7 +795,6 @@ def max_existing_idx(content: str) -> int:
         biggest = max(biggest, int(m.group(1), 10))
     return biggest
 
-
 def find_stub_path(decompiled_dir: str):
     """在 smali*/ 里找桩文件(只有解包目录下、且位于桩包路径中的才算)。"""
     for root, _dirs, files in os.walk(decompiled_dir):
@@ -899,7 +804,6 @@ def find_stub_path(decompiled_dir: str):
         if STUB_FILE in files and root.endswith(os.path.join(*STUB_PKG_DIR)):
             return os.path.join(root, STUB_FILE)
     return None
-
 
 def read_existing_salt(decompiled_dir: str):
     """已存在且是本工具生成的桩 → 复用其 SEED(否则旧密文解不开)。
@@ -914,7 +818,6 @@ def read_existing_salt(decompiled_dir: str):
                          f'   请改名或移走用户的 {STUB_DESC} 后重试')
     return read_stub_seed(content), False
 
-
 def _pick_smali_root(decompiled_dir: str) -> str:
     """桩落在哪个 smali 目录:优先 smali/,否则第一个 smali*/。"""
     preferred = os.path.join(decompiled_dir, 'smali')
@@ -924,7 +827,6 @@ def _pick_smali_root(decompiled_dir: str) -> str:
         if SMALI_DIR_RE.match(name) and os.path.isdir(os.path.join(decompiled_dir, name)):
             return os.path.join(decompiled_dir, name)
     raise SystemExit(f'❌ 解包目录下找不到 smali/ 或 smali_classes*/ : {decompiled_dir}')
-
 
 def write_components_stamp(decompiled_dir: str, cls_desc: str) -> str:
     """记录本次注入的组件(类名 + 源文件路径)。
@@ -947,7 +849,6 @@ def write_components_stamp(decompiled_dir: str, cls_desc: str) -> str:
         json.dump(payload, fp, ensure_ascii=False, indent=2)
         fp.write('\n')
     return path
-
 
 def clean_components(decompiled_dir: str) -> int:
     """按组件标记删除残留的注入物(解密桩)。幂等,清完删标记文件。
@@ -997,7 +898,6 @@ def clean_components(decompiled_dir: str) -> int:
     os.remove(path)
     return removed
 
-
 def write_stub(decompiled_dir: str, seed: bytes) -> str:
     """写 v2/S2 解密桩。
 
@@ -1029,7 +929,6 @@ def write_stub(decompiled_dir: str, seed: bytes) -> str:
     with open(stub_path, 'w', encoding='utf-8') as fp:
         fp.write(content)
     return stub_path
-
 
 def process_file(path: str, cls_desc: str, includes, excludes,
                  exclude_methods, seed: int, next_off: int):
@@ -1219,7 +1118,6 @@ def process_file(path: str, cls_desc: str, includes, excludes,
         fp.write('\n'.join(final))
     return hits, idx, field_backfills
 
-
 def inject_clinit_backfills(path: str, backfills) -> bool:
     """报错二十四/D4:在 path 所属类的 <clinit> 末尾(return-void 之前)注入:
 
@@ -1301,7 +1199,6 @@ def inject_clinit_backfills(path: str, backfills) -> bool:
     with open(path, 'w', encoding='utf-8') as fp:
         fp.write('\n'.join(lines))
     return True
-
 
 def main():
     argv = sys.argv[1:]
@@ -1461,7 +1358,6 @@ def main():
             print('⚠️ 没有任何字符串被加密 —— 检查规则是否命中(系统/依赖类会被硬排除)',
                   file=sys.stderr)
     return 0
-
 
 if __name__ == '__main__':
     sys.exit(main())

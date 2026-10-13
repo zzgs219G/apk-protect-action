@@ -1,35 +1,14 @@
 #!/usr/bin/env bash
 # build-stub.sh — 解密桩编译链: StrDec.java → javac → d8 → baksmali → StrDec.smali
 #
-# 【为什么这条链存在】
-# 手写 smali 桩的可维护性已被历史报错(二十一/二十二/二十五)反复证伪。本链把
-# smali 降级为自动生成的中间产物:算法只改 StrDec.java,重跑本脚本即得新 smali,
-# 人永远不碰 StrDec.smali。
+# 模块的完整契约(密文形态/密钥流/SEED 双锚点注入/历史教训)见同目录 README.md。
+# 要点: smali 是自动生成的中间产物,人永远不要手改;本脚本用哨兵种子
+# 0x5EED000000000000L 编译(非 0 使 d8 保留 SEED 字段初值并内联到使用点),
+# encrypt-strings.py 据此做双锚点一致性注入;产出后自检两个锚点,缺失 fail-fast。
 #
-# 【用法】build-stub.sh [输出目录]
-# 【产物】
-#   <输出目录>/StrDec.smali  — 解密桩骨架(无占位符,可直接汇编),
-#                              含一个哨兵种子常量,由 encrypt-strings.py 结构性
-#                              替换为真种子(见下"SEED 注入契约")。
-#   默认输出目录 = 本脚本所在目录 stub-src/(仓库内的骨架缓存),
-#   与 encrypt-strings.py 的读取路径 stub-src/StrDec.smali 一致 —— 勿改此语义。
-#   注:产物文件名固定为 StrDec.smali(不带包路径),因为它只是"类体片段"的载体,
-#   真正的类名/包名已在 smali 内的 .class 行里写死为 Lcom/nc/strdec/StrDec;。
-#
-# 【SEED 注入契约(与 encrypt-strings.py 共同维护,勿单方面改)】
-# 本脚本用哨兵种子 0x5EED000000000000 编译。d8 的行为(已实测):
-#   * SEED 初值非 0 → 保留 `.field private static final SEED:J = 0x...L`
-#   * 同时把种子【内联】到每个使用点(const-wide vX, 0x...L)
-# 所以 encrypt-strings.py 必须做【双锚点一致性注入】:`.field` 初值与所有内联
-# 常量同时改写为真种子,且改写数量守恒(错一个 → 运行期与构建期密钥流不一致,
-# 全包字符串乱码)。本脚本产出后自检这两个锚点都存在,缺失即 fail-fast。
-#
-# 【依赖】
-#   javac        — JDK(本机已有)
-#   tools/d8.jar — 仓库内固定版本 D8(r8 9.3.16,与 apktool.jar 同待遇)
-#   android-all.jar — $STUB_ANDROID_JAR 或 robolectric 默认路径(编译期 classpath,
-#                     提供 android.util.Base64)
-#   apktool.jar  — 仓库内 tools/dcc/tools/apktool.jar(dcc.zip 解压产物,提供 baksmali)
+# 用法: build-stub.sh [输出目录](默认 stub-src/,与 encrypt-strings.py 读取路径一致)
+# 依赖: javac / tools/d8.jar / android-all.jar($STUB_ANDROID_JAR 可覆盖,
+#       本机缺失时用 tests/shims 编最小 jar,见 README"依赖与环境") / apktool.jar
 set -euo pipefail
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
