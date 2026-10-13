@@ -6,7 +6,6 @@
   T1 sigcheck 单独勾选            → args.txt == ["--sigcheck"]
   T2 dex2c 单独勾选 + 规则        → --dex2c + 规则文件路径（workspace 相对）
   T3 dex2c 联合 sigcheck 留空规则 → --dex2c 不带文件参数（§7 重点）
-  T4 stringenc 勾选未填规则       → 解析器 fail（App 端同规则应拦截）
   T6 全家桶组合                   → 参数齐全、顺序固定
   T7 未知顶层 key                 → 报错退出（保险丝 a，§10.1 反向）
   T8 config 缺失其余模块 key      → 视为 disabled 不报错（§10.1 正向）
@@ -71,7 +70,6 @@ def check(name, cond, detail=""):
 
 def cfg(**kw):
     base = {"schema_version": 1, "sigcheck": False, "dex2c": {"enabled": False},
-            "stringenc": {"enabled": False},
             "antidiff": False, "envcheck": False, "packer": False}
     base.update(kw)
     return base
@@ -95,16 +93,10 @@ rc, args, files, err = run(cfg(sigcheck=True, dex2c={"enabled": True, "rules_fil
 check("T3 dex2c+sigcheck 留空规则 → --dex2c 无文件参数",
       rc == 0 and args == ["--sigcheck", "--dex2c"], f"rc={rc} args={args} err={err}")
 
-# T4
-rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": ""}))
-check("T4 stringenc 留空规则 → fail-fast", rc != 0 and "规则为空" in err, f"rc={rc} err={err}")
-
 # T6
 rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True, packer=True,
-                               dex2c={"enabled": True, "rules_file": "**/com.test.**"},
-                               stringenc={"enabled": True, "rules_file": "**/com.s.**"}))
-expect = ["--sigcheck", "--dex2c", "schema_rules/dex2c.txt",
-          "--stringenc", "schema_rules/stringenc.txt", "--anti-diff", "--envcheck",
+                               dex2c={"enabled": True, "rules_file": "**/com.test.**"}))
+expect = ["--sigcheck", "--dex2c", "schema_rules/dex2c.txt", "--anti-diff", "--envcheck",
           "--packer"]
 check("T6 全家桶 → 参数齐全且顺序固定", rc == 0 and args == expect, f"rc={rc} args={args}")
 
@@ -197,12 +189,12 @@ check("T10 schema_version 偏高 → 报错提示更新流水线", rc != 0 and "
 rc, args, files, err = run(cfg())
 check("T11 全部 disabled → 报错", rc != 0 and "没有" in err, f"rc={rc} err={err}")
 
-# T12（§7：特殊字符规则）
+# T12（§7：特殊字符规则；stringenc 下线后由 dex2c 的 rules_file 同机制覆盖）
 tricky = "**/com.test.**  # 注释 行 !排除\nactivity*\n\n$HOME `id` ; rm -rf\n"
-rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": tricky}))
+rc, args, files, err = run(cfg(dex2c={"enabled": True, "rules_file": tricky}))
 check("T12 特殊字符规则 → 原样写入文件、argv 仅相对路径",
-      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt"]
-      and files.get("stringenc.txt") == tricky,
+      rc == 0 and args == ["--dex2c", "schema_rules/dex2c.txt"]
+      and files.get("dex2c.txt") == tricky,
       f"rc={rc} args={args}")
 
 # T13

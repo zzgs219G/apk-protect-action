@@ -36,7 +36,9 @@ for m in d["modules"]:
 assert len(keys) == len(set(keys)), "模块 key 重复"
 # key 顺序 = 勾选 UI 的展示顺序 = protect.sh 的固定执行顺序
 # （protect.sh 阶段序：指纹 → dex2c → 组装 NDK(含 envcheck 并入 libnc.so) → 编译
-#   → mark-native → stringenc → anti-diff → 回编 → packer。
-#   envcheck 在 NDK 组装阶段并入 so，与 packer 一样排在列表末位。）
-assert keys == ["sigcheck", "dex2c", "stringenc", "antidiff", "envcheck", "packer"], keys
+#   → mark-native → anti-diff → 回编 → packer。
+#   envcheck 在 NDK 组装阶段并入 so，与 packer 一样排在列表末位。
+#   stringenc 已于 2026-10-13 下线删除(字符串架构优化.md 验收结论:防静态可见性
+#   收益弱于 0.95MB dex 膨胀+Base64 指纹+流水线面积的成本),历史档案见变更历史。）
+assert keys == ["sigcheck", "dex2c", "antidiff", "envcheck", "packer"], keys
 print("schema OK:", keys)

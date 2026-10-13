@@ -2,7 +2,7 @@
 # protect.sh — 唯一加固总控（勾选式合并版，取代旧三个 pipeline 总控 + run-modules.sh）
 #
 # 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dex2c [规则文件]]
-#           [--stringenc 规则文件] [--envcheck] [--packer] [--packer-smaller] [--anti-diff]
+#           [--envcheck] [--packer] [--packer-smaller] [--anti-diff]
 #   - 输入/输出/规则路径一律 normalize 成绝对路径（报错三教训：dcc 运行时要切目录，
 #     相对输出路径会被写进 dcc 目录）
 #   - 主进程 cwd 全程不漂移：dcc.py 在子 shell 里运行（module_cd_run）
@@ -14,7 +14,6 @@
 #                          双保险插桩（<clinit> + onCreate）→ Java 层判决式签名
 #                          联动注入(§3.11,判决在 so/杀在 Java,so 缺失即 fail-closed)→ 回编
 #   只 --dex2c [规则]    → 规则转 filter → dcc 转译 → mark-native.py 壳替换 → 回编
-#   只 --stringenc 规则  → 规则转正则 → 字符串加密(注入 Java 解密桩) → 回编
 #   --sigcheck --dex2c   → 提取指纹 → dcc 转译 → sig_check.c 合入同一 NDK 工程 →
 #                          mark-native.py 壳替换（不插 loadLibrary：onCreate 已抽进 so，
 #                          删 <clinit> 的 loadLibrary 会让 native 壳直接自爆）→ 回编
@@ -31,14 +30,10 @@
 #   未提供规则 + 联合勾选 sigcheck → 自动抽主类(make-filter-from-apk.py)
 #   未提供规则 + 未勾 sigcheck   → 报错退出(fail-fast,无类名来源)
 #
-# --stringenc [规则文件]   → dex 层字符串常量加密(与 dex2c 同款规则语法,内部复用
-#   rules-to-filter.py 的 class_rule_to_filter 做类匹配)。规则必填(没有"自动抽
-#   主类"的兜底:字符串加密必须明确范围,否则可能误伤)。加密对象 = const-string
-#   字面量 + R8 折叠的 static final String 字段常量;系统类/框架依赖类按硬编码
-#   名单排除,规则写 ** 也不突破。产物侧用纯 Java 解密桩 Lcom/nc/strdec/StrDec; 解,
-#   不依赖 so。
+# (字符串加密模块已于 2026-10-13 下线删除——验收结论:防静态可见性收益弱于
+#  0.95MB dex 膨胀+Base64 指纹+流水线面积的成本;设计档案见字符串架构优化.md)
 #
-# 固定执行顺序（与勾选顺序无关）：sigcheck → dex2c → stringenc → anti-diff → packer
+# 固定执行顺序（与勾选顺序无关）：sigcheck → dex2c → anti-diff → packer
 #
 # 前置依赖（由 workflow 安装）: python3 + dcc requirements、JDK 17、Android NDK、apktool
 set -euo pipefail
@@ -72,7 +67,6 @@ WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 PACKER_SMALLER=0   # 报错四十三:--packer-smaller(体积优化)→ 环境变量传 packer.sh
 DPT_EXTRA_ARGS_TEXT=""  # 通用 dpt 参数通道(报错四十三后方向调整):自由文本,空格分隔
 EXCLUDE_ABI=""          # 带值参数标准件(报错四十四):--exclude-abi 的值,经环境变量传 packer.sh
-WANT_STRINGENC=0; STRING_RULES=""
 WANT_ANTIDIFF=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -81,11 +75,6 @@ while [[ $# -gt 0 ]]; do
                 # 规则文件可选(联合勾选 sigcheck 时可省略 → 自动抽主类)
                 if [[ $# -ge 1 && "$1" != --* ]]; then
                   DEX2C_RULES="$(normalize_path "$1")"; shift
-                fi ;;
-    --stringenc) WANT_STRINGENC=1; shift
-                # 规则文件必填(字符串加密必须明确范围,不做"自动抽主类"兜底)
-                if [[ $# -ge 1 && "$1" != --* ]]; then
-                  STRING_RULES="$(normalize_path "$1")"; shift
                 fi ;;
     --envcheck) WANT_ENVCHECK=1; shift ;;
     --packer)   WANT_PACKER=1; shift ;;
@@ -101,7 +90,7 @@ while [[ $# -gt 0 ]]; do
       fi ;;
     --dpt-extra-args)
       # 通用 dpt 参数通道:值无条件取下一 token(dpt 参数本身合法地以 -- 开头,
-      # 不能套 --stringenc 的 "$1" != --* 守卫);缺值视为空(不附加)。
+      # 不能套带值参数惯用的 "$1" != --* 守卫);缺值视为空(不附加)。
       # 安全边界:自由文本只构成打包参数注入面,最坏打包失败;secrets 不经此路径。
       if [[ $# -ge 2 ]]; then DPT_EXTRA_ARGS_TEXT="$2"; shift 2; else shift; fi ;;
 
@@ -110,9 +99,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC + WANT_ANTIDIFF))
+TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_ANTIDIFF))
 if [[ $TOTAL -eq 0 ]]; then
-  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --envcheck / --anti-diff / --packer）"
+  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --envcheck / --anti-diff / --packer）"
   exit 1
 fi
 
@@ -133,17 +122,7 @@ if [[ $WANT_DEX2C -eq 1 ]]; then
     exit 1
   fi
 fi
-if [[ $WANT_STRINGENC -eq 1 ]]; then
-  if [[ -z "$STRING_RULES" ]]; then
-    log_err "--stringenc 必须提供类名规则文件（字符串加密不做自动抽主类的兜底）"
-    log_err "     规则语法与 --dex2c 完全一致: com.test.** / com.test.* / 精确类名 /"
-    log_err "     activity*(需 --classes) / !com.test.libs.** 排除 / # 注释"
-    exit 1
-  fi
-  require_nonempty_file "$STRING_RULES" "stringenc 规则文件"
-fi
-
-log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → stringenc → anti-diff → packer"
+log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → anti-diff → packer"
 
 # ── STEP 1: 提取证书指纹，生成 sig_hash.h（仅 --sigcheck） ──────────
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
@@ -189,8 +168,8 @@ if [[ $WANT_DEX2C -eq 1 ]]; then
 fi
 
 # ── STEP 3: 组装 NDK 工程 → 编译 libnc.so ───────────────────────────
-# 报错二十三:stringenc 是纯 dex 层模块,不产出/不依赖任何 so。
-# 只勾 stringenc(或未来其它纯 dex 组合)时,STEP 3/4 必须整体跳过 ——
+# 报错二十三:纯 dex 层模块组合不产出/不依赖任何 so。
+# 纯 dex 组合(未来若有)时,STEP 3/4 必须整体跳过 ——
 # 否则 ndk_write_mk 会往一个从未创建的 jni/ 目录里 cat > Application.mk,
 # 报 "No such file or directory"(报错信息里的 tmp.XXX/project/jni 路径即此)。
 # 有 so 需求的组合:sigcheck / dex2c / envcheck 任一勾选。
@@ -250,7 +229,7 @@ ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一）�
 
 log_step 4 6 "NDK 编译"
 ndk_build "$WORK/project"
-fi   # 有 so 需求的组合才执行 STEP 3/4(报错二十三:纯 stringenc 组合跳过)
+fi   # 有 so 需求的组合才执行 STEP 3/4(报错二十三:纯 dex 组合跳过)
 
 # ── STEP 5: 解包 → smali 处理 → 放 so → 回编（全组合只做这一次） ────
 log_step 5 6 "解包注入重打包"
@@ -275,50 +254,15 @@ fi
 # 两套独立真校验之一:Java 只"量"(PackageManager)并执行杀,标准值与比对全在
 # so(nc_link.c) —— 指纹永不过境进 dex;so 缺失 → fail-closed 杀,loadLibrary
 # 由"可删开关"变"承重墙"(修复 sigcheck-only 删开关静默绕过的最大缺口)。
-# 必须在插桩/loadLibrary 之后、stringenc 之前:新类常量可被 stringenc 顺带加密。
+# 必须在插桩/loadLibrary 之后(覆盖旧注入点的幂等语义)。
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
   python3 "$ROOT/scripts/sigcheck/javalink/inject-javacheck.py" \
     "$WORK/decompiled" --so-name nc
 fi
 
-# ── 字符串加密（dex 层，与 so 无关；必须在 mark-native 之后） ──────
-# 放在 native 化之后的原因:被 dex2c 抽走的方法此时已是 native 壳、没有方法体,
-# 字符串加密自然扫不到它们(省体积);同时用 compiled_methods.txt 做精确跳过,
-# 避免 dcc 与 mark-native 之间的时序差异导致误加密(报错十三式的布局假设错误)。
-#
-# 【重要】直接把【用户规则文件】交给 encrypt-strings.py,不要先转成 dcc filter:
-# 该脚本内部复用 rules-to-filter.py 的 class_rule_to_filter 做类匹配,输入必须
-# 是用户规则(点号通配符)。若喂 rules-to-filter.py 的产物(dcc filter 正则)
-# 会被二次转换产生畸形正则(LLcom/.../),filter 那侧的同类坑见流程文档 §2 步骤 3。
-if [[ $WANT_STRINGENC -eq 1 ]]; then
-  # activity* 需要 Activity 类列表 → 从 Manifest 动态提取(同 dex2c 侧做法)
-  if grep -q '^[[:space:]]*activity\*[[:space:]]*$' "$STRING_RULES"; then
-    log_info "检测到 activity* 规则,从 Manifest 提取 Activity 列表"
-    python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" \
-      "$WORK/.placeholder_string_activity.txt" --classes "$WORK/activity_classes.txt" \
-      --on-fail skip || true
-  fi
-
-  # 残留清理(幂等):上一轮若留下解密桩但本次一条都没加密,不能把旧桩带进产物
-  python3 "$ROOT/scripts/string-enc/encrypt-strings.py" clean "$WORK/decompiled"
-
-  STRING_ENC_ARGS=()
-  if [[ -f "$WORK/activity_classes.txt" ]]; then
-    STRING_ENC_ARGS+=(--classes "$WORK/activity_classes.txt")
-  fi
-  if [[ $WANT_DEX2C -eq 1 ]]; then
-    # 被抽进 so 的方法跳过 —— 它们的字符串会在 so 里,dex 侧没必要再加密
-    STRING_ENC_ARGS+=(--exclude-methods "$WORK/project/jni/nc/compiled_methods.txt")
-  fi
-  python3 "$ROOT/scripts/string-enc/encrypt-strings.py" \
-    "$WORK/decompiled" "$STRING_RULES" "${STRING_ENC_ARGS[@]}"
-fi
-
-# ── 防对比混淆（dex 层，最后做：等 dcc/stringenc 的改动落定后再上结构噪声） ──
-# 放在 stringenc 之后的原因:stringenc 会给选中类插入解密桩并改写 const-string,
-# 若 anti-diff 先做、stringenc 后做,stringenc 的改动会让 anti-diff 的"已处理"
-# 标记附近继续出现新差异,削弱防对比效果;最后做 anti-diff,全量 smali 一次性
-# 盖上标签重命名/块重排/入口垃圾指令噪声,diff 视角即"整包重编译"。
+# ── 防对比混淆（dex 层，最后做：等 dcc 的改动落定后再上结构噪声） ──
+# 最后做 anti-diff,全量 smali 一次性盖上标签重命名/块重排/入口垃圾指令噪声,
+# diff 视角即"整包重编译"。
 # anti-diff 自带跳过:native 方法(dcc 壳)、<init>/<clinit>(sigcheck/dcc 依赖)。
 if [[ $WANT_ANTIDIFF -eq 1 ]]; then
   # 变换 F（shl⇄mul 恒等重编码）已并入模块本体固定开启——原 antidiff.reencode
@@ -329,7 +273,7 @@ fi
 if [[ $WANT_SIGCHECK -eq 1 || $WANT_DEX2C -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
   repack_install_so "$WORK/decompiled" "$WORK/project/libs"
   # 强制解压 so 加载（本方案唯一允许的 Manifest 修改）——只在有 so 的组合执行;
-  # 纯 dex 组合(仅 stringenc)没有 libnc.so,manifest 无需改写(报错二十三)
+  # 纯 dex 组合没有 libnc.so,manifest 无需改写(报错二十三)
   repack_force_extractnativelibs "$WORK/decompiled"
 fi
 repack_build "$WORK/decompiled" "$WORK/unsigned.apk"

@@ -108,11 +108,12 @@ SMALI_DIR_RE = _INJECT.SMALI_DIR_RE
 
 CLASS_MARK = '# nc-antidiff-applied v1'   # 已处理类的标记注释(幂等判定)
 
-# ── 硬排除:系统类与框架依赖(与 stringenc SYSTEM_CLASS_PREFIXES 同型) ──
+# ── 硬排除:系统类与框架依赖(原与 stringenc SYSTEM_CLASS_PREFIXES 同型,
+#             stringenc 已于 2026-10-13 下线,本清单为 anti-diff 自有维护) ──
 # 理由(与 encrypt-strings.py §100 同源):这些类不是要保护的产品代码,
 # 反射/序列化/JNI 绑定库的任何文本扰动只有风险没有收益;攻击者对比时
 # 这些类本来就在"第三方依赖原样"的预期内,不构成定位线索。
-# 注:anti-diff 不改字符串/标识符,风险低于 stringenc,但 jsoup 这类
+# 注:anti-diff 不改字符串/标识符,但 jsoup 这类
 # "字符串即协议"的库在变换 C 下仍可能被启发式工具误报,统一排除省心。
 SKIP_CLASS_PREFIXES = (
     'android.', 'androidx.', 'android.support.', 'com.android.',
