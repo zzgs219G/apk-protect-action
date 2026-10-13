@@ -8,8 +8,7 @@
 #   ④ 注入的桩含真种子、零哨兵残留、无 .line/.source
 #   ⑤ 幂等: 再跑一次,产物字节完全一致
 #   ⑥ 种子复用: 第二次跑读回第一次的种子(不重新生成)
-#   ⑦ 解密正确性: 用编译桩解真实产物里的密文, 还原出原文
-#   ⑧ 桩【真过 apktool 汇编】(报错二十七): 注入后的 smali 必须能被 apktool
+#   ⑦ 桩【真过 apktool 汇编】(报错二十七): 注入后的 smali 必须能被 apktool
 #      真正汇编成 dex —— 文本断言(含真种子/零哨兵)拦不住"文件被腰斩"这类
 #      结构损坏, 只有真汇编才暴露(历史: mismatched input '' expecting
 #      END_METHOD_DIRECTIVE)

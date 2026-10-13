@@ -71,6 +71,11 @@ GAMMA = 0x9E3779B97F4A7C15L
    的每条字符串全部解错）。
 3. 解码必须 `byte[]` + `new String(byte[], "UTF-8")`——`char[]` 形态是 Latin-1 语义，
    中文/emoji 多字节 UTF-8 会乱码。
+4. `d()` 的块展开与 `keyByte()` 是同一密钥流的两份代码：**运行期唯一实现是 d() 的
+   块展开**（一次 mix64 产 8 字节），keyByte 仅供 A1 第 1 层反射对拍；不让 d() 逐
+   字节调 keyByte 是刻意的——未命中 keystream 成本会 ×8。两份实现的一致性由
+   A1 第 2 层全链往返 + A3 真闭环（真实分配器产物）双向钉死；offset 样本覆盖
+   %8 全部 8 个 residue，gen_plan 内置断言防样本集退化（2026-10-13 复核加固）。
 
 ## SEED 注入契约（build-stub.sh ↔ encrypt-strings.py 共同维护，勿单方面改）
 
@@ -214,5 +219,5 @@ CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
 | 套件 | 覆盖 |
 |---|---|
 | `tests/test-encrypt-smoke.sh` | 全链加密→解密往返 + 桩自检（27 断言） |
-| `tests/test-keystream-crosscheck.sh` | Python ↔ Java 密钥流逐字节对拍（288×2） |
+| `tests/test-keystream-crosscheck.sh` | Python ↔ Java 对拍：第 1 层反射 keyByte/mix64 纯算术；**第 2 层真实编译桩 d() 全链往返**（4 种子 × 117 例，offset 覆盖 %8 全部 8 个 residue） |
 | `tests/test-structure-resume.sh` | 续跑（offset 分配器）/ 桩结构不变量（含 L1 缓存断言） |

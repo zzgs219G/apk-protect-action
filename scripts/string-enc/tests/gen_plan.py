@@ -53,7 +53,9 @@ def build_samples():
 def build_plan(only_seed=None):
     """生成对拍计划:每条样本一个 (seed, offset, plain_hex, payload) 用例。
 
-    offset 刻意取非 8 对齐值与跨 64 位块边界值,锁定 `i>>>3` / `i&7` 的易错点。
+    offset 样本覆盖 %8 的全部 8 个 residue(0..7)与跨 64 位块边界值,锁定
+    `i>>>3` / `i&7` 的易错点(2026-10-13 复核加固:原 8 个 offset 仅覆盖
+    residue {0,1,7},d() 块展开的"非对齐起步"路径漏测 2..6)。
     only_seed: 只生成该种子(16 位 hex)的用例 —— 全链对拍按种子分组时用。
     """
     cases = []
@@ -61,7 +63,10 @@ def build_plan(only_seed=None):
              0xFFFFFFFFFFFFFFFF, 0x0000000000000001]
     if only_seed is not None:
         seeds = [int(only_seed, 16)]
-    offsets = [0, 1, 7, 8, 9, 65535, 65536, 0xFFFFFF - 32]
+    offsets = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 65535, 65536, 0xFFFFFF - 32]
+    # 覆盖不变量:residue 0..7 必须全在样本里,防将来改 offset 清单时静默漏测
+    assert {o % 8 for o in offsets} >= set(range(8)), \
+        'offset 样本必须覆盖 %8 全部 8 个 residue(块展开对齐路径不得漏测)'
     for seed in seeds:
         for sample in build_samples():
             plain = sample.encode('utf-8')
