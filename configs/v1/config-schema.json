@@ -28,7 +28,7 @@
             "when": "always",
             "unless": { "key": "sigcheck", "is": true }
           },
-          "hint": "联合签名校验时可留空（自动抽主类）"
+          "hint": "留空并勾选签名校验=自动抽主类；支持 com.test.** 定向；勿填 ** 全量（整个App转译，上游不支持）"
         }
       ]
     },
@@ -51,7 +51,7 @@
             "when": "always",
             "unless": { "key": "sigcheck", "is": true }
           },
-          "hint": "联合签名校验时可留空（自动抽主类）"
+          "hint": "留空并勾选签名校验=自动抽主类；支持 com.test.** 定向；勿填 ** 全量（整个App转译，上游不支持）"
         }
       ]
     },

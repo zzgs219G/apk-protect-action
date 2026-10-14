@@ -201,6 +201,17 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
         "$WORK/.placeholder_filter.txt" --classes "$WORK/activity_classes.txt" \
         --on-fail skip || true
     fi
+    # 全量规则防呆(2026-10-15 排查教训): ** 会被 rules-to-filter.py 转成
+    # L.*;.*(全 App 转译)。上游引擎对全量转译明确不支持——混淆过的大方法会
+    # 生成引用未声明变量的坏 C,报错形态是 NDK 编译期 undeclared identifier,
+    # 极难归因。在源头拦下,报人话(上游 dcc.py 内置护栏只拦字面 .*,拦不住
+    # L.*;.*,必须在流水线层补)。
+    if grep -qE '^L\.\*;\.\*$|^\.\*$' "$WORK/dcc_filter.txt"; then
+      log_err "检测到全量转译规则(**): 会把整个 App 的所有方法抽进 so,上游明确不支持"
+      log_err "     (混淆过的大方法会生成坏 C 代码,报错是难排查的 undeclared identifier)"
+      log_err "     正确姿势: ①规则留空+勾选签名校验 → 自动抽主类; ②定向规则,如 com.xixin.box.**"
+      exit 1
+    fi
     DCC_FILTER="$WORK/dcc_filter.txt"
   elif [[ $WANT_SIGCHECK -eq 1 ]]; then
     log_info "filter 来源: 未提供规则,自动抽取主类(make-filter-from-apk)"
