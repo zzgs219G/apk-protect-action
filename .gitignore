@@ -1,6 +1,8 @@
 build/
 # dcc.zip 解压产物(tools/dcc/ 单层,真源是 tools/dcc.zip)
 /tools/dcc/
+# dex2c.zip 解压产物(tools/Dex2C/ 单层,真源是 tools/dex2c.zip)
+/tools/Dex2C/
 # dpt-shell.zip 解压产物(tools/executable/ 单层,真源是 tools/dpt-shell.zip)
 /tools/executable/
 .gradle/

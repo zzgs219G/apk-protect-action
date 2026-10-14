@@ -6,6 +6,8 @@
   T1 sigcheck 单独勾选            → args.txt == ["--sigcheck"]
   T2 dex2c 单独勾选 + 规则        → --dex2c + 规则文件路径（workspace 相对）
   T3 dex2c 联合 sigcheck 留空规则 → --dex2c 不带文件参数（§7 重点）
+  T2b dcc 单独勾选 + 规则          → --dcc + 规则文件路径（2026-10-14 起 dcc=经典引擎,dex2c=新引擎）
+  T3b dcc 联合 sigcheck 留空规则   → --dcc 不带文件参数
   T4 stringenc 勾选未填规则       → 解析器 fail（App 端同规则应拦截）
   T6 全家桶组合                   → 参数齐全、顺序固定
   T7 未知顶层 key                 → 报错退出（保险丝 a，§10.1 反向）
@@ -70,7 +72,8 @@ def check(name, cond, detail=""):
 
 
 def cfg(**kw):
-    base = {"schema_version": 1, "sigcheck": False, "dex2c": {"enabled": False},
+    base = {"schema_version": 1, "sigcheck": False, "dcc": {"enabled": False},
+            "dex2c": {"enabled": False},
             "stringenc": {"enabled": False},
             "antidiff": False, "envcheck": False, "packer": False}
     base.update(kw)
@@ -94,6 +97,18 @@ check("T2 dex2c+规则 → --dex2c + workspace 相对规则路径",
 rc, args, files, err = run(cfg(sigcheck=True, dex2c={"enabled": True, "rules_file": ""}))
 check("T3 dex2c+sigcheck 留空规则 → --dex2c 无文件参数",
       rc == 0 and args == ["--sigcheck", "--dex2c"], f"rc={rc} args={args} err={err}")
+
+# T2b（2026-10-14 接入第二转译引擎:dex2c 名让给新引擎,经典引擎改挂 --dcc）
+rc, args, files, err = run(cfg(dcc={"enabled": True, "rules_file": "**/com.test.**"}))
+check("T2b dcc+规则 → --dcc + workspace 相对规则路径",
+      rc == 0 and args == ["--dcc", "schema_rules/dcc.txt"]
+      and files.get("dcc.txt", "").strip() == "**/com.test.**",
+      f"rc={rc} args={args}")
+
+# T3b
+rc, args, files, err = run(cfg(sigcheck=True, dcc={"enabled": True, "rules_file": ""}))
+check("T3b dcc+sigcheck 留空规则 → --dcc 无文件参数",
+      rc == 0 and args == ["--sigcheck", "--dcc"], f"rc={rc} args={args} err={err}")
 
 # T4
 rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": ""}))

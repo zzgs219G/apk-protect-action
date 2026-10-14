@@ -85,6 +85,27 @@ ensure_dcc() {
   echo "$dest/dcc"
 }
 
+# ensure_dex2c [解压根目录，默认 "$ROOT/tools"] → 解压后 Dex2C 目录路径(stdout)
+# 与 ensure_dcc 同款的第二转译引擎分发包(--dex2c)。真源 tools/dex2c.zip =
+# 父目录 ../Dex2C/ 仓库 Release 资产 Dex2C-<tag>.zip 原样（顶层 Dex2C/），
+# 下载后改名即分发包。zip 内顶层是 Dex2C/，解压到 tools/ 得单层 tools/Dex2C/；
+# 解压产物不进版本库，由 .gitignore 的 /tools/Dex2C/ 忽略。
+# 幂等:目标已存在(dcc.py 可见)则跳过解压,重复调用零开销。
+# 换版纪律:删旧解压产物再跑（幂等靠"dcc.py 存在"判断，旧产物在会静默用旧版）。
+DEX2C_ZIP="$ROOT/tools/dex2c.zip"  # dex2c 分发包(唯一真源,源码 ../Dex2C/)
+ensure_dex2c() {
+  local dest="${1:-$ROOT/tools}"
+  if [[ -f "$dest/Dex2C/dcc.py" ]]; then
+    echo "$dest/Dex2C"
+    return 0
+  fi
+  require_file "$DEX2C_ZIP" "dex2c 分发包"
+  mkdir -p "$dest"
+  unzip -qo "$DEX2C_ZIP" -d "$dest"
+  [[ -f "$dest/Dex2C/dcc.py" ]] || { log_err "dex2c.zip 解压后缺 Dex2C/dcc.py: $dest"; exit 1; }
+  echo "$dest/Dex2C"
+}
+
 # module_cd_run <目录> <命令...> — 在子 shell 里切目录执行，主进程 cwd 永不漂移
 module_cd_run() {
   local dir="$1"; shift
