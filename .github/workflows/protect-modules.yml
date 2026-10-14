@@ -78,13 +78,21 @@ jobs:
           # input 键名 protect_config 为永久冻结名（设计方案 §10.7）
           INPUT_PROTECT_CONFIG: ${{ inputs.protect_config }}
         run: |
-          python3 scripts/actions/resolve-config.py
-          echo "=== args.txt（一行一个参数）==="
-          cat schema_rules/args.txt
-          for f in schema_rules/*.txt; do
-            [[ "$f" == schema_rules/args.txt ]] && continue
-            echo "=== $f ==="; cat "$f"
-          done
+          # 观测性(2026-10-15 排查教训)：本次提交的配置原文/解析参数/规则内容必须进
+          # build.log——否则失败排查时(如规则误填 ** 触发全量转译)对"实际提交了什么"
+          # 一无所知，只能去网页翻 step 日志。env 中转照旧，内容仅 tee 进日志文件。
+          touch build.log
+          echo "=== 本次提交的 protect_config 原文 ===" | tee -a build.log
+          echo "$INPUT_PROTECT_CONFIG" | tee -a build.log
+          python3 scripts/actions/resolve-config.py 2>&1 | tee -a build.log
+          {
+            echo "=== args.txt（一行一个参数）==="
+            cat schema_rules/args.txt
+            for f in schema_rules/*.txt; do
+              [[ "$f" == schema_rules/args.txt ]] && continue
+              echo "=== $f ==="; cat "$f"
+            done
+          } | tee -a build.log
 
       - name: 下载 APK
         timeout-minutes: 5
