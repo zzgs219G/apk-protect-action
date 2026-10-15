@@ -366,7 +366,6 @@ def render_hb(wrapper_desc):
     :catch_hb
     goto :goto_loop
 .end method
-.end class
 """
     return text
 
