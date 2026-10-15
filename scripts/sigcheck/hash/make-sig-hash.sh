@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# make-sig-hash.sh — 从 APK 提取证书指纹，生成 sig_hash.h
-# 用法: make-sig-hash.sh <apk路径> <输出sig_hash.h路径>
+# make-sig-hash.sh — 从 APK 提取证书指纹，生成 sig_hash.h + sig_guard2.h
+# 用法: make-sig-hash.sh <apk路径> <输出sig_hash.h路径> [输出sig_guard2.h路径]
+#
+# 2026-10 独立双线:除原有 sig_hash.h 外,再生成一份【独立答案】sig_guard2.h,
+#   供独立模块 sig_guard2.c 使用。两线的关系:
+#     - 各自的 salt 独立随机、派生公式不同(见下方两处 python)
+#     - 攻击者改掉一条线的标准值,另一条线的判定不受影响
+#     - 不共用头文件是刻意的:共享 = 单点(改一处两线同废)
+#   第 3 个参数缺省时只生成 sig_hash.h(向后兼容旧调用)。
 # 依赖（按优先级）:
 #   1. apksigner (build-tools) — v1/v2/v3 全支持
 #   2. scripts/extract-cert-fp.py (纯 python3 标准库) — 解析 v2/v3 Signing Block
@@ -10,9 +17,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APK="$1"
 OUT="$2"
+OUT2="${3:-}"   # 可选:第二份独立答案(sig_guard2.h)
 
-if [[ $# -ne 2 ]]; then
-  echo "用法: $0 <apk> <输出.h>" >&2
+if [[ $# -lt 2 ]]; then
+  echo "用法: $0 <apk> <输出sig_hash.h> [输出sig_guard2.h]" >&2
   exit 1
 fi
 if [[ ! -f "$APK" ]]; then
@@ -122,3 +130,59 @@ fi
 } > "$OUT"
 
 echo "✅ sig_hash.h 已生成(双轮派生形态,明文指纹未写入): 指纹=$HASH_HEX salt=$SALT_HEX"
+
+# ── 第二份独立答案(2026-10 双线) ─────────────────────────────────────
+# 仅当调用方给了第 3 个参数时生成。与第一份的关系:【同源指纹,不同派生】。
+#   salt2  = os.urandom(16)                          独立随机(与 salt 无关联)
+#   t2     = SHA256(b"G2" || fp)                     轮1: 加域分隔符,与 t1 不同
+#   stored2[i] = t2[i] ^ salt2[(i*7) % 16]          轮2: 步进 7 的置换取盐
+#              ^ ((i * 0x5B + 0x3D) & 0xFF)         不同的位置扩散系数
+# 攻击者即使完全解开第一份的派生逻辑,也【推不出】第二份的公式与盐。
+if [[ -n "$OUT2" ]]; then
+  DERIVED2_JSON=$(python3 - "$HASH_HEX" <<'PYEOF'
+import hashlib, os, sys, json
+fp = bytes.fromhex(sys.argv[1])
+salt = os.urandom(16)
+t2 = hashlib.sha256(b"G2" + fp).digest()
+stored = bytes(
+    t2[i] ^ salt[(i * 7) % 16] ^ ((i * 0x5B + 0x3D) & 0xFF)
+    for i in range(32)
+)
+print(json.dumps({"salt": salt.hex(), "stored": stored.hex()}))
+PYEOF
+)
+  SALT2_HEX=$(printf '%s' "$DERIVED2_JSON" | grep -o '"salt": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{32\}')
+  STORED2_HEX=$(printf '%s' "$DERIVED2_JSON" | grep -o '"stored": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{64\}')
+  if [[ ${#SALT2_HEX} -ne 32 || ${#STORED2_HEX} -ne 64 ]]; then
+    echo "❌ 第二份派生失败(python 输出异常): $DERIVED2_JSON" >&2
+    exit 1
+  fi
+  {
+    echo "/* 由流水线自动生成:sig_guard2.c 专用(独立派生,与 sig_hash.h 不同源公式) */"
+    echo "/* 攻防说明:两条线互不共享标准值 —— 改掉一条,另一条仍在判定 */"
+    echo "#ifndef _SIG_GUARD2_H_"
+    echo "#define _SIG_GUARD2_H_"
+    echo "#define SG2_HASH_LEN 32"
+    echo "#define SG2_SALT_LEN 16"
+    echo "static const unsigned char SG2_SALT[SG2_SALT_LEN] = {"
+    for ((i = 0; i < 32; i += 16)); do
+      row=""
+      for ((j = 0; j < 16; j += 2)); do
+        row+="0x${SALT2_HEX:i+j:2}, "
+      done
+      echo "    ${row%, },"
+    done
+    echo "};"
+    echo "static const unsigned char SG2_STORED[SG2_HASH_LEN] = {"
+    for ((i = 0; i < 64; i += 16)); do
+      row=""
+      for ((j = 0; j < 16; j += 2)); do
+        row+="0x${STORED2_HEX:i+j:2}, "
+      done
+      echo "    ${row%, },"
+    done
+    echo "};"
+    echo "#endif"
+  } > "$OUT2"
+  echo "✅ sig_guard2.h 已生成(独立派生): salt2=$SALT2_HEX"
+fi

@@ -194,10 +194,14 @@ fi
 
 log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dcc/dex2c → stringenc → anti-diff → packer"
 
-# ── STEP 1: 提取证书指纹，生成 sig_hash.h（仅 --sigcheck） ──────────
+# ── STEP 1: 提取证书指纹，生成 sig_hash.h + sig_guard2.h（仅 --sigcheck） ──
+# 2026-10 双线:同时生成第二份【独立】标准答案(sig_guard2.h),供
+# sig_guard2.c 使用 —— 两条线的 salt/派生公式/处置路径全独立,
+# 攻击者 patch 第一线的 delayed_kill 后,第二线照常判定。
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
   log_step 1 6 "提取证书指纹"
-  "$ROOT/scripts/sigcheck/hash/make-sig-hash.sh" "$IN_APK" "$WORK/sig_hash.h"
+  "$ROOT/scripts/sigcheck/hash/make-sig-hash.sh" "$IN_APK" \
+      "$WORK/sig_hash.h" "$WORK/sig_guard2.h"
 fi
 
 # ── STEP 2: dcc 转译（仅 --dex2c，--no-build 只产出工程包） ─────────
@@ -349,13 +353,17 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
     mkdir -p "$WORK/project/jni/nc"
     cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/nc/"
     cp "$ROOT/scripts/sigcheck/src/nc_link.c"   "$WORK/project/jni/nc/"
+    cp "$ROOT/scripts/sigcheck/src/sig_guard2.c" "$WORK/project/jni/nc/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/nc/"
+    cp "$WORK/sig_guard2.h"             "$WORK/project/jni/nc/"
     cp "$WORK/sig_log_data.h"           "$WORK/project/jni/nc/"
   else
     mkdir -p "$WORK/project/jni"
     cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/"
     cp "$ROOT/scripts/sigcheck/src/nc_link.c"   "$WORK/project/jni/"
+    cp "$ROOT/scripts/sigcheck/src/sig_guard2.c" "$WORK/project/jni/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/"
+    cp "$WORK/sig_guard2.h"             "$WORK/project/jni/"
     cp "$WORK/sig_log_data.h"           "$WORK/project/jni/"
   fi
 fi
