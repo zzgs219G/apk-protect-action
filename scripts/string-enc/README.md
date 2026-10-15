@@ -1,9 +1,33 @@
 # string-enc — dex 层字符串常量加密模块
 
-构建期把「用户选中类」的 `const-string` 字面量加密，运行期由注入的纯 Java 解密桩
-`Lcom/nc/strdec/StrDec;` 解密。目标：`strings`/静态特征扫描看不到明文（URL/API
-key/日志文案）。**定位是防静态可见性，不是密码学安全**——密钥流派生材料同在包内，
+构建期把「用户选中类」的 `const-string` 字面量加密，运行期由注入的解密桩解密。
+目标：`strings`/静态特征扫描看不到明文（URL/API key/日志文案）。
+**定位是防静态可见性，不是密码学安全**——密钥流派生材料同在包内，
 懂格式者仍可解；真正的密钥材料请走服务端/白盒方案。
+
+## 两层拆分（2026-10，stringenc↔dex2c 联动引入）
+
+桩已拆成「壳 + 内核」，配合 `--dex2c-stub` 可把算法整体转译进 `libnc.so`：
+
+| 层 | 方法 | 内容 | 联动后去向 |
+|---|---|---|---|
+| 壳 | `d()` | 只做 try/catch 兜底 + 转调 `dn()` | **留在 dex** |
+| 内核 | `dn()` / `mix64()` / `keyByte()` | 算法本体、splitmix64 常量、密钥流 | **进 so**（勾选 `--dex2c-stub`） |
+
+**为什么必须拆**：dex2c 转译器不支持异常表（`dcc.py:132` 读入 `exceptions`
+后再未使用，`dex2c/` 全目录无任何 try/catch 发射逻辑）。整包 try/catch 的方法体
+被转译时异常处理器被静默丢弃 → 生成能编译但语义错的 C（失败兜底丢失，
+遇到脏密文从"降级"变"崩溃"）。所以异常表必须留在 dex 的壳里，
+内核保持无异常表才能被转译。
+
+**为什么 filter 要写 3 条而不是 1 条**：dex2c 只转译 filter 命中的方法，
+未命中的方法即使被调用也只是留一个 JNI 反调。只写 `dn` 时
+`mix64`/`keyByte` 留在 dex 被 `D2C_RESOLVE_STATIC_METHOD` 反调，
+splitmix64 常量与密钥流逻辑仍可读——"算法进 so"名不副实。
+故 `--emit-stub-filter` 固定产出 dn/mix64/keyByte 三条。
+
+联动机制与代价见 `docs/流程文档.md` §3.7；不变量由 `tests/test-link-dex2c.sh`
+的 7 项断言锁死。
 
 > 2026-10-12 验收注记：真机实测本模块成本 ≈10-20ms（非冷启动主因），体积代价
 > ≈0.95MB dex（Base64 +33% 膨胀）。曾短暂讨论下线，最终保留（防静态可见性仍有
@@ -16,6 +40,7 @@ StrDec.java ──build-stub.sh──► stub-src/StrDec.smali（桩骨架,哨�
                                      │
 encrypt-strings.py ◄─────────────────┘
    │  ①解析桩骨架(双锚点注入 SEED)  ②按规则扫 const-string  ③加密+改写+注入桩
+   │  ④--emit-stub-filter:产出桩内核的 dex2c filter 规则(联动用)
    ▼
 <解包目录>/smali/**(密文 const-string + StrDec 桩) ──apktool b──► 加壳包
 ```
@@ -27,7 +52,7 @@ encrypt-strings.py ◄─────────────────┘
 | `stub-src/StrDec.smali` | **自动生成的中间产物，人永远不要手改**（报错二十一/二十二/二十五） |
 | `encrypt-strings.py` | 构建期主脚本：找字符串 → 加密 → 改写 → 注入桩（最大单体） |
 | `tools/d8.jar` | 固定版本 D8（r8 9.3.16，与 apktool.jar 同待遇，勿换版） |
-| `tests/` | 冒烟 / 密钥流对拍 / 结构与续跑 三套件 + P3/P5 宿主工具 |
+| `tests/` | 冒烟 / 密钥流对拍 / 结构与续跑 / 桩随机化 / 联动端到端 五套件 + P3/P5 宿主工具 |
 
 ## 选类语法与硬排除
 
@@ -135,15 +160,44 @@ static final String 字段：在所属类 <clinit> 里回填（inject_clinit_bac
 
 ### d() 单次调用内部（StrDec.java）
 
+**联动前（桩全在 dex）**：
+
 ```
-CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
-未命中 → Base64.decode(payload, NO_WRAP)
-       → len<4 ？→ 原样返回（兜底，不缓存）
-       → offset_be24 → 块展开 XOR（一个 mix64 产 8 字节，内层 j 从 (offset+k)&7 起）
-       → new String(out, "UTF-8")
-       → size<30000 ？→ CACHE.put（racy 检查，极端并发略超无害）
-任何异常(Throwable) → 原样返回 payload，不缓存（防毒缓存）
+d() {
+  try {
+    dn(payload)          ← 同一方法体内联
+  } catch (Throwable t) {
+    return payload       ← 兜底
+  }
+}
 ```
+
+**联动后（`--dex2c-stub`，dn/mix64/keyByte 进 so）**：
+
+```
+d() {                      ← dex 里的壳,三行
+  try   { return dn(payload); }
+  catch (Throwable t) { return payload; }
+}
+
+dn(payload) {              ← so 内(Java_*_dn__Ljava_lang_String_2)
+  CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
+  未命中 → Base64.decode(payload, NO_WRAP)
+         → len<4 ？→ 原样返回（兜底，不缓存）
+         → offset_be24 → 块展开 XOR（一个 mix64 产 8 字节，内层 j 从 (offset+k)&7 起）
+         → new String(out, "UTF-8")
+         → size<30000 ？→ CACHE.put（racy 检查，极端并发略超无害）
+  任何异常 → 向上抛给 d() 的 catch，原样返回 payload，不缓存（防毒缓存）
+}
+
+mix64(J)J                  ← so 内,由 dn 经 JNI 反调(dcc.py 不用
+keyByte(JJ)I               --dynamic-register 时 dex 内 Java 调用一律按
+                             JNI 短名解析,故多一次 JNI 往返,非本地调用)
+```
+
+> 联动后 dex 侧只剩壳 `d()` + `<clinit>`（建缓存），算法/常量/密钥流全部不可读。
+> JNI 反调的额外开销未实测；要消除需给 dex2c 传 `--dynamic-register`
+> （`protect.sh` 当前未传，属于已知未优化项）。
 
 ### 缓存事实清单（有 / 没有）
 
@@ -211,6 +265,10 @@ CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
   (悄悄换名 = 旧调用点全部指向不存在的类)
 - 替换范围:仅 .class 描述符(含桩内自引用全量 6 处)与解密主方法名;
   字段名(SEED/CACHE)与私有方法名(mix64/keyByte)是双锚点/P3 对拍契约,不动
+- **联动下 dn/mix64/keyByte 三个方法名不随机化**(2026-10):随机化只改 `d()`,
+  内核三方法名固定 —— dex2c 的 filter 由 `--emit-stub-filter` 按类描述符
+  + 固定方法名产出,方法名若也随机则规则形态要跟着变,收益为零(类描述符
+  已经每包随机,精确签名防不住)。
 - 派生物同源重建(报错四十八):STUB_DOT 与密文/回填引用/非法形态三个正则由
   `_rebuild_desc_derived()` 随主变量一起重建——漏重建的后果:续跑水位线失明
   (offset 复用=静默乱码)、`**` 规则下桩被当业务类二次加密、两条既有防线失明
@@ -229,6 +287,7 @@ CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
 | 报错二十四 | 字段常量回填引用的非法形态（初值指向 StrDec 字段）；构建期防线：产物 .field 初值禁止桩字段引用 |
 | 报错二十五 | 桩骨架三防线（占位符残留/类体顶层裸指令/so 名合法性）——泛型字段也会撞它（Signature 注解） |
 | 报错四十八 | 桩随机化只改 4 个主变量，import 期派生物（STUB_DOT 与 3 个引用正则）不随重建 → 随机名下续跑水位线失明（offset 复用=静默乱码）、`**` 规则下桩被二次加密、报错二十二/二十四防线失明；**凡派生自主变量的东西，改名时必须同源重建并有断言锁住** |
+| 2026-10 联动三层拆分 | ① `dn()` 拆出 try/catch 后 `new String(out,"UTF-8")` 的受检异常暴露 → 内核须显式 `throws UnsupportedEncodingException`；② 报错二十二自检锚点须从 `d` 改到 `dn`（真正调 Base64 的是内核，沿用旧锚点会误报壳的 `move-result-object` 并放过内核真实风险）；③ **只转 `dn` 不够**——`mix64`/`keyByte` 会留在 dex 被 JNI 反调，splitmix64 常量仍可读，filter 必须三条齐上 |
 
 ## 依赖与环境
 
@@ -246,3 +305,7 @@ CACHE.get(payload) 命中 → 直接返回（稳态，~50-100ns，零分配）
 | `tests/test-keystream-crosscheck.sh` | Python ↔ Java 对拍：第 1 层反射 keyByte/mix64 纯算术；**第 2 层真实编译桩 d() 全链往返**（4 种子 × 117 例，offset 覆盖 %8 全部 8 个 residue） |
 | `tests/test-structure-resume.sh` | 续跑（offset 分配器）/ 桩结构不变量（含 L1 缓存断言） |
 | `tests/test-stub-randomize.sh` | 桩随机化：随机生效/产物零 legacy 痕迹/续跑复用随机名/改名 fail-fast/派生物同步/** 规则两轮水位线（6 断言组） |
+| `tests/test-link-dex2c.sh` | **联动端到端**（2026-10）：随机桩名 → `--emit-stub-filter` → dex2c 转译 → 算法进 so。7 项断言：dn/mix64/keyByte 三方法转译、壳 `d()` 与构造器不转译、splitmix64 常量内联进 C、dn→mix64 反调指向 so 内导出符号。不依赖 android.jar/NDK/真机 |
+
+> 联动套件只证明**联动语义**（filter 命中 + 转译产物正确），不覆盖全流程
+> （apktool 回编 + NDK 编译 + 真机启动）——后者需 CI/真机环境。
