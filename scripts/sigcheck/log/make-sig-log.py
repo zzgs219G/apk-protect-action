@@ -26,6 +26,9 @@ def main():
 
     # 匹配 /*LSG:...*/ 单行标记(文案内禁止 */ 换行等,正则天然限定)
     pat = re.compile(r'/\*LSG:(.+?)\*/')
+    # 匹配 /*LSGS:...*/ 特征串标记(2026-10 借鉴 XopProtector:检测特征串不明文进 so,
+    # 防 strings 一键扫出全部检测清单;S = String,与 LSG 共用同一张密文表/枚举)
+    pat_s = re.compile(r'/\*LSGS:(.+?)\*/')
     ids = []      # (宏名, 明文)
     seen = set()  # 宏名去重
 
@@ -50,6 +53,25 @@ def main():
             full = f"LSG_{name}"
             if full in seen:
                 print(f"❌ {path}: LSG 宏名重复: {full}", file=sys.stderr)
+                return 1
+            seen.add(full)
+            ids.append((full, prefix, content))
+        # 特征串标记(LSGS):与 LSG 同表共存,但宏名以 LSGS_ 为前缀以示区分
+        for m in pat_s.finditer(text):
+            msg = m.group(1).strip()
+            if not msg:
+                continue
+            if '|' not in msg:
+                print(f"❌ {path}: LSGS 标记缺少宏名(应为 /*LSGS:NAME|串*/): {msg[:40]}", file=sys.stderr)
+                return 1
+            name, content = msg.split('|', 1)
+            name = name.strip()
+            if not re.fullmatch(r'[A-Z0-9_]+', name):
+                print(f"❌ {path}: LSGS 宏名非法(仅大写/数字/下划线): {name}", file=sys.stderr)
+                return 1
+            full = f"LSGS_{name}"
+            if full in seen:
+                print(f"❌ {path}: LSGS 宏名重复(或与 LSG 冲突): {full}", file=sys.stderr)
                 return 1
             seen.add(full)
             ids.append((full, prefix, content))
@@ -92,8 +114,11 @@ def main():
     lines.append(f'static const unsigned char LSG_KEY[LSG_KEY_LEN] = {{ '
                  + ', '.join(f'0x{b:02x}' for b in key) + ' };')
     lines.append('')
-    lines.append('/* 密文表:与 lsg_id_t 下标一一对应;每条以 \\0 结尾(密文里 0x00 即原串终结符的编码前哨) */')
-    lines.append('typedef struct { const unsigned char *data; unsigned int len; } lsg_msg_t;')
+    lines.append('/* 密文表:与 lsg_id_t 下标一一对应;每条以 \\0 结尾(密文里 0x00 即原串终结符的编码前哨)')
+    lines.append(' * ⚠️ volatile 必加:否则 -O2 会把 lsg_decode 对常量 id 的 XOR 循环做部分常量折叠,')
+    lines.append(' *    前 8 字节(key 长度)被折成明文 SIMD 向量常量落进 .rodata(实测泄漏 frida-ag 等),')
+    lines.append(' *    strings 又能扫出特征前缀 —— volatile 迫使每次真读密文,折叠无从下手。 */')
+    lines.append('typedef struct { const unsigned char volatile *data; unsigned int len; } lsg_msg_t;')
     for full, _prefix, content in ids:
         e = enc(content)
         arr = ', '.join(f'0x{b:02x}' for b in e)
@@ -105,7 +130,9 @@ def main():
         lines.append(f'    {{ LSG_DATA_{full[4:]}, {len(e)} }},  /* {full} */')
     lines.append('};')
     lines.append('')
-    lines.append('/* 解码到 buf(UTF-8),返回写入长度(不含 \\0);buf 不够返回 -1 */')
+    lines.append('/* 解码到 buf(UTF-8),返回写入长度(不含 \\0);buf 不够返回 -1')
+    lines.append(' * noinline 必加:允许内联 = 允许编译器把常量 id 的解码折叠成明文(见上方 volatile 说明)。 */')
+    lines.append('__attribute__((noinline))')
     lines.append('static int lsg_decode(lsg_id_t id, char *buf, size_t buflen) {')
     lines.append('    const lsg_msg_t *m;')
     lines.append('    unsigned int i;')
@@ -116,6 +143,14 @@ def main():
     lines.append('        buf[i] = (char)(m->data[i] ^ LSG_KEY[i % LSG_KEY_LEN]);')
     lines.append('    buf[m->len] = \'\\0\';')
     lines.append('    return (int)m->len;')
+    lines.append('}')
+    lines.append('')
+    lines.append('/* 特征串解码辅助(LSGS_* 专用):解码到调用方栈缓冲,返回 const char*。')
+    lines.append(' * 用法: const char *s = lsg_s(LSGS_XXX, buf, sizeof(buf));  之后像普通字符串一样')
+    lines.append(' * 用 strstr/strcmp/strncmp 均可。解码失败返回 NULL(调用方按"未检出"处理)。')
+    lines.append(' * 生命周期: buf 有效期内有效 —— 请在调用处声明 char buf[N] 并在同一作用域使用。 */')
+    lines.append('static const char *lsg_s(lsg_id_t id, char *buf, size_t buflen) {')
+    lines.append('    return (lsg_decode(id, buf, buflen) >= 0) ? buf : NULL;')
     lines.append('}')
     lines.append('')
     lines.append('#endif /* SIG_LOG_DATA_H */')

@@ -337,16 +337,40 @@ static int frida_port_probe(void) {
     return 0;
 }
 
-/* a2. /proc/self/maps 里有没有 frida 特征库(frida-gadget/frida-agent 注入痕迹) */
+/* ────────────────── a2. 特征串密文标记(LSGS) ──────────────────
+ * 明文只活在下面的标记注释里(与 LSG 中文文案同一套机制);
+ * 构建期 make-sig-log.py 扫描加密 → so 里只有密文;
+ * 运行时 lsg_s() 解码到栈缓冲。改特征串 = 改这里的标记明文。
+ * ⚠️ 注释里严禁出现 LSGS 标记的字面示例(嵌套注释会提前终结本注释块,
+ *    编译炸"top level declarator")——写法示例只存在于 make-sig-log.py。
+ * ─────────────────────────────────────────────────────────────── */
+/*LSGS:FRIDA_AGENT|frida-agent*/
+/*LSGS:FRIDA_GADGET|frida-gadget*/
+/*LSGS:FRIDA_INJECT|frida-inject*/
+/*LSGS:GADGET_FRIDA|gadget_frida*/
+
+/* a2. /proc/self/maps 里有没有 frida 特征库(frida-gadget/frida-agent 注入痕迹)
+ * 特征串不明文进 so(2026-10,借鉴 XopProtector 的 OBSC 思路,走自家 LSG 机制):
+ * 探针比对用的 4 个特征串来自上方 LSGS 标记(构建期加密,运行时 lsg_s 解码)。
+ * strings 扫 so 得不到任何检测特征。
+ * 解码失败(NULL)按"未检出"处理,与全文件宁漏勿误伤纪律一致。
+ * ⚠️ 本注释及全文件任何注释中禁止书写 LSGS 标记的字面形态(嵌套注释会
+ *    提前终结注释块,编译炸 top level declarator;报错速查已留档)。 */
 static int frida_maps_probe(void) {
     safe_lines_t it;
     char *line;
+    char s1[24], s2[24], s3[24], s4[24];
     int hit = 0;
+    const char *k1 = lsg_s(LSGS_FRIDA_AGENT, s1, sizeof(s1));
+    const char *k2 = lsg_s(LSGS_FRIDA_GADGET, s2, sizeof(s2));
+    const char *k3 = lsg_s(LSGS_FRIDA_INJECT, s3, sizeof(s3));
+    const char *k4 = lsg_s(LSGS_GADGET_FRIDA, s4, sizeof(s4));
+    if (!k1 || !k2 || !k3 || !k4) return 0;   /* 解码失败 → 未检出 */
     if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
     /* 只认明显的 frida 命名特征,宁漏勿误伤 */
     while ((line = safe_lines_next(&it)) != NULL) {
-        if (strstr(line, "frida-agent") || strstr(line, "frida-gadget") ||
-            strstr(line, "frida-inject") || strstr(line, "gadget_frida")) {
+        if (strstr(line, k1) || strstr(line, k2) ||
+            strstr(line, k3) || strstr(line, k4)) {
             hit = 1;
             break;
         }
@@ -355,17 +379,26 @@ static int frida_maps_probe(void) {
     return hit;
 }
 
-/* a3. /proc/net/tcp(及 tcp6) 里 27042/27043 的十六进制端口是否处于 LISTEN(0A) */
+/* ────────────────── a3. TCP 端口特征标记 ────────────────── */
+/*LSGS:TCP_69A2|:69A2*/
+/*LSGS:TCP_69A3|:69A3*/
+
+/* a3. /proc/net/tcp(及 tcp6) 里 27042/27043 的十六进制端口是否处于 LISTEN(0A)
+ * 端口特征串( ":69A2"/":69A3" )同样走 LSGS 密文,不明文进 so。 */
 static int frida_tcp_table_probe(void) {
     static const char *tables[] = { "/proc/net/tcp", "/proc/net/tcp6" };
-    static const char *hexports[] = { ":69A2", ":69A3" };   /* 27042=0x69A2 27043=0x69A3 */
+    char p1[12], p2[12];
+    const char *hexports[2];
     size_t t, p;
+    hexports[0] = lsg_s(LSGS_TCP_69A2, p1, sizeof(p1));
+    hexports[1] = lsg_s(LSGS_TCP_69A3, p2, sizeof(p2));
+    if (!hexports[0] || !hexports[1]) return 0;
     for (t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
         safe_lines_t it;
         char *line;
         if (safe_lines_open(&it, tables[t]) != 0) continue;
         while ((line = safe_lines_next(&it)) != NULL) {
-            for (p = 0; p < sizeof(hexports) / sizeof(hexports[0]); p++) {
+            for (p = 0; p < 2; p++) {
                 /* 形如 "...:69A2 00...:0000 0A ..." — 本地端口匹配 + state=0A(LISTEN) */
                 if (strstr(line, hexports[p]) && strstr(line + 10, " 0A ")) {
                     safe_lines_close(&it);
@@ -380,16 +413,38 @@ static int frida_tcp_table_probe(void) {
 
 /* ─────────────────────────── b. Xposed / LSPosed 检测 ─────────────────────────── */
 
-/* b1. 已加载库特征(读 maps,比文件存在性可靠——hook 框架必然注入自身库) */
+/* ────────────────── b1/b2. Xposed 特征标记 ────────────────── */
+/*LSGS:XP_LIBXPOSED|libxposed*/
+/*LSGS:XP_LSPD|lspd*/
+/*LSGS:XP_LSPOSED|lsposed*/
+/*LSGS:XP_EDXPOSED|edxposed*/
+/*LSGS:XP_LIBRIRU|libriru*/
+/*LSGS:XP_LIBZYGISK|libzygisk*/
+/*LSGS:XP_PATH_LSPD|/data/adb/lspd*/
+/*LSGS:XP_PATH_ZYGISK_LSP|/data/adb/modules/zygisk_lsposed*/
+/*LSGS:XP_PATH_RIRU_LSP|/data/adb/modules/riru_lsposed*/
+/*LSGS:XP_PATH_ZYGISK_EDX|/data/adb/modules/zygisk_edxposed*/
+/*LSGS:XP_PATH_XBRIDGE|/system/framework/XposedBridge.jar*/
+
+/* b1. 已加载库特征(读 maps,比文件存在性可靠——hook 框架必然注入自身库)
+ * 6 个特征串全走 LSGS 密文(不明文进 so),解码失败按"未检出"。 */
 static int xposed_maps_probe(void) {
     safe_lines_t it;
     char *line;
+    char s1[16], s2[8], s3[16], s4[16], s5[16], s6[16];
     int hit = 0;
+    const char *k1 = lsg_s(LSGS_XP_LIBXPOSED, s1, sizeof(s1));
+    const char *k2 = lsg_s(LSGS_XP_LSPD,      s2, sizeof(s2));
+    const char *k3 = lsg_s(LSGS_XP_LSPOSED,   s3, sizeof(s3));
+    const char *k4 = lsg_s(LSGS_XP_EDXPOSED,  s4, sizeof(s4));
+    const char *k5 = lsg_s(LSGS_XP_LIBRIRU,   s5, sizeof(s5));
+    const char *k6 = lsg_s(LSGS_XP_LIBZYGISK, s6, sizeof(s6));
+    if (!k1 || !k2 || !k3 || !k4 || !k5 || !k6) return 0;
     if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
     while ((line = safe_lines_next(&it)) != NULL) {
-        if (strstr(line, "libxposed") || strstr(line, "lspd") ||
-            strstr(line, "lsposed") || strstr(line, "edxposed") ||
-            strstr(line, "libriru")  || strstr(line, "libzygisk")) {
+        if (strstr(line, k1) || strstr(line, k2) ||
+            strstr(line, k3) || strstr(line, k4) ||
+            strstr(line, k5) || strstr(line, k6)) {
             hit = 1;
             break;
         }
@@ -399,32 +454,49 @@ static int xposed_maps_probe(void) {
 }
 
 /* b2. 已加载类特征:Xposed 环境 Java 栈里常有 XposedBridge(读自身进程 oatatmp 不可靠,
- * 改为探测 Xposed 安装痕迹文件——仅命中高置信路径) */
+ * 改为探测 Xposed 安装痕迹文件——仅命中高置信路径)
+ * 5 个路径全走 LSGS 密文(路径本身也是检测特征,不明文进 so)。 */
 static int xposed_file_probe(void) {
-    static const char *paths[] = {
-        "/data/adb/lspd",                    /* LSPosed daemon */
-        "/data/adb/modules/zygisk_lsposed",  /* LSPosed zygisk 模块 */
-        "/data/adb/modules/riru_lsposed",    /* LSPosed riru 旧版 */
-        "/data/adb/modules/zygisk_edxposed", /* EdXposed */
-        "/system/framework/XposedBridge.jar" /* 原版 Xposed */
-    };
+    char p1[48], p2[48], p3[48], p4[48], p5[48];
+    const char *paths[5];
     size_t i;
-    for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    paths[0] = lsg_s(LSGS_XP_PATH_LSPD,        p1, sizeof(p1));   /* LSPosed daemon */
+    paths[1] = lsg_s(LSGS_XP_PATH_ZYGISK_LSP,  p2, sizeof(p2));   /* LSPosed zygisk 模块 */
+    paths[2] = lsg_s(LSGS_XP_PATH_RIRU_LSP,    p3, sizeof(p3));   /* LSPosed riru 旧版 */
+    paths[3] = lsg_s(LSGS_XP_PATH_ZYGISK_EDX,  p4, sizeof(p4));   /* EdXposed */
+    paths[4] = lsg_s(LSGS_XP_PATH_XBRIDGE,     p5, sizeof(p5));   /* 原版 Xposed */
+    for (i = 0; i < 5; i++) {
+        if (!paths[i]) continue;          /* 单条解码失败跳过该条,不影响其余 */
         if (access(paths[i], F_OK) == 0) return 1;
     }
     return 0;
 }
 
+/* ────────────────── c/e/f. 调试器与 Frida 特征标记 ────────────────── */
+/*LSGS:TRACERPID|TracerPid:*/
+/*LSGS:THR_GUMJS|gum-js-loop*/
+/*LSGS:THR_GMAIN|gmain*/
+/*LSGS:THR_GDBUS|gdbus*/
+/*LSGS:THR_POOL|pool-frida*/
+/*LSGS:THR_FRIDA|frida*/
+/*LSGS:UNX_FRIDA|frida*/
+/*LSGS:UNX_LINJECTOR|linjector*/
+/*LSGS:UNX_GUMJS|gum-js*/
+
 /* ─────────────────────────── c. 调试器检测 ─────────────────────────── */
 
-/* /proc/self/status 的 TracerPid:被 ptrace 附着(调试器/memfault 工具)时非 0 */
+/* /proc/self/status 的 TracerPid:被 ptrace 附着(调试器/memfault 工具)时非 0
+ * "TracerPid:" 前缀走 LSGS 密文(它是调试检测的最直接路标词)。 */
 static int tracer_probe(void) {
     safe_lines_t it;
     char *line;
+    char tp[16];
     int hit = 0;
+    const char *key = lsg_s(LSGS_TRACERPID, tp, sizeof(tp));
+    if (!key) return 0;
     if (safe_lines_open(&it, "/proc/self/status") != 0) return 0;
     while ((line = safe_lines_next(&it)) != NULL) {
-        if (strncmp(line, "TracerPid:", 10) == 0) {
+        if (strncmp(line, key, 10) == 0) {
             int pid = atoi(line + 10);
             if (pid != 0) hit = 1;
             break;
@@ -721,19 +793,29 @@ static int self_text_crc_probe(void) {
     return (cf != cm) ? 1 : 0;
 }
 
-/* e. Frida 线程名检测(读 /proc/self/task/<tid>/comm) */
+/* e. Frida 线程名检测(读 /proc/self/task/<tid>/comm)
+ * 5 个线程名全走 LSGS 密文(线程名是最直接的 Frida 指纹之一)。
+ * 注意:gum 判定改为比对解码后的 k1,不再硬编码字面量。 */
 static int frida_thread_probe(void) {
-    static const char *names[] = { "gum-js-loop", "gmain", "gdbus", "pool-frida", "frida" };
-    const size_t nnames = sizeof(names) / sizeof(names[0]);
+    char n1[16], n2[8], n3[8], n4[16], n5[8];
+    const char *names[5];
+    size_t i;
     DIR *d = opendir("/proc/self/task");
     struct dirent *de;
     int hits = 0, gum = 0;
+    names[0] = lsg_s(LSGS_THR_GUMJS,  n1, sizeof(n1));   /* gum-js-loop */
+    names[1] = lsg_s(LSGS_THR_GMAIN,  n2, sizeof(n2));
+    names[2] = lsg_s(LSGS_THR_GDBUS,  n3, sizeof(n3));
+    names[3] = lsg_s(LSGS_THR_POOL,   n4, sizeof(n4));   /* pool-frida */
+    names[4] = lsg_s(LSGS_THR_FRIDA,  n5, sizeof(n5));
+    /* 任一解码失败 → 检测不完整,按"未检出"处理(宁漏勿误伤) */
+    if (!names[0] || !names[1] || !names[2] || !names[3] || !names[4]) { if (d) closedir(d); return 0; }
     if (!d) return 0;
     while ((de = readdir(d)) != NULL) {
         char p[160];
         char nm[64];
         char *fb = NULL;
-        size_t i, L;
+        size_t L;
         if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
         snprintf(p, sizeof(p), "/proc/self/task/%s/comm", de->d_name);
         /* 线程名同样走 syscall 直调(防 fopen hook 伪造 comm) */
@@ -742,10 +824,10 @@ static int frida_thread_probe(void) {
         free(fb);
         L = strcspn(nm, "\n");
         nm[L] = '\0';
-        for (i = 0; i < nnames; i++) {
+        for (i = 0; i < 5; i++) {
             if (strcmp(nm, names[i]) == 0) {
                 hits++;
-                if (strcmp(nm, "gum-js-loop") == 0) gum = 1;
+                if (i == 0) gum = 1;   /* 第 0 位恒为 gum-js-loop(见上方解码顺序) */
                 break;
             }
         }
@@ -757,14 +839,18 @@ static int frida_thread_probe(void) {
 
 /* f. Frida unix socket 检测(读 /proc/net/unix 的路径字段) */
 static int frida_unix_probe(void) {
-    static const char *sigs[] = { "frida", "linjector", "gum-js" };
-    const size_t ns = sizeof(sigs) / sizeof(sigs[0]);
+    char s1[12], s2[16], s3[12];
+    const char *sigs[3];
+    size_t i;
     safe_lines_t it;
     char *line;
+    sigs[0] = lsg_s(LSGS_UNX_FRIDA,     s1, sizeof(s1));   /* "frida" */
+    sigs[1] = lsg_s(LSGS_UNX_LINJECTOR, s2, sizeof(s2));   /* "linjector" */
+    sigs[2] = lsg_s(LSGS_UNX_GUMJS,     s3, sizeof(s3));   /* "gum-js" */
+    if (!sigs[0] || !sigs[1] || !sigs[2]) return 0;
     if (safe_lines_open(&it, "/proc/net/unix") != 0) return 0;
     while ((line = safe_lines_next(&it)) != NULL) {
-        size_t i;
-        for (i = 0; i < ns; i++) {
+        for (i = 0; i < 3; i++) {
             if (strstr(line, sigs[i])) { safe_lines_close(&it); return 1; }
         }
     }
