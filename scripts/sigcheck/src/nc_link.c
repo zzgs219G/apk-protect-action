@@ -55,8 +55,13 @@ void nc_heartbeat_touch(void)
  * 返回 0 = 正常(未武装/宽限期内/保活窗口内),非 0 = 超时(该杀)。
  * 首喂宽限 90s(Xop 同款:冷启动重活),之后保活窗 25s
  * (≥ env_watchdog 的 20s 轮询周期,宁可稍宽不误杀)。 */
-#define NC_HB_FIRST_GRACE_MS   90000LL
-#define NC_HB_KEEPALIVE_MS     25000LL
+/* 调试参数(2026-10-16 用户要求"5 秒附近闪退方便调试"):
+ * ⚠️ 发布前必须改回正式值 GRACE=90000 / KEEPALIVE=25000——调试值意味着
+ * 正常冷启动超过 5 秒的设备(低端机/加载重活)会被误杀。
+ * 调试语义:首喂宽限 5s / 保活窗 5s → 删 c() 调用或停喂后 ~25s 内必死
+ * (watchdog 20s 轮询 + 5s 窗口)。 */
+#define NC_HB_FIRST_GRACE_MS   5000LL
+#define NC_HB_KEEPALIVE_MS     5000LL
 
 __attribute__((noinline))
 int nc_heartbeat_expired(void)
