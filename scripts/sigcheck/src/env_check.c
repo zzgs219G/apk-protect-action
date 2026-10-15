@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <dlfcn.h>
+#include <sys/uio.h>   /* process_vm_readv 的 iovec(d4 指令检测) */
 #include <elf.h>
 #include <sys/auxv.h>   /* 2026-12 追加:运行时探测 CPU CRC32 扩展(getauxval/AT_HWCAP) */
 #include <sys/ptrace.h> /* 2026-10 追加:PTRACE_TRACEME 反调试抢占 */
@@ -131,7 +132,7 @@ static void envlog_c(int is_err, lsg_id_t id, const char *detail) {
  * 注:两个模块各有一条延时线程,攻击者 hook 掉其一,另一条仍在——天然互为备份。
  *
  * 前向声明:safe_syscall 定义在下方 a0b 节(探针可信化),本节的处置需要提前用它。 */
-static long safe_syscall(long n, long a0, long a1, long a2, long a3);
+static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, long a5);
 
 /* * 2026-10 增强(方案 F):让处置"不直白、难 hook、难归因"
  *   ① 延时堆破坏:先以随机间隔 malloc/free 不同尺寸的块(不写入业务内存),
@@ -168,7 +169,7 @@ static void *env_delayed_kill(void *arg) {
 
     /* ② syscall 直调发 SIGABRT(绕开 libc 的 abort,防 hook) */
 #ifdef __NR_tgkill
-    if (safe_syscall(__NR_tgkill, (long)getpid(), (long)gettid(), SIGABRT, 0) == 0) {
+    if (safe_syscall(__NR_tgkill, (long)getpid(), (long)gettid(), SIGABRT, 0, 0, 0) == 0) {
         /* 信号已投递;若因屏蔽未致死,下面兜底 */
     }
 #endif
@@ -223,8 +224,8 @@ static void anti_debug_preempt(void) {
  *      由调用方的"宁漏勿误伤"兜底接住,绝不误判。
  *
  * 本函数只负责【读一段文件到内存】,不做任何判定 —— 探针的判定逻辑一行不改。 */
-static long safe_syscall(long n, long a0, long a1, long a2, long a3) {
-    return syscall(n, a0, a1, a2, a3);
+static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
+    return syscall(n, a0, a1, a2, a3, a4, a5);
 }
 
 /* 读整个文件到 calloc 的缓冲(调用方 free)。成功返回长度(不含结尾 \0),失败返回 -1。
@@ -234,27 +235,27 @@ static long safe_read_alloc(const char *path, char **out) {
     char *buf = NULL;
     size_t cap = 0, len = 0;
     *out = NULL;
-    fd = (int)safe_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0);
+    fd = (int)safe_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
     if (fd < 0) return -1;
     cap = 65536;
     buf = (char *)malloc(cap);
-    if (!buf) { safe_syscall(__NR_close, fd, 0, 0, 0); return -1; }
+    if (!buf) { safe_syscall(__NR_close, fd, 0, 0, 0, 0, 0); return -1; }
     for (;;) {
         long r;
         if (len + 4096 + 1 > cap) {
             char *nb;
             size_t ncap = cap * 2;
             nb = (char *)realloc(buf, ncap);
-            if (!nb) { free(buf); safe_syscall(__NR_close, fd, 0, 0, 0); return -1; }
+            if (!nb) { free(buf); safe_syscall(__NR_close, fd, 0, 0, 0, 0, 0); return -1; }
             buf = nb; cap = ncap;
         }
-        r = safe_syscall(__NR_read, fd, (long)(buf + len), (long)(cap - len - 1), 0);
-        if (r < 0) { free(buf); safe_syscall(__NR_close, fd, 0, 0, 0); return -1; }
+        r = safe_syscall(__NR_read, fd, (long)(buf + len), (long)(cap - len - 1), 0, 0, 0);
+        if (r < 0) { free(buf); safe_syscall(__NR_close, fd, 0, 0, 0, 0, 0); return -1; }
         if (r == 0) break;
         len += (size_t)r;
         if (len > (32u << 20)) break;   /* 上限守卫:防超大文件耗尽内存 */
     }
-    safe_syscall(__NR_close, fd, 0, 0, 0);
+    safe_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
     buf[len] = '\0';
     *out = buf;
     return (long)len;
@@ -482,6 +483,10 @@ static int xposed_file_probe(void) {
 /*LSGS:UNX_FRIDA|frida*/
 /*LSGS:UNX_LINJECTOR|linjector*/
 /*LSGS:UNX_GUMJS|gum-js*/
+/*LSGS:SYM_FOPEN|fopen*/
+/*LSGS:SYM_OPEN|open*/
+/*LSGS:SYM_CONNECT|connect*/
+/*LSGS:SYM_READ|read*/
 
 /* ─────────────────────────── c. 调试器检测 ─────────────────────────── */
 
@@ -689,14 +694,58 @@ static int env_elf_text(const char *path, env_text_t *out) {
     }
 }
 
+/* d4. libc 导出函数入口指令检测(2026-10 借鉴 XopProtector libc_hook_score):
+ * Inline hook 的本质是"把函数入口第一条指令改写成跳转/断点",所以不校验
+ * 全部 .text(那是 d5 CRC 的活),只读 4 个攻击者最常 hook 的导出函数入口
+ * 4 字节,判 arm64 的 B/BL/BRK —— 16 字节 vs d5 的 1-2MB,纳秒级。
+ * 打分制(照抄 Xop):单个被 hook 可能是 ROM 厂商特性(MIUI 某些隐藏 hook),
+ * ≥2 分才报警压误报。读内存走 process_vm_readv(内核拷贝,不经本进程页表,
+ * 防 XOM 设备直接解引用 SIGSEGV;Xop safe_read_u32 同款)。
+ * 4 个函数名走 LSGS 密文(不然 "fopen"/"connect" 又是明文特征)。 */
+static int env_pvm_read_u32(const void *addr, uint32_t *out) {
+    struct iovec local, remote;
+    if (addr == NULL || out == NULL) return 0;
+    local.iov_base = out;             local.iov_len = sizeof(uint32_t);
+    remote.iov_base = (void *)addr;   remote.iov_len = sizeof(uint32_t);
+    /* ⚠️ process_vm_readv 是 6 参调用,syscall() 变参包装必须补第 7 个 0:
+     * ARM64 变参寄存器传参,缺位读到的是寄存器残留 → EINVAL(errno 22)。
+     * 实测 Termux dbg5:6 参包装恒失败,补 0 后正常。 */
+    return safe_syscall(__NR_process_vm_readv, (long)getpid(),
+                        (long)&local, 1L, (long)&remote, 1L, 0L) == (long)sizeof(uint32_t);
+}
+
+static int libc_hook_probe(void) {
+    char n1[8], n2[8], n3[12], n4[8];
+    const char *names[4];
+    void *fns[4];
+    int score = 0, i;
+    static const uint32_t masks[3] = { 0xFC000000u, 0xFC000000u, 0xFFE0001Fu };
+    static const uint32_t hooks[3] = { 0x14000000u, 0x94000000u, 0xD4200000u };
+    names[0] = lsg_s(LSGS_SYM_FOPEN,   n1, sizeof(n1));
+    names[1] = lsg_s(LSGS_SYM_OPEN,    n2, sizeof(n2));
+    names[2] = lsg_s(LSGS_SYM_CONNECT, n3, sizeof(n3));
+    names[3] = lsg_s(LSGS_SYM_READ,    n4, sizeof(n4));
+    if (!names[0] || !names[1] || !names[2] || !names[3]) return 0;
+    for (i = 0; i < 4; i++) {
+        uint32_t w = 0;
+        int j, hooked = 0;
+        fns[i] = dlsym(RTLD_DEFAULT, names[i]);
+        if (fns[i] == NULL) continue;
+        if (!env_pvm_read_u32(fns[i], &w)) continue;
+        for (j = 0; j < 3; j++) {
+            if ((w & masks[j]) == hooks[j]) { hooked = 1; break; }
+        }
+        score += hooked;
+    }
+    return (score >= 2) ? 1 : 0;
+}
+
 /* d5. libc .text 内存 vs 磁盘 CRC 比对;不等=内存被改写。任一步异常→放行(未检出) */
 static int libc_text_crc_probe(void) {
     Dl_info info;
     char path[512];
     env_text_t ts;
-    FILE *fp;
     uint8_t *fb;
-    size_t n;
     uint32_t cf, cm;
     const uint8_t *mem;
 
@@ -717,19 +766,22 @@ static int libc_text_crc_probe(void) {
     mem = (const uint8_t *)info.dli_fbase + ts.vaddr;
     if (!env_mem_readable(mem, (size_t)ts.size)) return 0;
 
-    fp = fopen(path, "rb");
-    if (!fp) return 0;
-    if (fseek(fp, (long)ts.offset, SEEK_SET) != 0) { fclose(fp); return 0; }
-    fb = (uint8_t *)malloc((size_t)ts.size);
-    if (!fb) { fclose(fp); return 0; }
-    n = fread(fb, 1, (size_t)ts.size, fp);
-    fclose(fp);
-    if (n != (size_t)ts.size) { free(fb); return 0; }
-
-    cf = env_crc32(fb, (size_t)ts.size);
-    cm = env_crc32(mem, (size_t)ts.size);
-    free(fb);
-    return (cf != cm) ? 1 : 0;
+    /* 磁盘副本读取走 syscall 直调(2026-10 修复):此前 fopen/fread 走 libc,
+     * 攻击者假 fread 喂一份"与内存一致的伪造 libc 内容"即可让本探针永久失明
+     * —— 文件头威胁模型自述过这一攻击(623 行),实现却漏网,真·自相矛盾。
+     * safe_read_alloc 一次读全文件再按 offset 取段,开销多读文件头部,
+     * 但 libc .text 通常在文件前段,可接受;CRC 降频后更是每 5 轮才一次。 */
+    {
+        char *file = NULL;
+        long flen = safe_read_alloc(path, &file);
+        if (flen < 0 || file == NULL) return 0;
+        if ((long)ts.offset + (long)ts.size > flen) { free(file); return 0; }
+        fb = (uint8_t *)file + ts.offset;
+        cf = env_crc32(fb, (size_t)ts.size);
+        cm = env_crc32(mem, (size_t)ts.size);
+        free(file);
+        return (cf != cm) ? 1 : 0;
+    }
 }
 
 /* d6. 自身 so .text 内存 vs 磁盘 CRC 比对(2026-10 方案 B)——抓运行时 so 被 patch。
@@ -779,12 +831,12 @@ static int self_text_crc_probe(void) {
     if (!env_mem_readable(mem, (size_t)ts.size)) return 0;
 
     /* 磁盘侧只读目标段:syscall 直调(防 fopen hook 喂假内容,与方案 C 一致) */
-    fd = (int)safe_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0);
+    fd = (int)safe_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
     if (fd < 0) return 0;
     fb = (uint8_t *)malloc((size_t)ts.size);
-    if (!fb) { safe_syscall(__NR_close, fd, 0, 0, 0); return 0; }
-    n = safe_syscall(__NR_pread64, fd, (long)fb, (long)ts.size, (long)ts.offset);
-    safe_syscall(__NR_close, fd, 0, 0, 0);
+    if (!fb) { safe_syscall(__NR_close, fd, 0, 0, 0, 0, 0); return 0; }
+    n = safe_syscall(__NR_pread64, fd, (long)fb, (long)ts.size, (long)ts.offset, 0, 0);
+    safe_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
     if (n != (long)ts.size) { free(fb); return 0; }
 
     cf = env_crc32(fb, (size_t)ts.size);
@@ -872,9 +924,14 @@ int nc_heartbeat_expired(void);
 
 static void *env_watchdog(void *arg) {
     (void)arg;
+    unsigned round = 0;   /* CRC 降频计数:指令检测每轮跑,CRC 每 5 轮跑一次 */
     for (;;) {
         int hit = 0;
         sleep(20);
+        round++;
+        /* d4 指令打分(纳秒级)每轮先跑;命中才轮到重的 CRC(命中通常也意味着
+         * 下一轮 CRC 会确认;这里独立判定,两个探针抓的攻击面不同,见各自注释) */
+        if (!hit && libc_hook_probe())       hit = 1;
         if (frida_port_probe())              hit = 1;
         if (!hit && frida_maps_probe())      hit = 1;
         if (!hit && frida_tcp_table_probe()) hit = 1;
@@ -882,9 +939,11 @@ static void *env_watchdog(void *arg) {
         if (!hit && frida_unix_probe())      hit = 1;
         if (!hit && xposed_maps_probe())     hit = 1;
         if (!hit && xposed_file_probe())     hit = 1;
-        if (!hit && libc_text_crc_probe())   hit = 1;
-        if (!hit && self_text_crc_probe())   hit = 1;
         if (!hit && tracer_probe())          hit = 1;
+        /* CRC 全量比对降频(2026-10):Inline hook 是"装完长期驻留"型攻击,
+         * 100s 检出延迟对效果无损,换来 80% 轮次的毫秒级开销归零 */
+        if (!hit && (round % 5 == 0) && libc_text_crc_probe()) hit = 1;
+        if (!hit && (round % 5 == 0) && self_text_crc_probe()) hit = 1;
         /* 心跳超时(Java 层被删/被绕过)——独立于上面的环境探针,
          * 不占 hit 位:env_fail 路径相同,但语义上分两条日志便于排障 */
         if (!hit && nc_heartbeat_expired())  hit = 2;
