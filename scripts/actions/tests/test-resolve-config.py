@@ -21,7 +21,7 @@
   T15 args.txt 结尾无多余空行（§10.2）
   T6b/T6c packer(基础加壳)          → leaf 模块，只吐 --packer，与共存模块顺序固定
   T6d 旧 App 快照无 packer 键       → 视为 disabled，不报错（§10.1 正向）
-  T6e/T6f stringenc.dex2c_stub       → 默认开追加 --dex2c-stub；显式 false 不追加
+  T6e/T6f stringenc.dex2c_stub       → 缺省/显式 false 均不追加；显式 true 追加（T6o）
 """
 import json
 import os
@@ -118,18 +118,22 @@ check("T4 stringenc 留空规则 → fail-fast", rc != 0 and "规则为空" in e
 # T6
 rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True, packer=True,
                                dex2c={"enabled": True, "rules_file": "**/com.test.**"},
-                               stringenc={"enabled": True, "rules_file": "**/com.s.**"}))
+                               stringenc={"enabled": True, "rules_file": "**/com.s.**",
+                                          "dex2c_stub": True}))
 expect = ["--sigcheck", "--dex2c", "schema_rules/dex2c.txt",
           "--stringenc", "schema_rules/stringenc.txt", "--dex2c-stub",
           "--anti-diff", "--envcheck", "--packer"]
 check("T6 全家桶 → 参数齐全且顺序固定", rc == 0 and args == expect, f"rc={rc} args={args}")
 
-# T6e stringenc.dex2c_stub 子复选框(2026-10 联动):默认开 → 追加 --dex2c-stub
-# (flag 分支:值是布尔、不写规则文件、不进 required 校验;位置紧跟所属模块 arg)
+# T6e stringenc.dex2c_stub 子复选框(2026-10 联动;同日防呆复盘改 default false):
+# 缺省 → 不追加。default 曾为 true,与 protect.sh 的依赖校验构成组合矛盾——
+# 只勾 stringenc 的老配置被 resolver 自动追加 --dex2c-stub,protect.sh fail-fast
+# ("必须与 --dex2c 同时勾选")整包构建失败。故 default 改 false(对齐 exclude_x86 先例),
+# 显式勾选才追加(见 T6o);flag 分支:值是布尔、不写规则文件、不进 required 校验。
 rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": "com.a.**"}))
-check("T6e stringenc.dex2c_stub 缺省 → 默认勾选,追加 --dex2c-stub",
-      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt",
-                           "--dex2c-stub"], f"rc={rc} args={args} err={err}")
+check("T6e stringenc.dex2c_stub 缺省 → 按 default(false) 不追加",
+      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt"],
+      f"rc={rc} args={args} err={err}")
 
 # T6f 显式不勾 → 不追加(老路径:桩留在 dex)
 rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": "com.a.**",
@@ -137,6 +141,15 @@ rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": "com.a.
 check("T6f stringenc.dex2c_stub=false → 不追加 --dex2c-stub",
       rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt"],
       f"rc={rc} args={args} err={err}")
+
+# T6o 显式勾选 → 追加。resolver 不做跨模块配对判断(stringenc+dex2c 才合法),
+# 缺配对由 protect.sh 的依赖校验 fail-fast 拦截——分工:resolver 管"勾了就传",
+# 流水线管"组合非法拒收"。
+rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": "com.a.**",
+                                          "dex2c_stub": True}))
+check("T6o stringenc.dex2c_stub=true → 追加 --dex2c-stub",
+      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt",
+                           "--dex2c-stub"], f"rc={rc} args={args} err={err}")
 
 # T6b packer:新增的加壳模块是 leaf(无子选项),勾选只吐一个 --packer
 rc, args, files, err = run(cfg(packer=True))
@@ -231,8 +244,7 @@ check("T11 全部 disabled → 报错", rc != 0 and "没有" in err, f"rc={rc} e
 tricky = "**/com.test.**  # 注释 行 !排除\nactivity*\n\n$HOME `id` ; rm -rf\n"
 rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": tricky}))
 check("T12 特殊字符规则 → 原样写入文件、argv 仅相对路径",
-      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt",
-                           "--dex2c-stub"]
+      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt"]
       and files.get("stringenc.txt") == tricky,
       f"rc={rc} args={args}")
 
