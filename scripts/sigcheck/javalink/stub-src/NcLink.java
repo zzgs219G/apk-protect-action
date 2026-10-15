@@ -24,4 +24,15 @@ public final class NcLink {
      * 标准答案常驻 so 内部,从不出 now——这就是"判决式"与"答案下发对比"的区别。
      */
     public static native boolean ncVerify(byte[] t1);
+
+    /**
+     * 心跳喂食入口(2026-10 借鉴 XopProtector 双向绑定):Guard 校验通过后
+     * 启动 daemon 线程每 5 秒喂一次。native 侧(nc_link.c)先校验调用者身份
+     * (IsSameObject 锁死 NcLink 本类,防反射/重绑定冒充),通过后记录时间戳;
+     * env_check.c 的 watchdog 在 armed 后首喂宽限 90s / 之后保活 25s,
+     * 超时未喂 = Java 壳被删/被绕过 → delayed_kill。
+     * ⚠️ 改名必须同步 nc_link.c 的 Java_com_nc_link_NcLink_heartbeat,
+     *    否则运行期 UnsatisfiedLinkError(喂循环吞掉,watchdog 超时兜底)。
+     */
+    public static native void heartbeat();
 }

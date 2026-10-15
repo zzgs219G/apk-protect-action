@@ -859,7 +859,17 @@ static int frida_unix_probe(void) {
 }
 
 /* g. 常驻复查线程:周期性重跑全部探测,补"启动后才挂载"的窗口。
- *    与构造时一次性检测并存(env_check_run 先跑一次,再启动本线程)。 */
+ *    与构造时一次性检测并存(env_check_run 先跑一次,再启动本线程)。
+ *
+ * Java 心跳检查(2026-10 借鉴 XopProtector 双向绑定):
+ *    nc_heartbeat_expired 由 nc_link.c 提供(sigcheck 勾选时在工程里);
+ *    envcheck 单勾时 nc_link 不在工程 → weak 弱引用自动落空返回 0,
+ *    检查静默跳过,组合自洽(见 weak 符号注释)。 */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+int nc_heartbeat_expired(void);
+
 static void *env_watchdog(void *arg) {
     (void)arg;
     for (;;) {
@@ -875,9 +885,16 @@ static void *env_watchdog(void *arg) {
         if (!hit && libc_text_crc_probe())   hit = 1;
         if (!hit && self_text_crc_probe())   hit = 1;
         if (!hit && tracer_probe())          hit = 1;
-        if (hit) {
+        /* 心跳超时(Java 层被删/被绕过)——独立于上面的环境探针,
+         * 不占 hit 位:env_fail 路径相同,但语义上分两条日志便于排障 */
+        if (!hit && nc_heartbeat_expired())  hit = 2;
+        if (hit == 1) {
             /*LSG:ENV_WATCHDOG_HIT|【失败】常驻复查线程检出危险环境*/
             envlog_c(1, LSG_ENV_WATCHDOG_HIT, NULL);
+            env_fail();
+        } else if (hit == 2) {
+            /*LSG:ENV_HB_LOST|【失败】Java 心跳丢失(壳被删或被绕过)*/
+            envlog_c(1, LSG_ENV_HB_LOST, NULL);
             env_fail();
         }
     }

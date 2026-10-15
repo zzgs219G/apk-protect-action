@@ -20,9 +20,58 @@
  * 调试模式:SIG_HASH_STORED 全零 → 返回真(与 sig_check.c 的 slot 判定同语义)。
  * 零日志设计:本文件不含任何字符串常量(strings 扫 so 零语义泄露)。
  */
+
+/* 心跳接口(实现在本文件下方;env_check.c 的 watchdog 调用检查端) */
+void nc_heartbeat_touch(void);
+int nc_heartbeat_expired(void);
+
 #include <jni.h>
 #include <stddef.h>
+#include <time.h>
 #include "sig_hash.h"
+
+/* ── Java 心跳状态(记录侧) ───────────────────────────────────────
+ * nc_link.c 是心跳记录的正确归属:它是 Java↔Native 的桥接层,
+ * 且在 sigcheck/envcheck 两种勾选组合下都会参与编译(protect.sh:354/363
+ * 把它随 sigcheck 拷入;envcheck 单勾时 nc_link 不在工程里,此时没有
+ * Java 壳喂心跳,watchdog 侧 armed==0 自然跳过检查,组合自洽)。
+ * volatile + noinline 防 -O2 常量折叠(同 LSGS 的实测教训)。
+ * 纯静态,不导出符号。 */
+volatile long long nc_heartbeat_last_ms = 0;   /* 最近一次心跳时间 */
+volatile long long nc_heartbeat_armed_ms = 0;  /* 武装时刻(首次喂时置) */
+
+__attribute__((noinline))
+void nc_heartbeat_touch(void)
+{
+    long long now = (long long)time(NULL) * 1000LL;
+    if (nc_heartbeat_armed_ms == 0) {
+        nc_heartbeat_armed_ms = now;    /* 首次喂 = 武装(CAS 语义可省:
+                                           重复武装只是时间窗略移,无害) */
+    }
+    nc_heartbeat_last_ms = now;
+}
+
+/* watchdog 检查端(env_check.c 调用):
+ * 返回 0 = 正常(未武装/宽限期内/保活窗口内),非 0 = 超时(该杀)。
+ * 首喂宽限 90s(Xop 同款:冷启动重活),之后保活窗 25s
+ * (≥ env_watchdog 的 20s 轮询周期,宁可稍宽不误杀)。 */
+#define NC_HB_FIRST_GRACE_MS   90000LL
+#define NC_HB_KEEPALIVE_MS     25000LL
+
+__attribute__((noinline))
+int nc_heartbeat_expired(void)
+{
+    long long armed = nc_heartbeat_armed_ms;
+    long long last, now;
+    if (armed == 0)
+        return 0;                        /* 未武装(Guard 未跑/无壳)不检查 */
+    last = nc_heartbeat_last_ms;
+    now = (long long)time(NULL) * 1000LL;
+    if (last == 0)
+        return (now - armed) > NC_HB_FIRST_GRACE_MS;
+    return (now - last) > NC_HB_KEEPALIVE_MS;
+}
+
 
 /*
  * 判决核心(宿主可测:NCLINK_HOST_TEST 时编译为纯逻辑函数)。
@@ -75,5 +124,27 @@ Java_com_nc_link_NcLink_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)
     ok = nc_verify_t1((const unsigned char *)buf, (int)len) ? JNI_TRUE : JNI_FALSE;
     (*env)->ReleaseByteArrayElements(env, measured, buf, JNI_ABORT);
     return ok;
+}
+
+/* Java→Native 心跳(2026-10 借鉴 XopProtector 双向绑定设计):
+ * Guard 注入壳每 5 秒喂一次;env_watchdog 检查 armed 后超时未喂 = Java 层
+ * 被删/被绕过 → 走 delayed_kill。记录侧只做原子时间戳(纳秒级,零开销)。
+ * ⚠️ 身份校验防冒充:攻击者 patch 掉 Java 校验后自己喂 ping 即可绕过整个
+ * 心跳机制 —— 所以 clazz 必须是 NcLink 本类(IsSameObject 锁死),
+ * 这是 Xop shell_heartbeat_ok 的同款纪律。 */
+JNIEXPORT void JNICALL
+Java_com_nc_link_NcLink_heartbeat(JNIEnv *env, jclass clazz)
+{
+    jclass self;
+    /* 仅允许 NcLink 本类调用(短名绑定的调用类必然正确,这里是纵深:
+     * 防 RegisterNatives 重绑/反射冒充)。self 为 NULL 时视为异常环境,
+     * 不记录本次心跳(watchdog 超时路径自会兜底,fail-closed)。 */
+    self = (*env)->FindClass(env, "com/nc/link/NcLink");
+    if (self != NULL) {
+        if ((*env)->IsSameObject(env, clazz, self)) {
+            nc_heartbeat_touch();
+        }
+        (*env)->DeleteLocalRef(env, self);
+    }
 }
 #endif /* NCLINK_HOST_TEST */

@@ -228,6 +228,12 @@ def render_bridge(so_name):
 # 判决入口:入参 t1 = SHA256(SHA256(实测证书DER));标准答案常驻 so,从不出境
 .method public static native ncVerify([B)Z
 .end method
+
+# 心跳喂食入口:Guard 的 daemon 线程每 5s 调一次;native 侧校验调用者身份
+# (IsSameObject 锁死本类)后记录时间戳;env_watchdog 超时未喂 → 杀。
+# 语义真相: stub-src/NcLink.java
+.method public static native heartbeat()V
+.end method
 """
     _render_asserts(text, so_name)
     return text
@@ -244,6 +250,27 @@ def render_guard(wrapper_desc):
 .method public constructor <init>()V
     .locals 0
     invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+
+# 单发守卫字段(daemon 线程只开一次)
+.field private static hbStarted:Z
+
+# 心跳喂食线程(daemon,5s 一次):语义真相 stub-src/Guard.java#startHeartbeat
+# 单发守卫由 Guard$hbStarted 标志位承担;喂失败吞 Throwable(native 超时自会兜底)
+.method public static startHeartbeat()V
+    .locals 4
+    sget-boolean v0, {wrapper_desc}->hbStarted:Z
+    if-eqz v0, :cond_hb_go
+    return-void
+    :cond_hb_go
+    const/4 v0, 0x1
+    sput-boolean v0, {wrapper_desc}->hbStarted:Z
+    new-instance v1, {wrapper_desc[:-1]}$Hb;
+    invoke-direct {{v1}}, {wrapper_desc[:-1]}$Hb;-><init>()V
+    const/4 v0, 0x1
+    invoke-virtual {{v1, v0}}, Ljava/lang/Thread;->setDaemon(Z)V
+    invoke-virtual {{v1}}, Ljava/lang/Thread;->start()V
     return-void
 .end method
 
@@ -289,6 +316,8 @@ def render_guard(wrapper_desc):
     invoke-static {{v4}}, {BRIDGE_DESC}->ncVerify([B)Z
     move-result v4
     if-eqz v4, :cond_kill
+    invoke-static {{}}, {BRIDGE_DESC}->heartbeat()V
+    invoke-static {{}}, {wrapper_desc}->startHeartbeat()V
     return-void
     :try_end_0
     :cond_kill
@@ -306,6 +335,39 @@ def render_guard(wrapper_desc):
 .end method
 """
     _render_asserts(text, 'nc')
+    return text
+
+
+def render_hb(wrapper_desc):
+    """Hb 内部类:心跳喂食循环(daemon Thread 子类,5s 一次)。
+    喂失败吞 Throwable 继续 —— native 侧超时自会处置(Xop 同款纪律)。"""
+    text = f"""# {MARKER}
+# Java→Native 心跳喂食循环(语义真相: stub-src/Guard.java#startHeartbeat)
+.class public final {wrapper_desc[:-1]}$Hb;
+.super Ljava/lang/Thread;
+
+.method public constructor <init>()V
+    .locals 0
+    invoke-direct {{p0}}, Ljava/lang/Thread;-><init>()V
+    return-void
+.end method
+
+.method public run()V
+    .locals 2
+
+    :goto_loop
+    :try_start_0
+    invoke-static {{}}, {BRIDGE_DESC}->heartbeat()V
+    const-wide/16 v0, 0x1388
+    invoke-static {{v0, v1}}, Ljava/lang/Thread;->sleep(J)V
+    :try_end_0
+    .catch Ljava/lang/Throwable; {{:try_start_0 .. :try_end_0}} :catch_hb
+    goto :goto_loop
+    :catch_hb
+    goto :goto_loop
+.end method
+.end class
+"""
     return text
 
 
@@ -498,6 +560,11 @@ def do_inject(decompiled_dir, so_name, wrapper_override=None):
         fp.write(render_guard(wrapper))
     with open(bridge_path, 'w', encoding='utf-8') as fp:
         fp.write(render_bridge(so_name))
+    # 心跳喂食循环(daemon Thread 子类,与 Guard 同目录)
+    hb_path = os.path.join(decompiled_dir, 'smali',
+                           (wrapper[1:-1] + '$Hb') + '.smali')
+    with open(hb_path, 'w', encoding='utf-8') as fp:
+        fp.write(render_hb(wrapper))
 
     # 调用点:LAUNCHER 优先(必在),Application 可选;双保险
     sites, notes = [], []

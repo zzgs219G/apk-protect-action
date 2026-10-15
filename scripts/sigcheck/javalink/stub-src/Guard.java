@@ -65,4 +65,37 @@ public final class Guard {
     private static void kill() {
         Process.killProcess(Process.myPid());
     }
+
+    /* ── Java→Native 心跳(2026-10 借鉴 XopProtector 双向绑定) ──
+     * 校验通过后启动 daemon 线程,每 5 秒喂一次 NcLink.heartbeat()。
+     * native 侧(nc_link.c)记录时间戳,env_watchdog 超时未喂(armed 后
+     * 首喂宽限 90s/之后保活 25s)= Java 层被删/被绕过 → delayed_kill。
+     * 这堵住了最大的架构单点:攻击者删掉 c() 调用 → so 不加载 → 全防失效;
+     * 有了心跳,"删调用"反而变成自杀(so 加载后心跳停 = 杀)。
+     * ⚠️ 必须在 ncVerify 通过之后才 start(判不过/ULE 直接 kill,无需喂);
+     *    单发守卫防重复开线程;daemon 保证不拖进程退出;
+     *    循环内 Throwable 全吞(Xop 同款:喂失败 native 侧超时自会兜底)。 */
+    private static volatile boolean heartbeatStarted;
+
+    private static void startHeartbeat() {
+        if (heartbeatStarted) {
+            return;
+        }
+        heartbeatStarted = true;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (true) {
+                    try {
+                        NcLink.heartbeat();
+                        Thread.sleep(5000);
+                    } catch (Throwable ignored) {
+                        /* 喂失败继续循环;native 侧超时自会处置 */
+                    }
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+    }
 }
