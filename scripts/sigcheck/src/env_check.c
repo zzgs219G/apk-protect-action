@@ -37,6 +37,8 @@
 #include <dlfcn.h>
 #include <elf.h>
 #include <sys/auxv.h>   /* 2026-12 追加:运行时探测 CPU CRC32 扩展(getauxval/AT_HWCAP) */
+#include <sys/ptrace.h> /* 2026-10 追加:PTRACE_TRACEME 反调试抢占 */
+#include <sys/prctl.h>  /* 2026-10 追加:PR_SET_DUMPABLE 禁内存 dump */
 #if defined(__aarch64__)
 #include <arm_acle.h>   /* 2026-12 追加:__crc32* 内建即硬件 CRC32(需 target("crc")) */
 #endif
@@ -143,6 +145,26 @@ static void env_fail(void) {
         abort();   /* 起线程失败则直接崩,不能放行 */
     }
     pthread_attr_destroy(&attr);
+}
+
+/* ────────────────── a0. 反调试抢占(2026-10 追加) ──────────────────
+ * tracer_probe(下方 c 项)是【被动】读 /proc/self/status 查 TracerPid——
+ * 攻击者 attach 后立即 detach 即可避开(探针只在构造时 + 每 20s 跑)。
+ * 本函数改为【主动】向内核声明"本进程不许被调试":
+ *   ptrace(PTRACE_TRACEME) —— 声明自身为被跟踪者后,内核拒绝任何外部
+ *     ptrace attach(EBUSY),调试器/事后挂载在系统层面被堵死,不依赖轮询时机。
+ *   prctl(PR_SET_DUMPABLE, 0) —— 同时禁掉 /proc/pid/mem 与 core dump 的可达性,
+ *     抬高内存 dump 与 Frida 注入的门槛。
+ *
+ * 性能:仅构造期执行一次,零运行期开销。
+ * 失败处理:PTRACE_TRACEME 返回 -1 且 errno==EPERM 表示"本进程已被跟踪"
+ *   (真机可能被系统的其他调试设施占用,如 Android Studio 的 profileable),
+ *   此时【不判失败】——交由 tracer_probe 的 TracerPid 判定,避免误伤;
+ *   其他错误同样静默(宁漏勿误伤,与全文件误报兜底纪律一致)。
+ * 注:已有 tracer 挂着时 PTRACE_TRACEME 会失败,这是预期行为,不算异常。 */
+static void anti_debug_preempt(void) {
+    (void)ptrace(PTRACE_TRACEME, 0, 0, 0);
+    (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 }
 
 /* ─────────────────────────── a. Frida 检测 ─────────────────────────── */
@@ -664,6 +686,7 @@ static void env_check_run(void) {
 
 /* dlopen 后最先执行的入口(与 sig_check_entry 并存,顺序不定,互不依赖) */
 __attribute__((constructor)) static void env_check_entry(void) {
+    anti_debug_preempt();   /* 2026-10 追加:先抢占(声明不许被调试),再跑探针 */
     env_check_run();
     env_watchdog_start();   /* 2026-12 追加:常驻复查线程(不影响上面的"加载即检") */
 }
