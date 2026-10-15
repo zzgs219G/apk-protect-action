@@ -39,6 +39,8 @@
 #include <sys/auxv.h>   /* 2026-12 追加:运行时探测 CPU CRC32 扩展(getauxval/AT_HWCAP) */
 #include <sys/ptrace.h> /* 2026-10 追加:PTRACE_TRACEME 反调试抢占 */
 #include <sys/prctl.h>  /* 2026-10 追加:PR_SET_DUMPABLE 禁内存 dump */
+#include <sys/syscall.h> /* 2026-10 追加:探针可信化 —— syscall 直调绕开 libc hook */
+#include <stdarg.h>
 #if defined(__aarch64__)
 #include <arm_acle.h>   /* 2026-12 追加:__crc32* 内建即硬件 CRC32(需 target("crc")) */
 #endif
@@ -167,6 +169,95 @@ static void anti_debug_preempt(void) {
     (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 }
 
+/* ────────────────── a0b. 探针可信化:syscall 直调(2026-10 追加) ──────────────────
+ * 背景:全文件的 /proc 探针(以及 ELF 解析)一律走 libc 的 fopen/fgets/fread。
+ * 攻击者只需 LD_PRELOAD 或 Frida 挂一个假的 fopen,即可让【全部探针】读到
+ * 伪造内容(maps 里藏掉 frida、status 里 TracerPid 归零、net/unix 清空),
+ * 一行 hook 废掉整个环境检测模块。
+ *
+ * 对策:所有敏感读取改走 syscall() 直调内核,不经 libc 的 FILE* 层。
+ * 攻击者要绕过就必须 hook syscall 本身(或内核级 rootkit),门槛显著抬高。
+ *
+ * 性能:syscall 直调比 fopen/fgets 更轻(少一层缓冲与锁),零额外开销。
+ * 兼容:__NR_openat 在 arm64 与 armv7 上均为 257,无需分架构处理;
+ *       read/close 的号也不分架构。不可用(seccomp 等)时返回"读失败",
+ *      由调用方的"宁漏勿误伤"兜底接住,绝不误判。
+ *
+ * 本函数只负责【读一段文件到内存】,不做任何判定 —— 探针的判定逻辑一行不改。 */
+static long safe_syscall(long n, long a0, long a1, long a2, long a3) {
+    return syscall(n, a0, a1, a2, a3);
+}
+
+/* 读整个文件到 calloc 的缓冲(调用方 free)。成功返回长度(不含结尾 \0),失败返回 -1。
+ * 注:缓冲末尾补 \0,便于按字符串处理(与 fgets 语义衔接)。 */
+static long safe_read_alloc(const char *path, char **out) {
+    int fd;
+    char *buf = NULL;
+    size_t cap = 0, len = 0;
+    *out = NULL;
+    fd = (int)safe_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0);
+    if (fd < 0) return -1;
+    cap = 65536;
+    buf = (char *)malloc(cap);
+    if (!buf) { safe_syscall(__NR_close, fd, 0, 0, 0); return -1; }
+    for (;;) {
+        long r;
+        if (len + 4096 + 1 > cap) {
+            char *nb;
+            size_t ncap = cap * 2;
+            nb = (char *)realloc(buf, ncap);
+            if (!nb) { free(buf); safe_syscall(__NR_close, fd, 0, 0, 0); return -1; }
+            buf = nb; cap = ncap;
+        }
+        r = safe_syscall(__NR_read, fd, (long)(buf + len), (long)(cap - len - 1), 0);
+        if (r < 0) { free(buf); safe_syscall(__NR_close, fd, 0, 0, 0); return -1; }
+        if (r == 0) break;
+        len += (size_t)r;
+        if (len > (32u << 20)) break;   /* 上限守卫:防超大文件耗尽内存 */
+    }
+    safe_syscall(__NR_close, fd, 0, 0, 0);
+    buf[len] = '\0';
+    *out = buf;
+    return (long)len;
+}
+
+/* ────────────────────── 行迭代器(替代 fopen+fgets 组合) ──────────────────────
+ * 用法与 fgets 循环同构,便于逐处替换而不动判定逻辑:
+ *   safe_lines_t it; const char *line;
+ *   if (safe_lines_open(&it, path) == 0) {
+ *       while ((line = safe_lines_next(&it)) != NULL) { ...原 fgets 循环体... }
+ *       safe_lines_close(&it);
+ *   } */
+typedef struct {
+    char *buf;
+    size_t pos;
+    long   len;
+} safe_lines_t;
+
+static int safe_lines_open(safe_lines_t *it, const char *path) {
+    it->buf = NULL; it->pos = 0; it->len = -1;
+    it->len = safe_read_alloc(path, &it->buf);
+    if (it->len < 0 || it->buf == NULL) { it->len = -1; return -1; }
+    return 0;
+}
+
+/* 返回下一行(已去尾换行),到末尾返回 NULL。行内容指向 it->buf 内部,无需释放。 */
+static char *safe_lines_next(safe_lines_t *it) {
+    size_t start;
+    if (it->len < 0 || it->buf == NULL) return NULL;
+    if (it->pos >= (size_t)it->len) return NULL;
+    start = it->pos;
+    while (it->pos < (size_t)it->len && it->buf[it->pos] != '\n') it->pos++;
+    it->buf[it->pos] = '\0';
+    if (it->pos < (size_t)it->len) it->pos++;   /* 跳过换行 */
+    return it->buf + start;
+}
+
+static void safe_lines_close(safe_lines_t *it) {
+    if (it->buf) { free(it->buf); it->buf = NULL; }
+    it->len = -1; it->pos = 0;
+}
+
 /* ─────────────────────────── a. Frida 检测 ─────────────────────────── */
 
 /* a1. frida 默认端口 27042 / 27043 是否有监听者(127.0.0.1 回环快扫,50ms 超时) */
@@ -209,19 +300,19 @@ static int frida_port_probe(void) {
 
 /* a2. /proc/self/maps 里有没有 frida 特征库(frida-gadget/frida-agent 注入痕迹) */
 static int frida_maps_probe(void) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    char line[512];
-    if (!fp) return 0;
+    safe_lines_t it;
+    char *line;
     int hit = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        /* 只认明显的 frida 命名特征,宁漏勿误伤 */
+    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    /* 只认明显的 frida 命名特征,宁漏勿误伤 */
+    while ((line = safe_lines_next(&it)) != NULL) {
         if (strstr(line, "frida-agent") || strstr(line, "frida-gadget") ||
             strstr(line, "frida-inject") || strstr(line, "gadget_frida")) {
             hit = 1;
             break;
         }
     }
-    fclose(fp);
+    safe_lines_close(&it);
     return hit;
 }
 
@@ -231,19 +322,19 @@ static int frida_tcp_table_probe(void) {
     static const char *hexports[] = { ":69A2", ":69A3" };   /* 27042=0x69A2 27043=0x69A3 */
     size_t t, p;
     for (t = 0; t < sizeof(tables) / sizeof(tables[0]); t++) {
-        FILE *fp = fopen(tables[t], "r");
-        char line[512];
-        if (!fp) continue;
-        while (fgets(line, sizeof(line), fp)) {
+        safe_lines_t it;
+        char *line;
+        if (safe_lines_open(&it, tables[t]) != 0) continue;
+        while ((line = safe_lines_next(&it)) != NULL) {
             for (p = 0; p < sizeof(hexports) / sizeof(hexports[0]); p++) {
                 /* 形如 "...:69A2 00...:0000 0A ..." — 本地端口匹配 + state=0A(LISTEN) */
                 if (strstr(line, hexports[p]) && strstr(line + 10, " 0A ")) {
-                    fclose(fp);
+                    safe_lines_close(&it);
                     return 1;
                 }
             }
         }
-        fclose(fp);
+        safe_lines_close(&it);
     }
     return 0;
 }
@@ -252,11 +343,11 @@ static int frida_tcp_table_probe(void) {
 
 /* b1. 已加载库特征(读 maps,比文件存在性可靠——hook 框架必然注入自身库) */
 static int xposed_maps_probe(void) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    char line[512];
-    if (!fp) return 0;
+    safe_lines_t it;
+    char *line;
     int hit = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    while ((line = safe_lines_next(&it)) != NULL) {
         if (strstr(line, "libxposed") || strstr(line, "lspd") ||
             strstr(line, "lsposed") || strstr(line, "edxposed") ||
             strstr(line, "libriru")  || strstr(line, "libzygisk")) {
@@ -264,7 +355,7 @@ static int xposed_maps_probe(void) {
             break;
         }
     }
-    fclose(fp);
+    safe_lines_close(&it);
     return hit;
 }
 
@@ -289,18 +380,18 @@ static int xposed_file_probe(void) {
 
 /* /proc/self/status 的 TracerPid:被 ptrace 附着(调试器/memfault 工具)时非 0 */
 static int tracer_probe(void) {
-    FILE *fp = fopen("/proc/self/status", "r");
-    char line[256];
-    if (!fp) return 0;
+    safe_lines_t it;
+    char *line;
     int hit = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    if (safe_lines_open(&it, "/proc/self/status") != 0) return 0;
+    while ((line = safe_lines_next(&it)) != NULL) {
         if (strncmp(line, "TracerPid:", 10) == 0) {
             int pid = atoi(line + 10);
             if (pid != 0) hit = 1;
             break;
         }
     }
-    fclose(fp);
+    safe_lines_close(&it);
     return hit;
 }
 
@@ -371,10 +462,10 @@ static uint32_t env_crc32(const uint8_t *buf, size_t len) {
 
 /* d2. 从 /proc/self/maps 取"含 needle 的映射"的文件路径(第一个 '/' 起) */
 static int env_map_path(const char *needle, char *out, size_t outlen) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    char line[512];
-    if (!fp) return 0;
-    while (fgets(line, sizeof(line), fp)) {
+    safe_lines_t it;
+    char *line;
+    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    while ((line = safe_lines_next(&it)) != NULL) {
         char *slash;
         size_t n;
         if (!strstr(line, needle)) continue;
@@ -384,28 +475,28 @@ static int env_map_path(const char *needle, char *out, size_t outlen) {
         if (n >= outlen) n = outlen - 1;
         memcpy(out, slash, n);
         out[n] = '\0';
-        fclose(fp);
+        safe_lines_close(&it);
         return 1;
     }
-    fclose(fp);
+    safe_lines_close(&it);
     return 0;
 }
 
 /* d3. [addr,addr+len) 是否整体落在可读映射内(maps 解析,避免非法读崩溃) */
 static int env_mem_readable(const void *addr, size_t len) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    char line[512];
+    safe_lines_t it;
+    char *line;
     uintptr_t target = (uintptr_t)addr;
     uintptr_t end = target + len;
-    if (!fp) return 0;
-    while (fgets(line, sizeof(line), fp)) {
+    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    while ((line = safe_lines_next(&it)) != NULL) {
         unsigned long s = 0, e = 0;
         char perms[8] = {0};
         if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) != 3) continue;
         if (perms[0] != 'r') continue;
-        if (target >= (uintptr_t)s && end <= (uintptr_t)e) { fclose(fp); return 1; }
+        if (target >= (uintptr_t)s && end <= (uintptr_t)e) { safe_lines_close(&it); return 1; }
     }
-    fclose(fp);
+    safe_lines_close(&it);
     return 0;
 }
 
@@ -413,75 +504,76 @@ static int env_mem_readable(const void *addr, size_t len) {
 typedef struct { uint64_t offset; uint64_t vaddr; uint64_t size; } env_text_t;
 
 static int env_elf_text(const char *path, env_text_t *out) {
-    FILE *fp = fopen(path, "rb");
+    unsigned char *file = NULL;
+    long flen;
     unsigned char ident[16];
     int is64, ok = 0;
-    if (!fp) return 0;
-    if (fread(ident, 1, 16, fp) != 16) { fclose(fp); return 0; }
-    if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F') { fclose(fp); return 0; }
-    if (ident[5] != 1) { fclose(fp); return 0; }        /* 只处理小端 */
+    /* 2026-10 探针可信化:ELF 也走 syscall 直调 —— 攻击者 hook fopen 后
+     * 可以喂一份"原版" .text 内容,让 libc_text_crc_probe 永久通过 */
+    flen = safe_read_alloc(path, (char **)&file);
+    if (flen < 16 || file == NULL) { if (file) free(file); return 0; }
+    memcpy(ident, file, 16);
+    if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F') { free(file); return 0; }
+    if (ident[5] != 1) { free(file); return 0; }        /* 只处理小端 */
     is64 = (ident[4] == 2);
-    rewind(fp);
     if (is64) {
-        Elf64_Ehdr eh;
+        Elf64_Ehdr *eh = (Elf64_Ehdr *)file;
         size_t shstr_size = 0;
         char *strtab = NULL;
         int i;
-        if (fread(&eh, 1, sizeof(eh), fp) != sizeof(eh)) { fclose(fp); return 0; }
-        if (eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shstrndx >= eh.e_shnum) { fclose(fp); return 0; }
+        if ((long)sizeof(Elf64_Ehdr) > flen) { free(file); return 0; }
+        if (eh->e_shoff == 0 || eh->e_shnum == 0 || eh->e_shstrndx >= eh->e_shnum) { free(file); return 0; }
+        if ((long)(eh->e_shoff + (uint64_t)eh->e_shstrndx * eh->e_shentsize + sizeof(Elf64_Shdr)) > flen) { free(file); return 0; }
         {
-            Elf64_Shdr shstr;
-            if (fseek(fp, (long)(eh.e_shoff + (uint64_t)eh.e_shstrndx * eh.e_shentsize), SEEK_SET) != 0) { fclose(fp); return 0; }
-            if (fread(&shstr, 1, sizeof(shstr), fp) != sizeof(shstr)) { fclose(fp); return 0; }
-            shstr_size = (size_t)shstr.sh_size;
+            Elf64_Shdr *shstr = (Elf64_Shdr *)(file + eh->e_shoff + (uint64_t)eh->e_shstrndx * eh->e_shentsize);
+            shstr_size = (size_t)shstr->sh_size;
+            if ((long)(shstr->sh_offset + shstr_size) > flen) { free(file); return 0; }
             strtab = (char *)malloc(shstr_size + 1);
-            if (!strtab) { fclose(fp); return 0; }
-            if (fseek(fp, (long)shstr.sh_offset, SEEK_SET) != 0 ||
-                fread(strtab, 1, shstr_size, fp) != shstr_size) { free(strtab); fclose(fp); return 0; }
+            if (!strtab) { free(file); return 0; }
+            memcpy(strtab, file + shstr->sh_offset, shstr_size);
             strtab[shstr_size] = '\0';
         }
-        for (i = 0; i < (int)eh.e_shnum; i++) {
-            Elf64_Shdr sh;
-            if (fseek(fp, (long)(eh.e_shoff + (uint64_t)i * eh.e_shentsize), SEEK_SET) != 0) break;
-            if (fread(&sh, 1, sizeof(sh), fp) != sizeof(sh)) break;
-            if ((size_t)sh.sh_name >= shstr_size) continue;
-            if (strcmp(strtab + sh.sh_name, ".text") == 0) {
-                out->offset = sh.sh_offset; out->vaddr = sh.sh_addr; out->size = sh.sh_size;
+        for (i = 0; i < (int)eh->e_shnum; i++) {
+            Elf64_Shdr *sh;
+            if ((long)(eh->e_shoff + (uint64_t)i * eh->e_shentsize + sizeof(Elf64_Shdr)) > flen) break;
+            sh = (Elf64_Shdr *)(file + eh->e_shoff + (uint64_t)i * eh->e_shentsize);
+            if ((size_t)sh->sh_name >= shstr_size) continue;
+            if (strcmp(strtab + sh->sh_name, ".text") == 0) {
+                out->offset = sh->sh_offset; out->vaddr = sh->sh_addr; out->size = sh->sh_size;
                 ok = 1; break;
             }
         }
-        free(strtab); fclose(fp);
+        free(strtab); free(file);
         return ok;
     }
     {
-        Elf32_Ehdr eh;
+        Elf32_Ehdr *eh = (Elf32_Ehdr *)file;
         size_t shstr_size = 0;
         char *strtab = NULL;
         int i;
-        if (fread(&eh, 1, sizeof(eh), fp) != sizeof(eh)) { fclose(fp); return 0; }
-        if (eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shstrndx >= eh.e_shnum) { fclose(fp); return 0; }
+        if ((long)sizeof(Elf32_Ehdr) > flen) { free(file); return 0; }
+        if (eh->e_shoff == 0 || eh->e_shnum == 0 || eh->e_shstrndx >= eh->e_shnum) { free(file); return 0; }
+        if ((long)(eh->e_shoff + (uint32_t)eh->e_shstrndx * eh->e_shentsize + sizeof(Elf32_Shdr)) > flen) { free(file); return 0; }
         {
-            Elf32_Shdr shstr;
-            if (fseek(fp, (long)(eh.e_shoff + (uint32_t)eh.e_shstrndx * eh.e_shentsize), SEEK_SET) != 0) { fclose(fp); return 0; }
-            if (fread(&shstr, 1, sizeof(shstr), fp) != sizeof(shstr)) { fclose(fp); return 0; }
-            shstr_size = (size_t)shstr.sh_size;
+            Elf32_Shdr *shstr = (Elf32_Shdr *)(file + eh->e_shoff + (uint32_t)eh->e_shstrndx * eh->e_shentsize);
+            shstr_size = (size_t)shstr->sh_size;
+            if ((long)(shstr->sh_offset + shstr_size) > flen) { free(file); return 0; }
             strtab = (char *)malloc(shstr_size + 1);
-            if (!strtab) { fclose(fp); return 0; }
-            if (fseek(fp, (long)shstr.sh_offset, SEEK_SET) != 0 ||
-                fread(strtab, 1, shstr_size, fp) != shstr_size) { free(strtab); fclose(fp); return 0; }
+            if (!strtab) { free(file); return 0; }
+            memcpy(strtab, file + shstr->sh_offset, shstr_size);
             strtab[shstr_size] = '\0';
         }
-        for (i = 0; i < (int)eh.e_shnum; i++) {
-            Elf32_Shdr sh;
-            if (fseek(fp, (long)(eh.e_shoff + (uint32_t)i * eh.e_shentsize), SEEK_SET) != 0) break;
-            if (fread(&sh, 1, sizeof(sh), fp) != sizeof(sh)) break;
-            if ((size_t)sh.sh_name >= shstr_size) continue;
-            if (strcmp(strtab + sh.sh_name, ".text") == 0) {
-                out->offset = sh.sh_offset; out->vaddr = sh.sh_addr; out->size = sh.sh_size;
+        for (i = 0; i < (int)eh->e_shnum; i++) {
+            Elf32_Shdr *sh;
+            if ((long)(eh->e_shoff + (uint32_t)i * eh->e_shentsize + sizeof(Elf32_Shdr)) > flen) break;
+            sh = (Elf32_Shdr *)(file + eh->e_shoff + (uint32_t)i * eh->e_shentsize);
+            if ((size_t)sh->sh_name >= shstr_size) continue;
+            if (strcmp(strtab + sh->sh_name, ".text") == 0) {
+                out->offset = sh->sh_offset; out->vaddr = sh->sh_addr; out->size = sh->sh_size;
                 ok = 1; break;
             }
         }
-        free(strtab); fclose(fp);
+        free(strtab); free(file);
         return ok;
     }
 }
@@ -540,14 +632,14 @@ static int frida_thread_probe(void) {
     while ((de = readdir(d)) != NULL) {
         char p[160];
         char nm[64];
-        FILE *f;
+        char *fb = NULL;
         size_t i, L;
         if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
         snprintf(p, sizeof(p), "/proc/self/task/%s/comm", de->d_name);
-        f = fopen(p, "r");
-        if (!f) continue;
-        if (fgets(nm, sizeof(nm), f) == NULL) { fclose(f); continue; }
-        fclose(f);
+        /* 线程名同样走 syscall 直调(防 fopen hook 伪造 comm) */
+        if (safe_read_alloc(p, &fb) < 0 || fb == NULL) continue;
+        snprintf(nm, sizeof(nm), "%s", fb);
+        free(fb);
         L = strcspn(nm, "\n");
         nm[L] = '\0';
         for (i = 0; i < nnames; i++) {
@@ -567,16 +659,16 @@ static int frida_thread_probe(void) {
 static int frida_unix_probe(void) {
     static const char *sigs[] = { "frida", "linjector", "gum-js" };
     const size_t ns = sizeof(sigs) / sizeof(sigs[0]);
-    FILE *fp = fopen("/proc/net/unix", "r");
-    char line[512];
-    if (!fp) return 0;
-    while (fgets(line, sizeof(line), fp)) {
+    safe_lines_t it;
+    char *line;
+    if (safe_lines_open(&it, "/proc/net/unix") != 0) return 0;
+    while ((line = safe_lines_next(&it)) != NULL) {
         size_t i;
         for (i = 0; i < ns; i++) {
-            if (strstr(line, sigs[i])) { fclose(fp); return 1; }
+            if (strstr(line, sigs[i])) { safe_lines_close(&it); return 1; }
         }
     }
-    fclose(fp);
+    safe_lines_close(&it);
     return 0;
 }
 
