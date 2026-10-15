@@ -48,6 +48,10 @@ STUB_FILE = 'StrDec.smali'
 STUB_GEN_MARK = '# nc-strdec-gen v2'          # 桩文件内的生成标记(识别"这是我们写的")
 # 解密主方法名 —— 「只盯最危险一步」的警报器只管这个方法(见 _check_stub_registers)
 STUB_DECRYPT_METHOD = 'd'
+# 解密内核方法名(2026-10 两层拆分):算法本体在 dn(),d() 只剩 try/catch 壳。
+# 桩随机化只改 d 不改 dn —— dn 是 dex2c 联动要转译的目标(见 protect.sh
+# --dex2c 分支),且它是真正调用系统 Base64 解码工具的方法(报错二十二锚点)。
+STUB_KERNEL_METHOD = 'dn'
 STUB_SRC = 'stub-src/StrDec.java'             # 解密桩唯一源码真相(本脚本相对路径)
 STUB_D8_JAR = 'tools/d8.jar'                  # 固定版本 D8(报错六教训:工具版本漂移即翻车)
 CLASS_MARK = '# nc-strdec-encrypted'          # 已加密类的标记注释(幂等判定)
@@ -143,11 +147,15 @@ def load_stub_skeleton() -> str:
             f'   先运行 scripts/string-enc/build-stub.sh 生成(它把 '
             f'{STUB_SRC} 编译为 smali)。')
     find_stub_seed_anchors(tpl)      # 锚点自检(失败即抛 SystemExit)
-    # 防线(报错二十二):骨架必须过参数寄存器自检。锚定骨架真名 'd' ——
+    # 防线(报错二十二):骨架必须过参数寄存器自检。锚定骨架真名 'dn' ——
     # 骨架恒为 build-stub.sh 的 legacy 编译产物,方法名随机化只发生在
     # write_stub 的文本替换(寄存器布局不变);若按全局随机名找方法,
     # 守卫找不到目标方法 → 整条防线静默失效(报错四十八)。
-    _check_stub_registers(tpl, 'd')
+    # 注(2026-10 两层拆分):警报器必须盯 dn() 而非 d() —— d() 已退化为
+    # 只做 try/catch 兜底的壳,真正调用系统 Base64 解码工具的是 dn();
+    # 沿用旧锚点会误报壳的 move-result-object(见 tests 失败现象),
+    # 且放过内核的真实风险。
+    _check_stub_registers(tpl, STUB_KERNEL_METHOD)
     # 防线(报错二十五):类体顶层(非 .method 区)不许出现裸指令。
     # 骨架是编译产物,理论上不会违规;这条兜底拦住任何"把指令写进类体顶层"
     # 的回归(该形态 smali 汇编器报 no viable alternative)。
@@ -1372,6 +1380,11 @@ def main():
     ap.add_argument('--stub-name',
                     help="固定桩名 '包名.类名[:方法名]'(如 com.nc.strdec.StrDec:d),"
                          "仅供测试/复现;不传 = 每包随机生成(生产默认,防引擎固定签名)")
+    ap.add_argument('--emit-stub-filter',
+                    metavar='OUT_PATH',
+                    help="把解密桩内核的 dex2c/dcc filter 规则写入该路径(仅一行,"
+                         "形如 Lcom/a/b/c/StrDec;dn.*)。供 protect.sh 的 stringenc↔"
+                         "dex2c 联动的 filter 追加使用;不传则不产出。桩未注入时不写文件。")
     ap.add_argument('--quiet', action='store_true', help='只打错误')
     args = ap.parse_args(argv)
 
@@ -1487,6 +1500,43 @@ def main():
                   f' (组件标记 {os.path.basename(stamp)})')
     # 复用桩的场景 S2 无需任何字段合并:桩里只有种子,续跑时种子原样保留,
     # 新密文用同一种子 + 新区段即可解 —— 这正是 S2 相对 v1/S1 的幂等优势。
+
+    # ── 联动(stringenc↔dex2c):输出桩内核的 filter 规则 ─────────────────
+    # 为什么要单独产出:桩名是每包随机的(STUB_DESC),protect.sh 无法预知,
+    # 只能由本脚本(唯一知道桩名的环节)反向写出来给 dex2c 的 filter 追加。
+    # 规则只针对 dn()(解密内核),不碰 d() —— d() 是 try/catch 壳,dex2c
+    # 不支持异常表,转它只会生成坏 C(详见 README「两层拆分」)。
+    # 只在桩确实存在时写文件(本次新注入 或 续跑复用),否则 dex2c 追加一条
+    # 命中不存在类的规则只是空转,还掩盖"没加密却勾了联动"的配置错误。
+    if args.emit_stub_filter:
+        if find_stub_path(args.decompiled) is not None:
+            # full_name = Lcom/pkg/Cls;method(args)ret；filter 是正则、按 search 匹配。
+            # 【必须覆盖三个方法,不能只写 dn】dex2c 只转译 filter 命中的方法,
+            # 未命中的方法即使被调用也只是留一个 JNI 反调(实测:只写 dn 时
+            # mix64/keyByte 留在 dex 被 D2C_RESOLVE_STATIC_METHOD 反调,
+            # splitmix64 常量与密钥流逻辑仍可读)。三者一并抽走,
+            # 算法才真正整体进 so。
+            #    dn()      解密内核(控制流/偏移/XOR)
+            #    mix64()   splitmix64 混合函数(核心常量在这里)
+            #    keyByte() 密钥流单字节(README 记为对拍契约,运行期不调用,
+            #             但一起抽走可避免"半截算法"形态)
+            # d() 刻意不写:它是 try/catch 壳,dex2c 不支持异常表。
+            lines = [STUB_DESC + m + r'(.*)'
+                     for m in (STUB_KERNEL_METHOD, 'mix64', 'keyByte')]
+            with open(args.emit_stub_filter, 'w', encoding='utf-8') as fp:
+                fp.write('\n'.join(lines) + '\n')
+            if not args.quiet:
+                print(f'  🔗 联动 filter 已写出: {len(lines)} 条规则')
+                for l in lines:
+                    print(f'       {l}')
+        else:
+            # 桩不存在(本次零加密且无旧桩):联动的前提不成立,显式告警而非静默。
+            # protect.sh 侧据此 fail-fast,避免用户以为联动已生效。
+            with open(args.emit_stub_filter, 'w', encoding='utf-8') as fp:
+                fp.write('\n')
+            if not args.quiet:
+                print('⚠️ 未发现解密桩,联动 filter 为空(本次无加密且无旧桩)',
+                      file=sys.stderr)
 
     # 报错二十四 构建期防线:任何产物 .field 初值都不允许是 StrDec 字段引用
     # (FIELD 型 0x19 encoded static_value,ART 类初始化即失败 → 秒闪退无日志)。

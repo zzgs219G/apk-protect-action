@@ -21,6 +21,7 @@
   T15 args.txt 结尾无多余空行（§10.2）
   T6b/T6c packer(基础加壳)          → leaf 模块，只吐 --packer，与共存模块顺序固定
   T6d 旧 App 快照无 packer 键       → 视为 disabled，不报错（§10.1 正向）
+  T6e/T6f stringenc.dex2c_stub       → 默认开追加 --dex2c-stub；显式 false 不追加
 """
 import json
 import os
@@ -119,9 +120,23 @@ rc, args, files, err = run(cfg(sigcheck=True, envcheck=True, antidiff=True, pack
                                dex2c={"enabled": True, "rules_file": "**/com.test.**"},
                                stringenc={"enabled": True, "rules_file": "**/com.s.**"}))
 expect = ["--sigcheck", "--dex2c", "schema_rules/dex2c.txt",
-          "--stringenc", "schema_rules/stringenc.txt", "--anti-diff", "--envcheck",
-          "--packer"]
+          "--stringenc", "schema_rules/stringenc.txt", "--dex2c-stub",
+          "--anti-diff", "--envcheck", "--packer"]
 check("T6 全家桶 → 参数齐全且顺序固定", rc == 0 and args == expect, f"rc={rc} args={args}")
+
+# T6e stringenc.dex2c_stub 子复选框(2026-10 联动):默认开 → 追加 --dex2c-stub
+# (flag 分支:值是布尔、不写规则文件、不进 required 校验;位置紧跟所属模块 arg)
+rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": "com.a.**"}))
+check("T6e stringenc.dex2c_stub 缺省 → 默认勾选,追加 --dex2c-stub",
+      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt",
+                           "--dex2c-stub"], f"rc={rc} args={args} err={err}")
+
+# T6f 显式不勾 → 不追加(老路径:桩留在 dex)
+rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": "com.a.**",
+                                          "dex2c_stub": False}))
+check("T6f stringenc.dex2c_stub=false → 不追加 --dex2c-stub",
+      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt"],
+      f"rc={rc} args={args} err={err}")
 
 # T6b packer:新增的加壳模块是 leaf(无子选项),勾选只吐一个 --packer
 rc, args, files, err = run(cfg(packer=True))
@@ -216,7 +231,8 @@ check("T11 全部 disabled → 报错", rc != 0 and "没有" in err, f"rc={rc} e
 tricky = "**/com.test.**  # 注释 行 !排除\nactivity*\n\n$HOME `id` ; rm -rf\n"
 rc, args, files, err = run(cfg(stringenc={"enabled": True, "rules_file": tricky}))
 check("T12 特殊字符规则 → 原样写入文件、argv 仅相对路径",
-      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt"]
+      rc == 0 and args == ["--stringenc", "schema_rules/stringenc.txt",
+                           "--dex2c-stub"]
       and files.get("stringenc.txt") == tricky,
       f"rc={rc} args={args}")
 

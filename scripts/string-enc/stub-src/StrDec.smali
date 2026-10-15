@@ -34,9 +34,27 @@
 .end method
 
 .method public static d(Ljava/lang/String;)Ljava/lang/String;
-    .locals 14
+    .locals 0
 
     :try_start_0
+    invoke-static {p0}, Lcom/nc/strdec/StrDec;->dn(Ljava/lang/String;)Ljava/lang/String;
+
+    move-result-object p0
+    :try_end_0
+    .catchall {:try_start_0 .. :try_end_0} :catchall_0
+
+    :catchall_0
+    return-object p0
+.end method
+
+.method public static dn(Ljava/lang/String;)Ljava/lang/String;
+    .locals 14
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljava/io/UnsupportedEncodingException;
+        }
+    .end annotation
+
     sget-object v0, Lcom/nc/strdec/StrDec;->CACHE:Ljava/util/concurrent/ConcurrentHashMap;
 
     invoke-virtual {v0, p0}, Ljava/util/concurrent/ConcurrentHashMap;->get(Ljava/lang/Object;)Ljava/lang/Object;
@@ -62,7 +80,7 @@
 
     if-ge v2, v3, :cond_1
 
-    goto :goto_1
+    return-object p0
 
     :cond_1
     const/4 v2, 0x0
@@ -183,15 +201,9 @@
     if-ge v2, v3, :cond_4
 
     invoke-virtual {v1, p0, v0}, Ljava/util/concurrent/ConcurrentHashMap;->put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
-    :try_end_0
-    .catchall {:try_start_0 .. :try_end_0} :catchall_0
 
     :cond_4
     return-object v0
-
-    :catchall_0
-    :goto_1
-    return-object p0
 .end method
 
 .method private static keyByte(JJ)I

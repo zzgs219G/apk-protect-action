@@ -82,6 +82,7 @@ DPT_EXTRA_ARGS_TEXT=""  # 通用 dpt 参数通道(报错四十三后方向调整
 EXCLUDE_ABI=""          # 带值参数标准件(报错四十四):--exclude-abi 的值,经环境变量传 packer.sh
 WANT_STRINGENC=0; STRING_RULES=""
 WANT_ANTIDIFF=0
+WANT_DEX2C_STUB=0     # 联动子复选框:把解密桩内核 dn() 也抽进 dex2c(见 STEP2 顺序手术)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sigcheck) WANT_SIGCHECK=1; shift ;;
@@ -119,6 +120,7 @@ while [[ $# -gt 0 ]]; do
       if [[ $# -ge 2 ]]; then DPT_EXTRA_ARGS_TEXT="$2"; shift 2; else shift; fi ;;
 
     --anti-diff) WANT_ANTIDIFF=1; shift ;;
+    --dex2c-stub) WANT_DEX2C_STUB=1; shift ;;
     *)          log_err "未知参数: $1"; usage ;;
   esac
 done
@@ -127,6 +129,20 @@ TOTAL=$((WANT_SIGCHECK + WANT_DCC + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + W
 if [[ $TOTAL -eq 0 ]]; then
   log_err "未勾选任何模块（--sigcheck / --dcc|--dex2c [规则] / --stringenc 规则 / --envcheck / --anti-diff / --packer）"
   exit 1
+fi
+
+# 联动子复选框的依赖校验(防呆):--dex2c-stub 单独勾选没有意义 ——
+# 它只是"把桩也交给 dex2c 转译"的修饰,必须同时有 stringenc(产出桩)
+# 与 dex2c(消费桩)。缺任何一个都是配置错误,fail-fast 说人话。
+if [[ $WANT_DEX2C_STUB -eq 1 ]]; then
+  if [[ $WANT_STRINGENC -eq 0 ]]; then
+    log_err "--dex2c-stub 必须与 --stringenc 同时勾选(没有字符串加密就没有解密桩可抽)"
+    exit 1
+  fi
+  if [[ $WANT_DEX2C -eq 0 ]]; then
+    log_err "--dex2c-stub 必须与 --dex2c 同时勾选(桩要交给 dex2c 转译;--dcc 旧引擎不接联动)"
+    exit 1
+  fi
 fi
 
 # 同层转译引擎互斥:双跑会产出两份互相覆盖的工程包,产物不可预期 → fail-fast
@@ -185,6 +201,51 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
 fi
 
 # ── STEP 2: dcc 转译（仅 --dex2c，--no-build 只产出工程包） ─────────
+# 联动(stringenc↔dex2c)的顺序手术:
+#   dex2c 从【APK】里读 dex(tools/Dex2C/dcc.py compile_dex→auto_vm→androguard),
+#   而解密桩是 stringenc 在 STEP5 才注入 smali 的 —— 正常顺序下 STEP2 时
+#   APK 里根本没有桩类,filter 写任何名字都转不到它。
+#   故勾选 --dex2c-stub 时,先在 STEP2 之前跑一轮 stringenc(解包→加密+注桩
+#   →回编成 APK'),dex2c 转译 APK' 就能命中桩;STEP5 再跳过一次 stringenc。
+#   代价:apktool 解包/回编从 1 次变 2 次(旧三总控合并时消除过的开销,
+#   为联动加回来;dex 8MB 量级约 +30~60s)。
+LINK_STUB=0
+if [[ $WANT_DEX2C -eq 1 && $WANT_STRINGENC -eq 1 && $WANT_DEX2C_STUB -eq 1 ]]; then
+  LINK_STUB=1
+fi
+if [[ $LINK_STUB -eq 1 ]]; then
+  log_step 2 6 "字符串加密前置（联动：桩须先于 dex2c 进 APK）"
+  repack_unpack "$WORK/pre" "$IN_APK"
+  # activity* 需要 Activity 类列表 → 从 Manifest 动态提取(同 STEP5 侧做法)
+  if grep -q '^[[:space:]]*activity\*[[:space:]]*$' "$STRING_RULES"; then
+    log_info "检测到 activity* 规则,从 Manifest 提取 Activity 列表"
+    python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" \
+      "$WORK/.placeholder_pre.txt" --classes "$WORK/activity_classes.txt" \
+      --on-fail skip || true
+  fi
+  python3 "$ROOT/scripts/string-enc/encrypt-strings.py" clean "$WORK/pre"
+  PRE_ENC_ARGS=()
+  [[ -f "$WORK/activity_classes.txt" ]] && PRE_ENC_ARGS+=(--classes "$WORK/activity_classes.txt")
+  # 关键差异:前置轮【不传 --exclude-methods】—— 此刻 dex2c 还没跑,
+  # 不知道哪些方法会被抽走。后果仅体积(被抽方法里的字符串白加密后随方法
+  # 变 native 壳),正确性无碍;STEP5 主轮仍按 compiled_methods 精确跳过。
+  python3 "$ROOT/scripts/string-enc/encrypt-strings.py" \
+    "$WORK/pre" "$STRING_RULES" "${PRE_ENC_ARGS[@]}" \
+    --emit-stub-filter "$WORK/stub_filter.txt"
+  # 联动前提校验:桩必须真的存在(零加密 + 无旧桩 = 联动空转,fail-fast
+  # 而非让用户以为生效)。encrypt-strings 在无桩时写空文件。
+  if [[ ! -s "$WORK/stub_filter.txt" ]]; then
+    log_err "--dex2c-stub 联动生效前提不成立:本轮 stringenc 没有注入解密桩"
+    log_err "     (规则零命中且无旧桩 → 无桩可抽;请检查规则是否命中业务类)"
+    exit 1
+  fi
+  log_info "联动 filter: $(cat "$WORK/stub_filter.txt")"
+  repack_build "$WORK/pre" "$WORK/pre-encrypted.apk"
+  LINK_APK="$WORK/pre-encrypted.apk"
+else
+  LINK_APK="$IN_APK"
+fi
+
 if [[ $WANT_TRANSPILE -eq 1 ]]; then
   log_step 2 6 "核心方法转 C（dcc/dex2c）"
   # 类名来源决策(规则优先,修复:联合勾选 sigcheck 时无视用户规则的 bug):
@@ -197,7 +258,7 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
     # activity* 需要 Activity 类列表 → 从 Manifest 动态提取
     if grep -q '^[[:space:]]*activity\*[[:space:]]*$' "$TRANSPILE_RULES"; then
       log_info "检测到 activity* 规则,从 Manifest 提取 Activity 列表"
-      python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" \
+      python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$LINK_APK" \
         "$WORK/.placeholder_filter.txt" --classes "$WORK/activity_classes.txt" \
         --on-fail skip || true
     fi
@@ -216,11 +277,25 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
   elif [[ $WANT_SIGCHECK -eq 1 ]]; then
     log_info "filter 来源: 未提供规则,自动抽取主类(make-filter-from-apk)"
     # 动态解析 Manifest 里的 LAUNCHER activity → 自动生成 filter（一行一个类）
-    python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$IN_APK" \
+    python3 "$ROOT/scripts/filter/make-filter-from-apk.py" "$LINK_APK" \
       "$WORK/auto_filter.txt" --classes "$WORK/activity_classes.txt" --on-fail error
     # auto_filter.txt 已是 dcc filter 正则格式(见 make-filter-from-apk.py),
     # 直接使用,不要二次转换 —— 曾经二次转换产生畸形正则导致 no compiled methods
     DCC_FILTER="$WORK/auto_filter.txt"
+  fi
+
+  # ── 联动:把解密桩内核 dn() 追加进 dex2c 的 filter ─────────────────
+  # 桩名每包随机,规则由 stringenc 前置轮的 --emit-stub-filter 反向产出。
+  # 只联 --dex2c:--dcc 是旧引擎,按用户决策不接入联动(dcc 待 dex2c 替代后下线)。
+  if [[ $LINK_STUB -eq 1 ]]; then
+    if [[ $WANT_DCC -eq 1 ]]; then
+      log_err "--dex2c-stub 只支持 --dex2c(与 --dcc 互斥,旧引擎不接联动)"
+      exit 1
+    fi
+    cp "$DCC_FILTER" "$WORK/dcc_filter_linked.txt"
+    cat "$WORK/stub_filter.txt" >> "$WORK/dcc_filter_linked.txt"
+    DCC_FILTER="$WORK/dcc_filter_linked.txt"
+    log_info "联动:桩内核已追加进 dex2c filter（$(grep -c . "$WORK/stub_filter.txt") 条: dn/mix64/keyByte）"
   fi
 
   # 两引擎的 dcc.py 都要在自身目录运行 → 子 shell 隔离，主进程 cwd 不漂移。
@@ -228,12 +303,12 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
   # (no-build 下 -o 不落地产物,传哑值),另传 --allow-global 对齐 dcc 的规则语义
   # (dcc 无全局规则护栏)、--disable-signing 防御性关签名(no-build 下本就不执行)。
   if [[ $WANT_DCC -eq 1 ]]; then
-    module_cd_run "$DCC_DIR" python3 dcc.py "$IN_APK" \
+    module_cd_run "$DCC_DIR" python3 dcc.py "$LINK_APK" \
       --project-archive "$WORK/dcc-project.zip" \
       --no-build \
       --filter "$DCC_FILTER"
   else
-    module_cd_run "$DEX2C_DIR" python3 dcc.py -i "$IN_APK" -o "$WORK/dex2c-no-build.apk" \
+    module_cd_run "$DEX2C_DIR" python3 dcc.py -i "$LINK_APK" -o "$WORK/dex2c-no-build.apk" \
       --project-archive "$WORK/dcc-project.zip" \
       --no-build \
       --disable-signing \
@@ -309,8 +384,16 @@ ndk_build "$WORK/project"
 fi   # 有 so 需求的组合才执行 STEP 3/4(报错二十三:纯 stringenc 组合跳过)
 
 # ── STEP 5: 解包 → smali 处理 → 放 so → 回编（全组合只做这一次） ────
+# ── STEP 5: 解包 → smali 处理 → 放 so → 回编（全组合只做这一次） ────
+# 联动路径(stringenc↔dex2c)必须解【前置加密后的 APK'】而非原始 IN_APK ——
+# stringenc 已在 STEP2 前跑完并回编成 APK',解原始包会把密文+桩全部丢掉,
+# 只剩 mark-native 把 dn() 改壳后指向一个不存在的桩类 → UnsatisfiedLinkError。
+STEP5_APK="$IN_APK"
+if [[ $LINK_STUB -eq 1 ]]; then
+  STEP5_APK="$WORK/pre-encrypted.apk"
+fi
 log_step 5 6 "解包注入重打包"
-repack_unpack "$WORK/decompiled" "$IN_APK"
+repack_unpack "$WORK/decompiled" "$STEP5_APK"
 
 if [[ $WANT_TRANSPILE -eq 1 ]]; then
   # native 化：把已抽进 so 的方法在 smali 里改成 native 壳，并插 System.loadLibrary("nc")
@@ -346,6 +429,11 @@ fi
 # 该脚本内部复用 rules-to-filter.py 的 class_rule_to_filter 做类匹配,输入必须
 # 是用户规则(点号通配符)。若喂 rules-to-filter.py 的产物(dcc filter 正则)
 # 会被二次转换产生畸形正则(LLcom/.../),filter 那侧的同类坑见流程文档 §2 步骤 3。
+if [[ $WANT_STRINGENC -eq 1 && $LINK_STUB -eq 1 ]]; then
+  # 联动路径:stringenc 已在 STEP2 前跑完(桩必须先进 APK 才能被 dex2c 转译)。
+  # STEP5 再跑一次会二次加密(同一明文被包两层密文)→ 整包乱码,必须跳过。
+  log_info "字符串加密已在 STEP2 前置完成（联动路径，此处跳过避免二次加密）"
+else
 if [[ $WANT_STRINGENC -eq 1 ]]; then
   # activity* 需要 Activity 类列表 → 从 Manifest 动态提取(同 dex2c 侧做法)
   if grep -q '^[[:space:]]*activity\*[[:space:]]*$' "$STRING_RULES"; then
@@ -368,6 +456,7 @@ if [[ $WANT_STRINGENC -eq 1 ]]; then
   fi
   python3 "$ROOT/scripts/string-enc/encrypt-strings.py" \
     "$WORK/decompiled" "$STRING_RULES" "${STRING_ENC_ARGS[@]}"
+fi
 fi
 
 # ── 防对比混淆（dex 层，最后做：等 dcc/stringenc 的改动落定后再上结构噪声） ──

@@ -72,6 +72,15 @@
           "value_kind": "rules_file",
           "required": { "when": "always" },
           "hint": "每行一条，支持 **/com.test.** / activity*"
+        },
+        {
+          "key": "dex2c_stub",
+          "label": "解密桩也抽进 so",
+          "desc": "把解密桩内核 dn() 一并交给 dex2c 转译进 libnc.so，dex 里只剩 try/catch 壳，算法/种子不再以 Java 形式可见。需同时勾选 Dex2C；不勾时桩留在 dex。",
+          "type": "checkbox",
+          "default": true,
+          "value_kind": "flag",
+          "arg_on": "--dex2c-stub"
         }
       ]
     },
