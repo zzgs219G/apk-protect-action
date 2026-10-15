@@ -660,6 +660,67 @@ static int libc_text_crc_probe(void) {
     return (cf != cm) ? 1 : 0;
 }
 
+/* d6. 自身 so .text 内存 vs 磁盘 CRC 比对(2026-10 方案 B)——抓运行时 so 被 patch。
+ *
+ * 与 d5(libc)同构,目标换成"本 so 自身":
+ *   攻击者把 nc_verify_t1 / derive_expected 等校验函数 InlineHook 成恒真后,
+ *   内存里的机器码与磁盘文件不再一致 → 本探针检出。
+ *
+ * 性能设计(用户要求"性能写好点"):
+ *   ① 复用 env_crc32 —— arm64 自动走 target("crc") 硬件指令(HWCAP 探测),
+ *      实测比表驱动快约 65 倍;不支持则回落表驱动,结果逐位等价。
+ *   ② 只 CRC 目标段(.text),不读整个 so —— 典型 300KB,硬件 CRC 约 0.1~0.3ms。
+ *   ③ 磁盘侧只读该段(openat + pread 到固定缓冲),不做整文件扫描。
+ *   ④ 调用频率:构造期一次 + 看门狗每 20s 一次,平均开销可忽略。
+ *
+ * 误报兜底(与全文件纪律一致):任一步 I/O/解析/内存权限异常 → 视为"未检出",
+ *   宁漏勿误伤。特别注意:若 .text 所在页在内存中不可读(某些加固/只读映射),
+ *   直接放行而不是误判。 */
+static int self_text_crc_probe(void) {
+    Dl_info info;
+    char path[512];
+    env_text_t ts;
+    int fd;
+    uint8_t *fb;
+    long n;
+    uint32_t cf, cm;
+    const uint8_t *mem;
+
+    /* 用本探针自身地址定位自家 so(dladdr 对 static 函数同样有效) */
+    if (dladdr((const void *)&self_text_crc_probe, &info) == 0 || info.dli_fbase == NULL) return 0;
+
+    path[0] = '\0';
+    if (info.dli_fname != NULL) {
+        if (info.dli_fname[0] == '/')
+            snprintf(path, sizeof(path), "%s", info.dli_fname);
+        else
+            env_map_path(info.dli_fname, path, sizeof(path));
+    }
+    if (path[0] == '\0') env_map_path("libnc.so", path, sizeof(path));
+    if (path[0] == '\0') return 0;
+
+    if (!env_elf_text(path, &ts)) return 0;
+    /* 合理性守卫:自家 .text 不该是 0 或荒谬大(防解析到错误段) */
+    if (ts.size < 4096 || ts.size > (32u << 20)) return 0;
+
+    mem = (const uint8_t *)info.dli_fbase + ts.vaddr;
+    if (!env_mem_readable(mem, (size_t)ts.size)) return 0;
+
+    /* 磁盘侧只读目标段:syscall 直调(防 fopen hook 喂假内容,与方案 C 一致) */
+    fd = (int)safe_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0);
+    if (fd < 0) return 0;
+    fb = (uint8_t *)malloc((size_t)ts.size);
+    if (!fb) { safe_syscall(__NR_close, fd, 0, 0, 0); return 0; }
+    n = safe_syscall(__NR_pread64, fd, (long)fb, (long)ts.size, (long)ts.offset);
+    safe_syscall(__NR_close, fd, 0, 0, 0);
+    if (n != (long)ts.size) { free(fb); return 0; }
+
+    cf = env_crc32(fb, (size_t)ts.size);
+    cm = env_crc32(mem, (size_t)ts.size);
+    free(fb);
+    return (cf != cm) ? 1 : 0;
+}
+
 /* e. Frida 线程名检测(读 /proc/self/task/<tid>/comm) */
 static int frida_thread_probe(void) {
     static const char *names[] = { "gum-js-loop", "gmain", "gdbus", "pool-frida", "frida" };
@@ -726,6 +787,7 @@ static void *env_watchdog(void *arg) {
         if (!hit && xposed_maps_probe())     hit = 1;
         if (!hit && xposed_file_probe())     hit = 1;
         if (!hit && libc_text_crc_probe())   hit = 1;
+        if (!hit && self_text_crc_probe())   hit = 1;
         if (!hit && tracer_probe())          hit = 1;
         if (hit) {
             /*LSG:ENV_WATCHDOG_HIT|【失败】常驻复查线程检出危险环境*/
@@ -803,6 +865,11 @@ static void env_check_run(void) {
     r = libc_text_crc_probe();
     /*LSG:ENV_CRC|【数据】libc .text 内存完整性校验结果*/
     envlog_c(0, LSG_ENV_CRC, r ? "hit" : "clean");
+    if (!hit && r) hit = 1;
+
+    r = self_text_crc_probe();
+    /*LSG:ENV_SELF_CRC|【数据】本 so .text 内存完整性校验结果*/
+    envlog_c(0, LSG_ENV_SELF_CRC, r ? "hit" : "clean");
     if (!hit && r) hit = 1;
 
     if (hit) {
