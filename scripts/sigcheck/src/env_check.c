@@ -40,6 +40,7 @@
 #include <sys/ptrace.h> /* 2026-10 追加:PTRACE_TRACEME 反调试抢占 */
 #include <sys/prctl.h>  /* 2026-10 追加:PR_SET_DUMPABLE 禁内存 dump */
 #include <sys/syscall.h> /* 2026-10 追加:探针可信化 —— syscall 直调绕开 libc hook */
+#include <signal.h>      /* 2026-10 追加:方案 F —— SIGABRT 直投内核 */
 #include <stdarg.h>
 #if defined(__aarch64__)
 #include <arm_acle.h>   /* 2026-12 追加:__crc32* 内建即硬件 CRC32(需 target("crc")) */
@@ -126,14 +127,52 @@ static void envlog_c(int is_err, lsg_id_t id, const char *detail) {
 }
 
 /* ─────────────────────────── 检测到危险环境后的反应 ───────────────────────────
- * 与 sig_check.c 的 delayed_kill 同款:分离线程随机延时 abort。
- * 注:两个模块各有一条延时线程,攻击者 hook 掉其一,另一条仍在——天然互为备份。 */
+ * 与 sig_check.c 的 delayed_kill 同款:分离线程随机延时后处置。
+ * 注:两个模块各有一条延时线程,攻击者 hook 掉其一,另一条仍在——天然互为备份。
+ *
+ * 前向声明:safe_syscall 定义在下方 a0b 节(探针可信化),本节的处置需要提前用它。 */
+static long safe_syscall(long n, long a0, long a1, long a2, long a3);
+
+/* * 2026-10 增强(方案 F):让处置"不直白、难 hook、难归因"
+ *   ① 延时堆破坏:先以随机间隔 malloc/free 不同尺寸的块(不写入业务内存),
+ *      使进程堆布局碎片化。攻击者即便 hook 掉后续的发信号/abort,进程状态
+ *      也已被扰动,后续任意时点的崩溃都难以归因到本校验。
+ *      纯 malloc/free,不触碰任何业务数据(通用工具不做业务耦合)。
+ *   ② syscall 直调发信号:SIGABRT 用 __NR_tgkill 直投内核,不经 libc 的
+ *      abort()——攻击者 LD_PRELOAD/Frida hook abort 不再有效(与方案 C
+ *      探针可信化同一思路)。
+ *   ③ 保留随机延时:崩溃时机不可预测,攻击者难以把崩溃与"刚触发了什么"关联。
+ *
+ * 失败兜底:syscall 不可用(被 seccomp 拦等)时回落 abort(),绝不静默放行。 */
 static void *env_delayed_kill(void *arg) {
     (void)arg;
     unsigned int seed = (unsigned int)(time(NULL) ^ getpid());
     int delay = 1 + (int)(rand_r(&seed) % 3);   /* 与 sig_check 调试延时保持一致 */
+
+    /* ① 延时堆破坏(与 sig_check.c 的 delayed_kill 同款手法) */
+    {
+        int rounds = 8 + (int)(rand_r(&seed) % 16);   /* 8~23 轮,量级随机 */
+        int i;
+        for (i = 0; i < rounds; i++) {
+            size_t sz = (size_t)(64 + (rand_r(&seed) % 4096));
+            void *p = malloc(sz);
+            int j;
+            for (j = 0; j < 50 + (int)(rand_r(&seed) % 200); j++) {
+                usleep(1000 + (rand_r(&seed) % 3000));   /* 1~4ms 抖动 */
+            }
+            free(p);
+        }
+    }
+
     sleep(delay);
-    abort();
+
+    /* ② syscall 直调发 SIGABRT(绕开 libc 的 abort,防 hook) */
+#ifdef __NR_tgkill
+    if (safe_syscall(__NR_tgkill, (long)getpid(), (long)gettid(), SIGABRT, 0) == 0) {
+        /* 信号已投递;若因屏蔽未致死,下面兜底 */
+    }
+#endif
+    abort();   /* ③ 兜底:syscall 失败或被拦时仍要死,绝不静默放行 */
     return NULL;
 }
 
