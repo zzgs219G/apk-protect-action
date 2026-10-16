@@ -36,6 +36,13 @@ public final class Guard {
                两层防线静默全灭(真机实证:删净 so 自带 loadLibrary 注入点后
                换 key 重签不杀)。先加载后测量,so 层校验不再受测量摆布。 */
             NcLink.ensureLoaded();
+            /* .ncguard 段自解密自检(2026-12)：so 已加载,立即触发一次性解锁。
+               返回值 59 = 完整链路通过(解锁→解密→执行密文段代码)。
+               刻意【不影响主流程】:任何异常/非 59 都只静默记录,不 kill、
+               不阻断测量——本自检只是可观测性探针,不是防御支点。
+               若将来要把 .ncguard 变成真防御(把 env_check 探针移进去),
+               那时才需要 fail-closed。 */
+            ncguardSelftest();
             /* 报错四十九(2026-10-16):心跳喂食必须与"测量是否成功"解耦。
                旧形态把 heartbeat()/startHeartbeat() 放在 ncVerify 通过之后——
                测量链抛任何非 ULE Throwable(NameNotFoundException / signingInfo
@@ -75,6 +82,24 @@ public final class Guard {
 
     private static void kill() {
         Process.killProcess(Process.myPid());
+    }
+
+    /* ── .ncguard 段自解密自检(2026-12) ────────────────────────────
+     * native 侧 com/nc/guard/NcGuard.selftest() 返回：
+     *   59   完整链路通过（解锁→解密→执行 .ncguard 代码）
+     *   -100 已自检过（原子守门挡住重入）
+     *   负数 解锁失败（段定位/mprotect 等，见 nc_guard_unlock.c）
+     * 本方法是纯观测探针：不 kill、不阻断、不改变任何防御行为。
+     * 全吞 Throwable——自检本身绝不许成为新崩溃源。 */
+    private static void ncguardSelftest() {
+        try {
+            int r = com.nc.guard.NcGuard.selftest();
+            if (r != 59) {
+                android.util.Log.w("ncguard", "selftest rc=" + r);
+            }
+        } catch (Throwable ignored) {
+            /* 自检失败不影响主流程 */
+        }
     }
 
     /* ── Java→Native 心跳(2026-10 借鉴 XopProtector 双向绑定) ──

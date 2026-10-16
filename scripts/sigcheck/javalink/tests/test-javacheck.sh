@@ -21,7 +21,7 @@ ok() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 echo "[1/9] py_compile + javac 语义真相源(对 android API 桩编译,校验 API 形态)"
 python3 -m py_compile "$JL/inject-javacheck.py"
 python3 -m py_compile "$JL/tests/mk_manifest.py"
-mkdir -p "$T/stubs/android/content/pm" "$T/stubs/android/os" "$T/classes"
+mkdir -p "$T/stubs/android/content/pm" "$T/stubs/android/os" "$T/stubs/android/util" "$T/classes"
 cat > "$T/stubs/android/content/Context.java" <<'EOF'
 package android.content;
 public class Context {
@@ -67,11 +67,21 @@ public class Process {
     public static void killProcess(int pid) {}
 }
 EOF
+cat > "$T/stubs/android/util/Log.java" <<'EOF'
+package android.util;
+public class Log {
+    public static int w(String tag, String msg) { return 0; }
+    public static int d(String tag, String msg) { return 0; }
+    public static int e(String tag, String msg) { return 0; }
+}
+EOF
 javac -nowarn -d "$T/classes" \
   "$T/stubs/android/content/Context.java" \
   "$T/stubs/android/content/pm/"*.java \
   "$T/stubs/android/os/"*.java \
+  "$T/stubs/android/util/"*.java \
   "$JL/stub-src/NcLink.java" \
+  "$JL/stub-src/NcGuard.java" \
   "$JL/stub-src/Guard.java"
 ok "javac 语义真相源编译通过(Guard/NcLink 与桩 API 形态一致)"
 

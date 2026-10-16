@@ -34,6 +34,9 @@ MARKER = '# nc-javacheck-applied v1'
 CALL_MARKER = '# nc-javacheck-call'
 COMPONENTS_JSON = 'javacheck-components.json'
 BRIDGE_DESC = 'Lcom/nc/link/NcLink;'
+# .ncguard 段自解密自检入口(2026-12) —— native 侧 nc_guard_jni.c 实现。
+# 独立于 BRIDGE：它是"机制本身能否工作"的观测探针,不是签名校验链路。
+SELFTEST_DESC = 'Lcom/nc/guard/NcGuard;'
 SO_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,30}$')
 SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')   # 与 inject-loadlib/mark-native 同源,改动须 grep 三处
 
@@ -282,6 +285,18 @@ def render_guard(wrapper_desc):
 
     :try_start_0
     invoke-static {{}}, {BRIDGE_DESC}->ensureLoaded()V
+    # .ncguard 段自解密自检(2026-12):so 已加载即触发一次性解锁。
+    # 59 = 完整链路通过(解锁→解密→执行 .ncguard 代码);-100 = 已自检过;
+    # 负数 = 解锁失败(见 nc_guard_unlock.c)。纯观测:不 kill 不阻断,
+    # 与测量链解耦,全吞 Throwable,绝不成新崩溃源。
+    invoke-static {{}}, {SELFTEST_DESC}->selftest()I
+    move-result v0
+    const/16 v1, 0x3b
+    if-eq v0, v1, :after_selftest
+    const-string v0, "ncguard"
+    const-string v1, "selftest rc!=59"
+    invoke-static {{v0, v1}}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;)I
+    :after_selftest
     # 心跳前置(2026-10-16 修复):喂食必须与"测量是否成功"解耦。
     # 旧形态放在 ncVerify 通过之后 —— 测量链抛任何非 ULE Throwable 就跳
     # :catch_skip 静默返回 → 一次都不喂 → env_watchdog 把"没喂"误判成
