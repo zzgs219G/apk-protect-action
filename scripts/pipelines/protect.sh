@@ -347,10 +347,37 @@ if [[ $WANT_ENVCHECK -eq 1 ]]; then
     fi
   fi
 fi
+# so 静态加固(2026-12):开箱代码进 NDK 工程 —— ndk_write_mk 的两级 wildcard
+# 已收 *.c，nc_guard_unlock.c 放 jni/nc/ 或 jni/ 根都会被编译进 libnc.so。
+# 它无主动执行逻辑，由调用方在需要时调 ncguard_unlock()。
+# 布局对齐：联合(dex2c)方案源码在 jni/nc/，单独 sigcheck/envcheck 在 jni/ 根。
+if [[ -d "$WORK/project/jni/nc" ]]; then
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/nc/"
+else
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/"
+fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc
 
 log_step 4 6 "NDK 编译"
 ndk_build "$WORK/project"
+
+# ── so 静态加固(2026-12):把 .ncguard 段锁成密文（构建期"锁箱"）──────
+# 运行期由 nc_guard_unlock.c 的 ncguard_unlock() 解密；磁盘上 IDA 读到的
+# .ncguard 是 RC4 密文。抄自 XopProtector 的 .bitcode 自解密机制。
+# 幂等：已锁文件默认拒绝（防二次加密毁数据），故不加 --force。
+if [[ -d "$WORK/project/libs" ]]; then
+  for so in "$WORK"/project/libs/*/libnc.so; do
+    [[ -f "$so" ]] || continue
+    # fail-fast：段不存在/已锁 都算配置错误，静默跳过等于"以为防了其实没防"
+    python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" \
+      --section .ncguard 2>&1 | sed 's/^/  [lock] /' || {
+      echo "❌ .ncguard 锁箱失败（段未标记？或已锁？）——so 静态加固未生效" >&2
+      exit 1
+    }
+  done
+fi
 fi   # 有 so 需求的组合才执行 STEP 3/4(报错二十三:纯 stringenc 组合跳过)
 
 # ── STEP 5: 解包 → smali 处理 → 放 so → 回编（全组合只做这一次） ────
