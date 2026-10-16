@@ -151,7 +151,6 @@ int ncguard_unlock(void) {
 
     /* 擦敏感材料 */
     memset(key, 0, sizeof(key));
-    ncg_page_mprotect(slotdata, slotdata + 16, PROT_READ | PROT_WRITE);
     memset(slotdata, 0, 16);
 
     /* ⚠️ 必须把"已解锁"状态回写磁盘：否则第二次调本函数时又会从磁盘读到
