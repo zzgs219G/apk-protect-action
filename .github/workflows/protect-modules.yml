@@ -104,19 +104,9 @@ jobs:
           set -o pipefail
           # 报错四十四(2026-10-16): curl (3) URL rejected —— apk_url 含中文/空格
           # (文件名"简盒-正式版-...(1)_sign.apk")。curl 默认拒绝非 ASCII URL。
-          # 修法: --data-urlencode 不适用下载;正确姿势是先百分号编码路径部分再下载。
-          # 编码规则: 保留 scheme://host,仅对 path/query 做逐字节 UTF-8 百分号编码
-          # (空格→%20,中文→%E5%..);已编码的 %XX 不重复编码。
-          ENC_URL=$(python3 - "$APK_URL" <<'PY'
-import sys, urllib.parse
-u = sys.argv[1].strip()
-p = urllib.parse.urlsplit(u)
-path = urllib.parse.quote(p.path, safe='/%:@')
-query = urllib.parse.quote(p.query, safe='=&%:@') if p.query else ''
-print(urllib.parse.urlunsplit((p.scheme, p.netloc, path, query, '')))
-PY
-)
-          [ -n "$ENC_URL" ] || { echo "❌ apk_url 为空" | tee -a build.log; exit 1; }
+          # 修法: 下载前对 path/query 做百分号编码(scheme/host 保留,已编码的 %XX 不重复)。
+          ENC_URL=$(APK_URL="$APK_URL" python3 -c 'import os, urllib.parse; u = os.environ["APK_URL"].strip(); p = urllib.parse.urlsplit(u); path = urllib.parse.quote(p.path, safe="/%:@"); query = urllib.parse.quote(p.query, safe="=&%:@") if p.query else ""; print(urllib.parse.urlunsplit((p.scheme, p.netloc, path, query, "")))')
+          [ -n "$ENC_URL" ] || { echo "apk_url 为空" | tee -a build.log; exit 1; }
           echo "下载 URL(编码后): $ENC_URL" | tee -a build.log
           curl -fL --retry 3 -o app.apk "$ENC_URL" 2>&1 | tee -a build.log
           ls -la app.apk | tee -a build.log
