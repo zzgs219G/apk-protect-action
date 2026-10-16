@@ -1,10 +1,10 @@
 name: 'Setup NDK (prefers preinstalled)'
-description: '优先使用 runner 预装的 Android NDK（零下载零耗时），预装版本不匹配时回退到 nttld/setup-ndk 下载'
+description: '优先使用 runner 预装的 Android NDK（零下载零耗时），预装版本不匹配时回退下载指定版本'
 inputs:
   ndk-version:
-    description: 'NDK 版本号（r26d 等 nttld 写法）'
+    description: 'NDK 版本号（r27d / r26d，runner 预装目录以版本号命名）'
     required: false
-    default: 'r26d'
+    default: 'r27d'
 outputs:
   ndk-path:
     description: 'NDK 根目录绝对路径'
@@ -22,19 +22,29 @@ runs:
         NDK_R: ${{ inputs.ndk-version }}
       run: |
         set -euo pipefail
-        # r26d → 26.3.11579264（runner 预装目录以版本号命名）
-        case "$NDK_R" in
-          r26d) VER="26.3.11579264" ;;
-          *)    VER="" ;;
-        esac
+        # 版本号 → runner 预装目录名（形如 27.3.13750724）的映射表，单一真相源。
+        # r27d 是当前 ubuntu-24.04 runner 的预装版本（2026-10 实测 27.3.13750724），
+        # 选它即可零下载命中预装；r26d 保留作回退。
+        declare -A NDK_VER_MAP=(
+          [r27d]="27.3.13750724"
+          [r26d]="26.3.11579264"
+        )
+        VER="${NDK_VER_MAP[$NDK_R]:-}"
+        # 空值旁路修复：原逻辑对白名单外的版本给 VER=""，使下面"主版本号一致"
+        # 的判断永真 → 任何预装 NDK 都被接受，静默用错版本（报错十六的复发通道）。
+        # 现在一律 fail-fast。
+        [[ -n "$VER" ]] || { echo "❌ 不支持的 NDK 版本: $NDK_R（支持: ${!NDK_VER_MAP[*]}）"; exit 1; }
 
         # 1) 首选：GitHub ubuntu runner 预装的 NDK（零下载）——但必须先校验版本。
         #    报错十六（2026-09）: GitHub 把 runner 预装 NDK 升到 r27 后，ANDROID_NDK_HOME
-        #    未经版本校验就抢先命中 → dcc 生成的 C（jobject 寄存器收 int 赋值）在
+        #    未经版本校验就抢先命中 → 转译生成的 C（jobject 寄存器收 int 赋值）在
         #    r27 的 clang 18 下从 warning 升级为 error → NDK 编译失败。
         #    修法：预装候选逐个提取版本号（目录名形如 26.3.11579264 / 27.x.x），
         #    只认主版本号与指定版本一致的候选；都不匹配则回退下载。
-        want_major="${VER%%.*}"   # r26d → 26
+        #    注（2026-12）: dex2c 成为唯一转译引擎后，已实测其 move-result 路径
+        #    rhs 是变量而非常量，原报错十六的触发条件很可能不再成立；故 r27d
+        #    改回默认版本以吃到预装。若后续 CI 复现该编译错，回退 r26d 并修生成器。
+        want_major="${VER%%.*}"   # r27d → 27
         CANDIDATES=()
         [[ -n "${ANDROID_NDK_HOME:-}" ]] && CANDIDATES+=("$ANDROID_NDK_HOME")
         if [[ -n "${ANDROID_HOME:-}" ]]; then
@@ -60,13 +70,9 @@ runs:
         echo "⚠️ 预装 NDK 不匹配，回退下载 r 版本: $NDK_R"
         DEST="${RUNNER_TEMP:-/tmp}/ndk"
         rm -rf "$DEST"
-        case "$NDK_R" in
-          r26d)
-            URL="https://dl.google.com/android/repository/android-ndk-r26d-linux.zip"
-            ;;
-          *)
-            echo "❌ 不支持的回退版本: $NDK_R"; exit 1 ;;
-        esac
+        # URL 直接由版本号推导（android-ndk-<ver>-linux.zip），无需再维护 case 表；
+        # 版本合法性已在上面映射表处 fail-fast，这里不会出现未知版本。
+        URL="https://dl.google.com/android/repository/android-ndk-${NDK_R}-linux.zip"
         curl -fL --retry 3 -o "$DEST.zip" "$URL"
         unzip -q "$DEST.zip" -d "$(dirname "$DEST")"
         DIR="$(dirname "$DEST")/android-ndk-$NDK_R"

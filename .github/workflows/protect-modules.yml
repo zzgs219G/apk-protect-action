@@ -49,7 +49,7 @@ jobs:
         id: ndk
         uses: ./.github/actions/setup-ndk
         with:
-          ndk-version: r26d
+          ndk-version: r27d
 
       - name: 解压 dex2c 分发包
         run: |
