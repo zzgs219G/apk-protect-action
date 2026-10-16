@@ -185,6 +185,21 @@ first_invoke = next((i.get_output() for i in gcode.get_bc().get_instructions()
                      if i.get_name().startswith('invoke-')), None)
 check(first_invoke is not None and 'ensureLoaded' in first_invoke,
       f'Guard.c 第一条调用不是 ensureLoaded(报错四十二): {first_invoke}')
+# 报错四十九(2026-10-16):心跳喂食必须前置到测量链之前,与"测量是否成功"解耦。
+# 旧形态放在 ncVerify 之后 → 测量抛非 ULE 异常经 :catch_skip 静默返回 → 一次不喂
+# → env_watchdog 误判"壳被删" → 正常包冷启动必杀(docs/sigcheck_log.txt 实证)。
+invokes = [i.get_output() for i in gcode.get_bc().get_instructions()
+           if i.get_name().startswith('invoke-')]
+def _idx(needle):
+    return next((k for k, o in enumerate(invokes) if needle in o), -1)
+i_load, i_beat, i_start, i_verify = (_idx('ensureLoaded'), _idx('heartbeat'),
+                                     _idx('startHeartbeat'), _idx('ncVerify'))
+check(i_beat > i_load, f'heartbeat 不在 ensureLoaded 之后(报错四十九): {invokes}')
+check(i_start > i_load, f'startHeartbeat 不在 ensureLoaded 之后(报错四十九): {invokes}')
+check(0 < i_verify and i_beat < i_verify,
+      f'heartbeat 未前置到 ncVerify 之前,测量异常会误杀(报错四十九): {invokes}')
+check(0 < i_verify and i_start < i_verify,
+      f'startHeartbeat 未前置到 ncVerify 之前(报错四十九): {invokes}')
 if fails:
     print('\n'.join('❌ ' + f for f in fails)); sys.exit(1)
 print('  ✅ 读回断言全部通过')

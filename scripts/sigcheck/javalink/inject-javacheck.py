@@ -282,6 +282,14 @@ def render_guard(wrapper_desc):
 
     :try_start_0
     invoke-static {{}}, {BRIDGE_DESC}->ensureLoaded()V
+    # 心跳前置(2026-10-16 修复):喂食必须与"测量是否成功"解耦。
+    # 旧形态放在 ncVerify 通过之后 —— 测量链抛任何非 ULE Throwable 就跳
+    # :catch_skip 静默返回 → 一次都不喂 → env_watchdog 把"没喂"误判成
+    # "Java 壳被删" → 正常包冷启动 ~6s 必杀(真机实证 docs/sigcheck_log.txt)。
+    # so 已加载(ensureLoaded 成功)即开始喂;判决不过走 :cond_kill,测量异常
+    # 走 :catch_skip —— 两者的处置各归各路,不再由心跳把"测量失败"升级成死刑。
+    invoke-static {{}}, {BRIDGE_DESC}->heartbeat()V
+    invoke-static {{}}, {wrapper_desc}->startHeartbeat()V
     const-string v0, "SHA-256"
     invoke-static {{v0}}, Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;
     move-result-object v1
@@ -316,8 +324,6 @@ def render_guard(wrapper_desc):
     invoke-static {{v4}}, {BRIDGE_DESC}->ncVerify([B)Z
     move-result v4
     if-eqz v4, :cond_kill
-    invoke-static {{}}, {BRIDGE_DESC}->heartbeat()V
-    invoke-static {{}}, {wrapper_desc}->startHeartbeat()V
     return-void
     :try_end_0
     :cond_kill

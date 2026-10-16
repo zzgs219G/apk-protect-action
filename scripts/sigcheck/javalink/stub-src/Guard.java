@@ -36,6 +36,17 @@ public final class Guard {
                两层防线静默全灭(真机实证:删净 so 自带 loadLibrary 注入点后
                换 key 重签不杀)。先加载后测量,so 层校验不再受测量摆布。 */
             NcLink.ensureLoaded();
+            /* 报错四十九(2026-10-16):心跳喂食必须与"测量是否成功"解耦。
+               旧形态把 heartbeat()/startHeartbeat() 放在 ncVerify 通过之后——
+               测量链抛任何非 ULE Throwable(NameNotFoundException / signingInfo
+               为 null 的 NPE / 签名数组空越界,targetSdk 37 下均有现实通道)
+               就跳 catch(Throwable) 静默返回 → 一次都不喂 → env_watchdog 把
+               "没喂"误判成"Java 壳被删" → 正常包冷启动 ~6s 必杀(真机实证:
+               docs/sigcheck_log.txt 三次"Java 心跳丢失" + tombstone 无线程
+               NativeGuard$Hb)。so 已加载即开始喂,处置各归各路:
+               判决不过 → kill();测量异常 → catch 静默跳过(喂食照常进行)。 */
+            NcLink.heartbeat();
+            startHeartbeat();
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             PackageManager pm = ctx.getPackageManager();
             String pkg = ctx.getPackageName();
@@ -72,7 +83,9 @@ public final class Guard {
      * 首喂宽限 90s/之后保活 25s)= Java 层被删/被绕过 → delayed_kill。
      * 这堵住了最大的架构单点:攻击者删掉 c() 调用 → so 不加载 → 全防失效;
      * 有了心跳,"删调用"反而变成自杀(so 加载后心跳停 = 杀)。
-     * ⚠️ 必须在 ncVerify 通过之后才 start(判不过/ULE 直接 kill,无需喂);
+     * ⚠️ 必须在 ensureLoaded() 之后、【测量链之前】start(报错四十九):
+     *    旧版"ncVerify 通过后才 start"会让测量异常经 catch 静默跳过 → 一次
+     *    不喂 → 正常包被误杀。现在 so 一加载就开始喂,判不过/ULE 仍各自 kill。
      *    单发守卫防重复开线程;daemon 保证不拖进程退出;
      *    循环内 Throwable 全吞(Xop 同款:喂失败 native 侧超时自会兜底)。 */
     private static volatile boolean heartbeatStarted;
