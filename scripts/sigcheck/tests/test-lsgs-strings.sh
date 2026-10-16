@@ -46,6 +46,9 @@ else
 fi
 
 cp "$SRC_ENV" "$T/env_check.c"
+cp "$SRC_SIG" "$T/sig_check.c"
+# sig_check.c 引用 sig_hash.h(构建期由 make-sig-hash.sh 生成;测试用空桩)
+printf '#ifndef _SIG_HASH_H_\n#define _SIG_HASH_H_\n#define SIG_HASH_LEN 32\n#define SIG_SALT_LEN 16\nstatic const unsigned char SIG_SALT[16]={0};\nstatic const unsigned char SIG_HASH_STORED[32]={0};\n#endif\n' > "$T/sig_hash.h"
 
 CC="$(command -v clang || command -v gcc)"
 
@@ -62,22 +65,25 @@ else
 fi
 
 # ── ⑤ 明文不入 so(攻击者视角,严格编译模式) ──
-if $CC -shared -fPIC -O2 -DSIGCHECK_HOST_TEST -I"$T" "$T/env_check.c" \
-      -o "$T/libtest.so" -llog -fvisibility=hidden \
+# sig_check.c 一并编入全家桶(实际流水线组合),外围串零泄漏一体验证
+if $CC -shared -fPIC -O2 -DSIGCHECK_HOST_TEST -DNCLINK_HOST_TEST -I"$T" \
+      "$T/sig_check.c" "$T/env_check.c" -o "$T/libtest.so" -llog -fvisibility=hidden \
       -ffunction-sections -fdata-sections -Wl,--gc-sections 2>"$T/c.log"; then
-    ok "env_check.c 严格模式编译通过(-O2 --gc-sections)"
+    ok "sig_check+env_check 全家桶严格模式编译通过(-O2 --gc-sections)"
     leak=0
     for s in "frida-agent" "frida-gadget" "frida-inject" "gadget_frida" \
              ":69A2" ":69A3" "libxposed" "lspd" "lsposed" "edxposed" \
              "libriru" "libzygisk" "XposedBridge" "TracerPid" "gum-js-loop" \
-             "gmain" "gdbus" "pool-frida" "linjector" "/data/adb"; do
+             "gmain" "gdbus" "pool-frida" "linjector" "/data/adb" \
+             "xixin_debug" "sigcheck_log.txt" "SIGCHECK_TEST_LOG" \
+             "SIGCHECK_TEST_APK" "apk not found" "no v2/v3 signing block"; do
         if grep -a -q "$s" "$T/libtest.so"; then
             bad "so 里泄漏明文特征串: $s"
             leak=$((leak+1))
         fi
     done
     if [[ $leak -eq 0 ]]; then
-        ok "明文零泄漏:20 个特征串在 so 里全部零命中(strings 扫描视角)"
+        ok "明文零泄漏:26 个特征/外围串在 so 里全部零命中(strings 扫描视角)"
     fi
 else
     bad "so 编译失败"; head -10 "$T/c.log"
