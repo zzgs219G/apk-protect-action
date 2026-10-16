@@ -41,36 +41,51 @@ class ElfError(Exception):
     pass
 
 
-# ── ELF 解析（64 位小端，arm64/x86_64；armeabi-v7a 需另行支持）──────
+# ── ELF 解析（ELF64 小端 + ELF32 小端；arm64-v8a 是 64，armeabi-v7a 是 32）──
+# 32 位布局差异：e_shoff 在 0x20、 Elf_Shdr 字段宽度从 8→4 字节
 class Elf:
     def __init__(self, data: bytes):
         if data[:4] != b'\x7fELF':
             raise ElfError('not an ELF file')
-        if data[4] != 2:
-            raise ElfError('only ELF64 supported (got EI_CLASS=%d)' % data[4])
         if data[5] != 1:
             raise ElfError('only little-endian supported (got EI_DATA=%d)' % data[5])
+        self.is64 = (data[4] == 2)
+        if data[4] not in (1, 2):
+            raise ElfError('unknown EI_CLASS=%d' % data[4])
         self.data = bytearray(data)
-        (self.e_shoff,) = struct.unpack_from('<Q', self.data, 0x28)
-        (self.e_shentsize,) = struct.unpack_from('<H', self.data, 0x3A)
-        (self.e_shnum,) = struct.unpack_from('<H', self.data, 0x3C)
-        (self.e_shstrndx,) = struct.unpack_from('<H', self.data, 0x3E)
+
+        if self.is64:
+            (self.e_shoff,) = struct.unpack_from('<Q', self.data, 0x28)
+            self.e_shentsize = struct.unpack_from('<H', self.data, 0x3A)[0]
+            self.e_shnum = struct.unpack_from('<H', self.data, 0x3C)[0]
+            self.e_shstrndx = struct.unpack_from('<H', self.data, 0x3E)[0]
+            SH_FMT, SH_SIZE = '<IIQQQQIIQQ', 64
+        else:
+            (self.e_shoff,) = struct.unpack_from('<I', self.data, 0x20)
+            self.e_shentsize = struct.unpack_from('<H', self.data, 0x2E)[0]
+            self.e_shnum = struct.unpack_from('<H', self.data, 0x30)[0]
+            self.e_shstrndx = struct.unpack_from('<H', self.data, 0x32)[0]
+            SH_FMT, SH_SIZE = '<IIIIIIIIII', 40
+
         if self.e_shoff == 0 or self.e_shnum == 0:
             raise ElfError('ELF has no section header table')
         if self.e_shstrndx >= self.e_shnum:
             raise ElfError('e_shstrndx out of range')
+        if self.e_shentsize != SH_SIZE:
+            raise ElfError('unexpected e_shentsize=%d (want %d)' % (self.e_shentsize, SH_SIZE))
+
         self.sections = []
         for i in range(self.e_shnum):
             off = self.e_shoff + i * self.e_shentsize
-            (sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
-             sh_link, sh_info, sh_addralign, sh_entsize) = struct.unpack_from('<IIQQQQIIQQ', self.data, off)
-            self.sections.append(dict(idx=i, name_off=sh_name, type=sh_type,
-                                      flags=sh_flags, addr=sh_addr, offset=sh_offset,
-                                      size=sh_size, link=sh_link, info=sh_info,
-                                      align=sh_addralign, entsize=sh_entsize))
-        # 段名字符串表
+            f = struct.unpack_from(SH_FMT, self.data, off)
+            if self.is64:
+                sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size = f[:6]
+            else:
+                sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size = f[:6]
+            self.sections.append(dict(name_off=sh_name, type=sh_type, flags=sh_flags,
+                                      addr=sh_addr, offset=sh_offset, size=sh_size))
         stroff = self.sections[self.e_shstrndx]['offset']
-        self._strtab = self.data[stroff:]
+        self._strtab = bytes(self.data[stroff:])
         for s in self.sections:
             end = self._strtab.find(b'\x00', s['name_off'])
             s['name'] = self._strtab[s['name_off']:end].decode('utf-8', 'replace')
