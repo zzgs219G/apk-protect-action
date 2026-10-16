@@ -25,15 +25,19 @@
 /* 密钥槽：运行期 ncguard_unlock() 从这里恢复 K_so。
  * const volatile 的理由同 Xop：writable 对象在 SHF_EXECINSTR 段里会让 LLD
  * 生成 W+X 的 PT_LOAD，而 Android 10+ 拒绝可写可执行段。用 const 让它进
- * .rodata（只读），运行时再 mprotect 改写。 */
-__attribute__((section(".nckey"), used, aligned(1)))
+ * .rodata（只读），运行时再 mprotect 改写。
+ * ⚠️ retain 不可省：lib-ndk.sh 的 LOCAL_LDFLAGS 含 -Wl,--gc-sections，
+ * 无引用的段会被当死代码连段一起回收（2026-10-17 CI 实测踩过：
+ * .ncguard 整个消失在 so 的段表里）。 */
+__attribute__((section(".nckey"), used, aligned(1), retain))
 static const volatile unsigned char ncg_key_slot[32] = {0};
 
 /* ── 被锁的业务逻辑：只有解锁后才能调用 ────────────────────────────
  * 用法：调用方必须先 ncguard_unlock() 成功，再调本函数。
  * 对拍契约：ncguard_probe(0) == ((0^0x5A)+0x0F)*3 & 0xFF == 59。
- * 取值刻意不取 42/0/1 这类哨兵值，避免 strings 一眼定位。 */
-__attribute__((section(".ncguard"), used))
+ * 取值刻意不取 42/0/1 这类哨兵值，避免 strings 一眼定位。
+ * retain 同密钥槽：防 --gc-sections 回收。 */
+__attribute__((section(".ncguard"), used, retain))
 int ncguard_probe(int token) {
     /* 用 token 派生一个确定性结果；逻辑本身不重要，重要的是"这段代码在
      * 锁箱后不可读、解锁后可正确执行"。Android 验证用的对拍契约：
