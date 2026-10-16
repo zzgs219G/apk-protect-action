@@ -354,9 +354,11 @@ fi
 if [[ -d "$WORK/project/jni/nc" ]]; then
   cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"    "$WORK/project/jni/nc/"
 else
   cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"    "$WORK/project/jni/"
 fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc
 

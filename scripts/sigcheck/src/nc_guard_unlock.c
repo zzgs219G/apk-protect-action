@@ -154,6 +154,22 @@ int ncguard_unlock(void) {
     ncg_page_mprotect(slotdata, slotdata + 16, PROT_READ | PROT_WRITE);
     memset(slotdata, 0, 16);
 
+    /* ⚠️ 必须把"已解锁"状态回写磁盘：否则第二次调本函数时又会从磁盘读到
+       完好 magic → 再解密一次 → 而 .ncguard 此刻已是明文 → 双重 RC4 把它
+       变回密文 → 调用密文代码 = SIGILL（2026-10-17 实测踩过：第一次 59
+       成功，第二次 Illegal instruction）。
+       做法：以可写方式重开 so，把 slot 前 16 字节（magic）清零。
+       失败不致命（只失去幂等性），故不返回错误。 */
+    {
+        int wfd = open(so_path, O_WRONLY);
+        if (wfd >= 0) {
+            uint8_t zero[16] = {0};
+            ssize_t wr = pwrite(wfd, zero, 16, slot.sh_offset);
+            (void) wr;                     /* 只写 magic；wrapped 留作取证 */
+            close(wfd);
+        }
+    }
+
     __builtin___clear_cache((char *)target, (char *)(target + sec.sh_size));
 
     if (ncg_page_mprotect(target, target + sec.sh_size,
