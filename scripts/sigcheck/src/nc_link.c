@@ -21,9 +21,13 @@
  * 零日志设计:本文件不含任何字符串常量(strings 扫 so 零语义泄露)。
  */
 
-/* 心跳接口(实现在本文件下方;env_check.c 的 watchdog 调用检查端) */
+/* 心跳接口(实现在本文件下方;env_check.c 的 watchdog 调用检查端)
+ * nc_heartbeat_arm_constructor 供 so constructor(env_check.c / sig_check.c)调用——
+ * 2026-10-16 修复:武装点从「首次喂」移到「so 加载」,
+ * 删喂食调用从「永久沉默」变成「倒计时死刑」。 */
 void nc_heartbeat_touch(void);
 int nc_heartbeat_expired(void);
+void nc_heartbeat_arm_constructor(void);
 
 #include <jni.h>
 #include <stddef.h>
@@ -38,7 +42,19 @@ int nc_heartbeat_expired(void);
  * volatile + noinline 防 -O2 常量折叠(同 LSGS 的实测教训)。
  * 纯静态,不导出符号。 */
 volatile long long nc_heartbeat_last_ms = 0;   /* 最近一次心跳时间 */
-volatile long long nc_heartbeat_armed_ms = 0;  /* 武装时刻(首次喂时置) */
+volatile long long nc_heartbeat_armed_ms = 0;  /* 武装时刻(constructor 置) */
+
+__attribute__((noinline))
+void nc_heartbeat_arm_constructor(void)
+{
+    long long now = (long long)time(NULL) * 1000LL;
+    long long expected = 0;
+    /* CAS 武装:constructor 可能多个(sig_check/env_check 都调),只取第一个 */
+    if (nc_heartbeat_armed_ms == 0) {
+        __atomic_compare_exchange_n(&nc_heartbeat_armed_ms, &expected, now,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+}
 
 __attribute__((noinline))
 void nc_heartbeat_touch(void)
@@ -58,8 +74,9 @@ void nc_heartbeat_touch(void)
 /* 调试参数(2026-10-16 用户要求"5 秒附近闪退方便调试"):
  * ⚠️ 发布前必须改回正式值 GRACE=90000 / KEEPALIVE=25000——调试值意味着
  * 正常冷启动超过 5 秒的设备(低端机/加载重活)会被误杀。
- * 调试语义:首喂宽限 5s / 保活窗 5s → 删 c() 调用或停喂后 ~25s 内必死
- * (watchdog 20s 轮询 + 5s 窗口)。 */
+ * 语义(2026-10-16 修复):武装点移到 so constructor——so 加载即倒计时,
+ * N 秒内 Java 必须开始喂,否则视为 Java 壳被删 → 杀。
+ * (旧版 armed 由首喂置位 → 删喂食调用 = 永久沉默,真机实证为盲区。) */
 #define NC_HB_FIRST_GRACE_MS   5000LL
 #define NC_HB_KEEPALIVE_MS     5000LL
 
@@ -69,7 +86,7 @@ int nc_heartbeat_expired(void)
     long long armed = nc_heartbeat_armed_ms;
     long long last, now;
     if (armed == 0)
-        return 0;                        /* 未武装(Guard 未跑/无壳)不检查 */
+        return 0;                        /* so 尚未加载完(constructor 未跑),防御性兜底 */
     last = nc_heartbeat_last_ms;
     now = (long long)time(NULL) * 1000LL;
     if (last == 0)

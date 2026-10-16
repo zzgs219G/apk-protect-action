@@ -922,6 +922,12 @@ __attribute__((weak))
 #endif
 int nc_heartbeat_expired(void);
 
+/* 武装端(2026-10-16 修复):so constructor 调用,同 weak 规则 */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void nc_heartbeat_arm_constructor(void);
+
 static void *env_watchdog(void *arg) {
     (void)arg;
     unsigned round = 0;   /* CRC 降频计数:指令检测每轮跑,CRC 每 5 轮跑一次 */
@@ -1051,6 +1057,9 @@ static void env_check_run(void) {
 /* dlopen 后最先执行的入口(与 sig_check_entry 并存,顺序不定,互不依赖) */
 __attribute__((constructor)) static void env_check_entry(void) {
     anti_debug_preempt();   /* 2026-10 追加:先抢占(声明不许被调试),再跑探针 */
+    /* 心跳武装(2026-10-16 修复):so 加载即倒计时——N 秒内 Java 必须开始喂。
+     * nc_link 仅在勾 sigcheck 时入工程,envcheck 单勾时符号缺失 → weak 落空跳过。 */
+    nc_heartbeat_arm_constructor();
     env_check_run();
     env_watchdog_start();   /* 2026-12 追加:常驻复查线程(不影响上面的"加载即检") */
 }
