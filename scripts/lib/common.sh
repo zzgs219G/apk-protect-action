@@ -67,6 +67,11 @@ require_env() {
 }
 
 # ensure_dcc [解压根目录，默认 "$ROOT/tools"] → 解压后 dcc 目录路径(stdout)
+# ⚠️ 职责已变更（2026-12 dcc 引擎下架）：dcc 不再是转译引擎（dex2c 是唯一引擎），
+# 本函数仅作为【apktool.jar + 内置 androguard】的载体被保留——dcc.zip 是这两者的
+# 唯一供应源（dex2c.zip 不含 apktool.jar，其 androguard 与 dcc 版有内容差异）。
+# lib-repack.sh 解包/回编、4 个 python 脚本的 androguard import 都依赖它，勿删。
+#
 # dcc 已从 sigcheck/dex2c/dcc/ 摊开目录改为 tools/dcc.zip 分发(单文件制品,
 # 与 dpt-shell 形态一致)。zip 内顶层是 dcc/,解压到 tools/ 即得单层 tools/dcc/
 # (与真源 dcc.zip 同目录);解压产物不进版本库,由 .gitignore 的 /tools/dcc/ 忽略。
@@ -86,7 +91,7 @@ ensure_dcc() {
 }
 
 # ensure_dex2c [解压根目录，默认 "$ROOT/tools"] → 解压后 Dex2C 目录路径(stdout)
-# 与 ensure_dcc 同款的第二转译引擎分发包(--dex2c)。真源 tools/dex2c.zip =
+# 唯一转译引擎分发包(--dex2c)。真源 tools/dex2c.zip =
 # 父目录 ../Dex2C/ 仓库 Release 资产 Dex2C-<tag>.zip 原样（顶层 Dex2C/），
 # 下载后改名即分发包。zip 内顶层是 Dex2C/，解压到 tools/ 得单层 tools/Dex2C/；
 # 解压产物不进版本库，由 .gitignore 的 /tools/Dex2C/ 忽略。

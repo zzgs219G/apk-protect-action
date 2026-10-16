@@ -10,33 +10,9 @@
       "arg": "--sigcheck"
     },
     {
-      "key": "dcc",
-      "label": "DCC",
-      "desc": "java层代码抽至so层（经典引擎）",
-      "type": "parent",
-      "default": false,
-      "arg": "--dcc",
-      "group_label": "dcc 类目保护规则",
-      "children": [
-        {
-          "key": "rules_file",
-          "label": "类名规则",
-          "type": "text",
-          "multiline": true,
-          "default": "",
-          "value_kind": "rules_file",
-          "required": {
-            "when": "always",
-            "unless": { "key": "sigcheck", "is": true }
-          },
-          "hint": "留空并勾选签名校验=自动抽主类；支持 com.test.** 定向；勿填 ** 全量（整个App转译，上游不支持）"
-        }
-      ]
-    },
-    {
       "key": "dex2c",
       "label": "Dex2C",
-      "desc": "java层代码抽至so层（新引擎，规则与契约同DCC）",
+      "desc": "java层代码抽至so层（唯一转译引擎）",
       "type": "parent",
       "default": false,
       "arg": "--dex2c",

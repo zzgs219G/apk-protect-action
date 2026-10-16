@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # protect.sh — 唯一加固总控（勾选式合并版，取代旧三个 pipeline 总控 + run-modules.sh）
 #
-# 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dcc|--dex2c [规则文件]]
+# 模块契约：<输入.apk> <输出_unsigned.apk> [--sigcheck] [--dex2c [规则文件]]
 #           [--stringenc 规则文件] [--envcheck] [--packer] [--packer-smaller] [--anti-diff]
-#   - 输入/输出/规则路径一律 normalize 成绝对路径（报错三教训：dcc 运行时要切目录，
-#     相对输出路径会被写进 dcc 目录）
-#   - 主进程 cwd 全程不漂移：dcc.py 在子 shell 里运行（module_cd_run）
+#   - 输入/输出/规则路径一律 normalize 成绝对路径（报错三教训：dex2c 运行时要切目录，
+#     相对输出路径会被写进 dex2c 目录）
+#   - 主进程 cwd 全程不漂移：dex2c 的 dcc.py 在子 shell 里运行（module_cd_run）
 #   - 无论勾选多少模块，apktool 解包/回编只做一次（旧联合方案要两次，这是本次合并
 #     的额外收益，对产物无行为差异——sig_check.c 以 constructor 方式并入同一 so）。
 #
@@ -13,9 +13,9 @@
 #   只 --sigcheck        → 提取指纹 → sig_check.c + nc_link.c 单独成 so → inject-loadlib.py
 #                          双保险插桩（<clinit> + onCreate）→ Java 层判决式签名
 #                          联动注入(§3.11,判决在 so/杀在 Java,so 缺失即 fail-closed)→ 回编
-#   只 --dcc|--dex2c [规则] → 规则转 filter → 转译(引擎二选一) → mark-native.py 壳替换 → 回编
+#   只 --dex2c [规则]      → 规则转 filter → 转译 → mark-native.py 壳替换 → 回编
 #   只 --stringenc 规则  → 规则转正则 → 字符串加密(注入 Java 解密桩) → 回编
-#   --sigcheck --dcc|--dex2c → 提取指纹 → 转译 → sig_check.c 合入同一 NDK 工程 →
+#   --sigcheck --dex2c       → 提取指纹 → 转译 → sig_check.c 合入同一 NDK 工程 →
 #                          mark-native.py 壳替换（不插 loadLibrary：onCreate 已抽进 so，
 #                          删 <clinit> 的 loadLibrary 会让 native 壳直接自爆）→ 回编
 #   --envcheck           → 环境检测(Frida/Xposed/调试器/libc内存CRC/常驻复查)并入 libnc.so(可与其余模块任意组合)
@@ -26,12 +26,10 @@
 #                          之后的成品包；勾了加壳则跳过本脚本的 finish_apk，
 #                          由 packer.sh 的产物直接作为最终输出(加壳包不能二次 zipalign)
 #
-# 转译引擎二选一(2026-10-14 接入,同层互斥,输出契约等价,下游 STEP3+ 零感知):
-#   --dcc    经典引擎 tools/dcc.zip(冻结资产,报错三/九/四/五钉死,勿动)
-#   --dex2c  新引擎 tools/dex2c.zip(源码在父目录 ../Dex2C/,自研 fork 可查;
+# 转译引擎(2026-10-14 接入;2026-12 旧引擎 dcc 下线,dex2c 成为唯一引擎):
+#   --dex2c  引擎 tools/dex2c.zip(源码在父目录 ../Dex2C/,自研 fork 可查;
 #            APKEditor 1.4.7 解包、构造函数守卫、Termux/Linux/Windows 跨平台)
-#   两引擎 --no-build --project-archive 产出同构工程包(jni/nc/*.cpp +
-#   compiled_methods.txt),mark-native/stringenc 等下游消费方不变
+#   产出工程包(jni/nc/*.cpp + compiled_methods.txt),mark-native/stringenc 等下游消费方不变
 #
 # 转译类名来源决策(规则优先,修复联合勾选无视用户规则的 bug):
 #   提供了规则(无论是否联合勾选) → 用户规则(rules-to-filter.py)
@@ -45,9 +43,9 @@
 #   名单排除,规则写 ** 也不突破。产物侧用纯 Java 解密桩 Lcom/nc/strdec/StrDec; 解,
 #   不依赖 so。
 #
-# 固定执行顺序（与勾选顺序无关）：sigcheck → dcc/dex2c(二选一) → stringenc → anti-diff → packer
+# 固定执行顺序（与勾选顺序无关）：sigcheck → dex2c → stringenc → anti-diff → packer
 #
-# 前置依赖（由 workflow 安装）: python3 + dcc/dex2c requirements、JDK 17、Android NDK、apktool
+# 前置依赖（由 workflow 安装）: python3 + dex2c requirements、JDK 17、Android NDK、apktool
 set -euo pipefail
 
 # ── 解析勾选（勾选顺序无关，执行顺序由下面 STEP 区硬编码） ────────────
@@ -71,12 +69,11 @@ source "$ROOT/scripts/lib/lib-repack.sh"
 # shellcheck source=../lib/lib-ndk.sh
 source "$ROOT/scripts/lib/lib-ndk.sh"
 
-DCC_DIR=""                                    # dcc 工具目录(--dcc 勾选时经 ensure_dcc 解压填充)
 DEX2C_DIR=""                                  # dex2c 工具目录(--dex2c 勾选时经 ensure_dex2c 解压填充)
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-WANT_SIGCHECK=0; WANT_DCC=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DCC_RULES=""; DEX2C_RULES=""
+WANT_SIGCHECK=0; WANT_DEX2C=0; WANT_PACKER=0; WANT_ENVCHECK=0; DEX2C_RULES=""
 PACKER_SMALLER=0   # 报错四十三:--packer-smaller(体积优化)→ 环境变量传 packer.sh
 DPT_EXTRA_ARGS_TEXT=""  # 通用 dpt 参数通道(报错四十三后方向调整):自由文本,空格分隔
 EXCLUDE_ABI=""          # 带值参数标准件(报错四十四):--exclude-abi 的值,经环境变量传 packer.sh
@@ -86,13 +83,8 @@ WANT_DEX2C_STUB=0     # 联动子复选框:把解密桩内核 dn() 也抽进 dex
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sigcheck) WANT_SIGCHECK=1; shift ;;
-    --dcc)      WANT_DCC=1; shift
-                # 规则文件可选(联合勾选 sigcheck 时可省略 → 自动抽主类)
-                if [[ $# -ge 1 && "$1" != --* ]]; then
-                  DCC_RULES="$(normalize_path "$1")"; shift
-                fi ;;
     --dex2c)    WANT_DEX2C=1; shift
-                # 新引擎:规则语法/来源决策与 --dcc 完全一致
+                # 规则文件可选(联合勾选 sigcheck 时可省略 → 自动抽主类)
                 if [[ $# -ge 1 && "$1" != --* ]]; then
                   DEX2C_RULES="$(normalize_path "$1")"; shift
                 fi ;;
@@ -125,9 +117,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-TOTAL=$((WANT_SIGCHECK + WANT_DCC + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC + WANT_ANTIDIFF))
+TOTAL=$((WANT_SIGCHECK + WANT_DEX2C + WANT_PACKER + WANT_ENVCHECK + WANT_STRINGENC + WANT_ANTIDIFF))
 if [[ $TOTAL -eq 0 ]]; then
-  log_err "未勾选任何模块（--sigcheck / --dcc|--dex2c [规则] / --stringenc 规则 / --envcheck / --anti-diff / --packer）"
+  log_err "未勾选任何模块（--sigcheck / --dex2c [规则] / --stringenc 规则 / --envcheck / --anti-diff / --packer）"
   exit 1
 fi
 
@@ -140,25 +132,14 @@ if [[ $WANT_DEX2C_STUB -eq 1 ]]; then
     exit 1
   fi
   if [[ $WANT_DEX2C -eq 0 ]]; then
-    log_err "--dex2c-stub 必须与 --dex2c 同时勾选(桩要交给 dex2c 转译;--dcc 旧引擎不接联动)"
+    log_err "--dex2c-stub 必须与 --dex2c 同时勾选(桩要交给 dex2c 转译)"
     exit 1
   fi
 fi
 
-# 同层转译引擎互斥:双跑会产出两份互相覆盖的工程包,产物不可预期 → fail-fast
-if [[ $WANT_DCC -eq 1 && $WANT_DEX2C -eq 1 ]]; then
-  log_err "--dcc 与 --dex2c 互斥（同层二选一: dcc=经典引擎, dex2c=新引擎, 输出契约等价）"
-  exit 1
-fi
-
-# 转译层统一变量:两引擎共用同一套规则来源决策与 STEP3+ 下游(引擎无关)
-WANT_TRANSPILE=$((WANT_DCC + WANT_DEX2C))
-TRANSPILE_RULES=""
-if [[ $WANT_DCC -eq 1 ]]; then
-  TRANSPILE_RULES="$DCC_RULES"
-elif [[ $WANT_DEX2C -eq 1 ]]; then
-  TRANSPILE_RULES="$DEX2C_RULES"
-fi
+# 转译层统一变量:唯一引擎,共用同一套规则来源决策与 STEP3+ 下游(引擎无关)
+WANT_TRANSPILE=$WANT_DEX2C
+TRANSPILE_RULES="$DEX2C_RULES"
 
 # ── 入口契约校验：所有环境假设在开工前 fail-fast ────────────────────
 IN_APK="$(normalize_path "$IN_APK")"
@@ -166,33 +147,28 @@ OUT_APK="$(normalize_path "$OUT_APK")"
 require_file "$IN_APK" "输入 APK"
 repack_require_tools
 if [[ $WANT_TRANSPILE -eq 1 ]]; then
-  if [[ $WANT_DCC -eq 1 ]]; then
-    DCC_DIR="$(ensure_dcc)"                 # 从 tools/dcc.zip 解压(幂等)并取得 dcc 目录
-    require_dir "$DCC_DIR" "dcc 工具目录"
-  else
     DEX2C_DIR="$(ensure_dex2c)"             # 从 tools/dex2c.zip 解压(幂等)并取得 Dex2C 目录
     require_dir "$DEX2C_DIR" "dex2c 工具目录"
-  fi
   # 规则文件:提供了就必须非空;没提供且未联合 sigcheck → 无类名来源,fail-fast
   if [[ -n "$TRANSPILE_RULES" ]]; then
-    require_nonempty_file "$TRANSPILE_RULES" "dcc/dex2c 规则文件"
+    require_nonempty_file "$TRANSPILE_RULES" "dex2c 规则文件"
   elif [[ $WANT_SIGCHECK -eq 0 ]]; then
-    log_err "--dcc/--dex2c 未提供规则文件且未勾选 --sigcheck,没有类名来源"
-    log_err "     (提供规则文件: --dcc rules.txt / --dex2c rules.txt;或联合 --sigcheck 自动抽取主类)"
+    log_err "--dex2c 未提供规则文件且未勾选 --sigcheck,没有类名来源"
+    log_err "     (提供规则文件: --dex2c rules.txt;或联合 --sigcheck 自动抽取主类)"
     exit 1
   fi
 fi
 if [[ $WANT_STRINGENC -eq 1 ]]; then
   if [[ -z "$STRING_RULES" ]]; then
     log_err "--stringenc 必须提供类名规则文件（字符串加密不做自动抽主类的兜底）"
-    log_err "     规则语法与 --dcc/--dex2c 完全一致: com.test.** / com.test.* / 精确类名 /"
+    log_err "     规则语法: com.test.** / com.test.* / 精确类名 /"
     log_err "     activity*(需 --classes) / !com.test.libs.** 排除 / # 注释"
     exit 1
   fi
   require_nonempty_file "$STRING_RULES" "stringenc 规则文件"
 fi
 
-log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dcc/dex2c → stringenc → anti-diff → packer"
+log "勾选 $TOTAL 个模块，按固定顺序执行: sigcheck → dex2c → stringenc → anti-diff → packer"
 
 # ── STEP 1: 提取证书指纹，生成 sig_hash.h + sig_guard2.h（仅 --sigcheck） ──
 # 2026-10 双线:同时生成第二份【独立】标准答案(sig_guard2.h),供
@@ -204,7 +180,7 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
       "$WORK/sig_hash.h" "$WORK/sig_guard2.h"
 fi
 
-# ── STEP 2: dcc 转译（仅 --dex2c，--no-build 只产出工程包） ─────────
+# ── STEP 2: dex2c 转译（--dex2c 勾选时；--no-build 只产出工程包） ─────────
 # 联动(stringenc↔dex2c)的顺序手术:
 #   dex2c 从【APK】里读 dex(tools/Dex2C/dcc.py compile_dex→auto_vm→androguard),
 #   而解密桩是 stringenc 在 STEP5 才注入 smali 的 —— 正常顺序下 STEP2 时
@@ -251,7 +227,7 @@ else
 fi
 
 if [[ $WANT_TRANSPILE -eq 1 ]]; then
-  log_step 2 6 "核心方法转 C（dcc/dex2c）"
+  log_step 2 6 "核心方法转 C（dex2c）"
   # 类名来源决策(规则优先,修复:联合勾选 sigcheck 时无视用户规则的 bug):
   #   1) 提供了用户规则 → 一律走用户规则(无论是否联合勾选)
   #   2) 未提供规则 + 联合勾选 sigcheck → Manifest 动态解析 LAUNCHER 自动生成 filter
@@ -288,39 +264,25 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
     DCC_FILTER="$WORK/auto_filter.txt"
   fi
 
-  # ── 联动:把解密桩内核 dn() 追加进 dex2c 的 filter ─────────────────
-  # 桩名每包随机,规则由 stringenc 前置轮的 --emit-stub-filter 反向产出。
-  # 只联 --dex2c:--dcc 是旧引擎,按用户决策不接入联动(dcc 待 dex2c 替代后下线)。
+  # 只联 --dex2c(唯一引擎):桩名每包随机,规则由 stringenc 前置轮的 --emit-stub-filter 反向产出。
   if [[ $LINK_STUB -eq 1 ]]; then
-    if [[ $WANT_DCC -eq 1 ]]; then
-      log_err "--dex2c-stub 只支持 --dex2c(与 --dcc 互斥,旧引擎不接联动)"
-      exit 1
-    fi
     cp "$DCC_FILTER" "$WORK/dcc_filter_linked.txt"
     cat "$WORK/stub_filter.txt" >> "$WORK/dcc_filter_linked.txt"
     DCC_FILTER="$WORK/dcc_filter_linked.txt"
     log_info "联动:桩内核已追加进 dex2c filter（$(grep -c . "$WORK/stub_filter.txt") 条: dn/mix64/keyByte）"
   fi
 
-  # 两引擎的 dcc.py 都要在自身目录运行 → 子 shell 隔离，主进程 cwd 不漂移。
-  # CLI 差异在本层吸收:dcc 位置参数输入;dex2c -i/-o 旗标式且 -o 必填
-  # (no-build 下 -o 不落地产物,传哑值),另传 --allow-global 对齐 dcc 的规则语义
-  # (dcc 无全局规则护栏)、--disable-signing 防御性关签名(no-build 下本就不执行)。
-  if [[ $WANT_DCC -eq 1 ]]; then
-    module_cd_run "$DCC_DIR" python3 dcc.py "$LINK_APK" \
-      --project-archive "$WORK/dcc-project.zip" \
-      --no-build \
-      --filter "$DCC_FILTER"
-  else
-    module_cd_run "$DEX2C_DIR" python3 dcc.py -i "$LINK_APK" -o "$WORK/dex2c-no-build.apk" \
-      --project-archive "$WORK/dcc-project.zip" \
-      --no-build \
-      --disable-signing \
-      --allow-global \
-      --filter "$DCC_FILTER"
-  fi
+  # dex2c 的 dcc.py 要在自身目录运行 → 子 shell 隔离，主进程 cwd 不漂移。
+  # CLI: -i/-o 旗标式且 -o 必填(no-build 下 -o 不落地产物,传哑值),
+  # 另传 --allow-global 对齐规则语义、--disable-signing 防御性关签名(no-build 下本就不执行)。
+  module_cd_run "$DEX2C_DIR" python3 dcc.py -i "$LINK_APK" -o "$WORK/dex2c-no-build.apk" \
+    --project-archive "$WORK/dcc-project.zip" \
+    --no-build \
+    --disable-signing \
+    --allow-global \
+    --filter "$DCC_FILTER"
 
-  require_file "$WORK/dcc-project.zip" "dcc 工程包（filter 可能未命中任何方法）"
+  require_file "$WORK/dcc-project.zip" "dex2c 工程包（filter 可能未命中任何方法）"
 fi
 
 # ── STEP 3: 组装 NDK 工程 → 编译 libnc.so ───────────────────────────
@@ -328,7 +290,7 @@ fi
 # 只勾 stringenc(或未来其它纯 dex 组合)时,STEP 3/4 必须整体跳过 ——
 # 否则 ndk_write_mk 会往一个从未创建的 jni/ 目录里 cat > Application.mk,
 # 报 "No such file or directory"(报错信息里的 tmp.XXX/project/jni 路径即此)。
-# 有 so 需求的组合:sigcheck / 转译(--dcc|--dex2c) / envcheck 任一勾选。
+# 有 so 需求的组合:sigcheck / 转译(--dex2c) / envcheck 任一勾选。
 if [[ $WANT_SIGCHECK -eq 1 || $WANT_TRANSPILE -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
 log_step 3 6 "组装 NDK 工程"
 mkdir -p "$WORK/project"

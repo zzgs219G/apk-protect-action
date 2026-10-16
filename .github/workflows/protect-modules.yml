@@ -6,7 +6,7 @@ name: APK加固-模块勾选
 #   protect.sh 参数（schema_rules/args.txt，一行一个）→ 执行。
 #   加新模块/子选项只改 configs/v1/config-schema.json 一份文件（App 与本 yml 零改动）。
 # 执行顺序由 protect.sh 固定为
-#   签名校验 → DCC/Dex2C(同层二选一,勾选传 --dcc 或 --dex2c) → 字符串加密 → 防对比混淆(anti-diff) → 环境检测(envcheck) → 基础加壳(packer)
+#   签名校验 → Dex2C(唯一转译引擎) → 字符串加密 → 防对比混淆(anti-diff) → 环境检测(envcheck) → 基础加壳(packer)
 #   （anti-diff 是 dex 层结构噪声,放 stringenc 后;加壳必须最后，加了壳其它模块改不动）
 # GitHub 网页兜底：不勾任何模块时可直接在 protect_config 手填 JSON（见 configs/v1/config-schema.json）。
 
@@ -51,21 +51,11 @@ jobs:
         with:
           ndk-version: r26d
 
-      - name: 解压 dcc 分发包
-        run: |
-          # zip 内顶层已是 dcc/,解压到 tools/ 得单层 tools/dcc/(tools/ 必然存在 → 无需 mkdir,
-          # 也避开报错十五"unzip 不自建多级父目录";产物由 .gitignore 的 /tools/dcc/ 忽略)
-          unzip -qo tools/dcc.zip -d tools
-          test -f tools/dcc/dcc.py || { echo "❌ dcc.zip 解压产物异常"; exit 1; }
-
-      - name: 安装 python 依赖(dcc)
-        run: pip3 install -r tools/dcc/requirements.txt
-
       - name: 解压 dex2c 分发包
         run: |
-          # 与 dcc 同款形态:zip 内顶层是 Dex2C/,解压到 tools/ 得单层 tools/Dex2C/;
-          # 产物由 .gitignore 的 /tools/Dex2C/ 忽略。与 dcc 并行的第二转译引擎,
-          # 只在勾选 --dex2c 时经 ensure_dex2c 使用;此处预解压仅为安装 python 依赖
+          # zip 内顶层是 Dex2C/,解压到 tools/ 得单层 tools/Dex2C/;
+          # 产物由 .gitignore 的 /tools/Dex2C/ 忽略。
+          # 转译引擎:dex2c 是唯一引擎(旧引擎 dcc 已于 2026-12 下线)
           unzip -qo tools/dex2c.zip -d tools
           test -f tools/Dex2C/dcc.py || { echo "❌ dex2c.zip 解压产物异常"; exit 1; }
 
