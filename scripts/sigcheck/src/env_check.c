@@ -70,14 +70,23 @@ static void envlog_detect(void) {
     if (envlog_ready >= 0) return;
     envlog_ready = 0;
 #ifdef SIGCHECK_HOST_TEST
-    env = getenv("SIGCHECK_TEST_LOG");
+    {
+        char ev[24];
+        const char *evn = lsg_s(LSGS_ENV_TESTLOG, ev, sizeof(ev));
+        if (!evn) return;
+        env = getenv(evn);
+    }
     if (!env || !*env) return;
     snprintf(envlog_path, sizeof(envlog_path), "%s", env);
     envlog_ready = 1;
     return;
 #endif
-    /* 哨兵与 sig_check 同一个:用户只建一个开关文件(2026-xx 改名 xixin_debug) */
-    if (access("/storage/emulated/0/xixin_debug", F_OK) != 0) return;
+    /* 哨兵与 sig_check 同一个(2026-10-16 LSGS 密文化):解码后比对,失败=关 */
+    {
+        char sb[48];
+        const char *sn = lsg_s(LSGS_SIGLOG_SENTINEL, sb, sizeof(sb));
+        if (!sn || access(sn, F_OK) != 0) return;
+    }
     {
         FILE *c = fopen("/proc/self/cmdline", "r");
         if (!c) return;
@@ -88,8 +97,13 @@ static void envlog_detect(void) {
             pkg[n] = '\0';
         }
     }
-    snprintf(envlog_path, sizeof(envlog_path),
-             "/storage/emulated/0/Android/data/%s/files/sigcheck_log.txt", pkg);
+    {
+        char ln2[48];
+        const char *ln = lsg_s(LSGS_LOGNAME, ln2, sizeof(ln2));
+        if (!ln) return;
+        snprintf(envlog_path, sizeof(envlog_path),
+                 "/storage/emulated/0/Android/data/%s/files/%s", pkg, ln);
+    }
     /* 预检可写性(以追加方式打开一次即验证),失败则本次进程内放弃 */
     fd = open(envlog_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
     if (fd < 0) return;

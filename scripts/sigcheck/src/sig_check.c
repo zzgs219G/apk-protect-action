@@ -56,7 +56,14 @@
 #include <sys/stat.h>
 #include <dlfcn.h>     /* 报错十四: dladdr/dlsym 定位本 so 真实路径 */
 
-#define SIGLOG_SENTINEL "/storage/emulated/0/xixin_debug"
+/* 调试哨兵路径(2026-10-16 LSGS 密文化):原明文 #define 是攻击者可读的
+ * 「调试开关位置」泄露。明文唯一载体:本文件「外围串 LSGS 标记区」的标记
+ * (在 sig_log_data.h include 之后,那里才有 lsg_s/LSGS_*)。
+ * 此处只放前向声明,siglog_detect 里调用的辅助函数在标记区后实现。 */
+static const char *siglog_sentinel(char *buf, size_t buflen);
+static const char *siglog_testlog_env(char *buf, size_t buflen);
+static const char *siglog_testapk_env(char *buf, size_t buflen);
+static const char *siglog_logname(char *buf, size_t buflen);
 
 static char siglog_path[512];   /* 日志文件完整路径,'' = 未探测 */
 static int  siglog_ready = -1;  /* -1 未探测, 0 开关关/不可用, 1 可写 */
@@ -66,21 +73,36 @@ static int get_pkg_name(char *out, size_t outlen);
 
 static void siglog_detect(void) {
     char pkg[256];
+    char sbuf[64];
     const char *env;
     if (siglog_ready >= 0) return;
     siglog_ready = 0;
 #ifdef SIGCHECK_HOST_TEST
     /* 宿主测试:不碰 sdcard,开关用环境变量控制 */
-    env = getenv("SIGCHECK_TEST_LOG");
+    {
+        char ev[24];
+        const char *evn = siglog_testlog_env(ev, sizeof(ev));
+        if (!evn) return;
+        env = getenv(evn);
+    }
     if (!env || !*env) return;
     snprintf(siglog_path, sizeof(siglog_path), "%s", env);
     siglog_ready = 1;
     return;
 #endif
-    if (access(SIGLOG_SENTINEL, F_OK) != 0) return;   /* 哨兵不存在 → 关 */
+    {
+        const char *sentinel = siglog_sentinel(sbuf, sizeof(sbuf));
+        if (!sentinel) return;                            /* 解码失败 → 关(宁漏勿误伤) */
+        if (access(sentinel, F_OK) != 0) return;          /* 哨兵不存在 → 关 */
+    }
     if (get_pkg_name(pkg, sizeof(pkg)) != 0) return;
-    snprintf(siglog_path, sizeof(siglog_path),
-             "/storage/emulated/0/Android/data/%s/files/sigcheck_log.txt", pkg);
+    {
+        char logname[48];
+        const char *ln = siglog_logname(logname, sizeof(logname));
+        if (!ln) return;
+        snprintf(siglog_path, sizeof(siglog_path),
+                 "/storage/emulated/0/Android/data/%s/files/%s", pkg, ln);
+    }
     siglog_ready = 1;   /* 真正可写性由 siglog 打开时判定,失败静默 */
 }
 
@@ -113,6 +135,19 @@ static void siglog(const char *prio, const char *fmt, ...) {
 #define LOGE(...) do { __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__); \
                        siglog("E", __VA_ARGS__); } while (0)
 
+/* ────────────────── 外围串 LSGS 密文标记(2026-10-16) ──────────────────
+ * sig_check.c 中除中文文案外的敏感明文(调试开关/日志名/测试后门/失败语义)
+ * 全部密文化。明文唯一载体:下方标记;so 里只有密文。
+ * ⚠️ 注释中禁止书写标记的字面形态(嵌套注释提前终结,编译炸,报错速查已留档)。
+ * ───────────────────────────────────────────────────────────────────── */
+/*LSGS:SIGLOG_SENTINEL|/storage/emulated/0/xixin_debug*/
+/*LSGS:LOGNAME|sigcheck_log.txt*/
+/*LSGS:ENV_TESTLOG|SIGCHECK_TEST_LOG*/
+/*LSGS:ENV_TESTAPK|SIGCHECK_TEST_APK*/
+/*LSGS:ERR_APK_NOT_FOUND|apk not found (maps+data/app both failed)*/
+/*LSGS:ERR_NO_SIGN_BLOCK|no v2/v3 signing block or parse failed*/
+/* env_check.c 侧(e2e 同哨兵/同日志名,复用上面两条;哨兵路径共用 SIGLOG_SENTINEL) */
+
 /* ─────────────────────────── 中文流程日志(用户 2026-11 需求) ───────────────────────────
  * 需求:日志每行能让用户(非英文读者)一眼看出"这行在干什么、是成功还是报错"。
  * 方案:文案明文只写在调用点的 LSG 标记注释里(形如 斜杠星LSG:NAME|文案星斜杠,
@@ -123,6 +158,22 @@ static void siglog(const char *prio, const char *fmt, ...) {
  *   【流程】= 正常走到某一步  【成功】【通过】= 该步/校验正常
  *   【失败】= 出错,走 fail 链  【数据】= 关键中间值(路径/指纹) */
 #include "sig_log_data.h"
+
+/* LSGS 解码包装函数(2026-10-16):siglog_detect 定义在 sig_log_data.h
+ * include 之前,直接调 lsg_s 不可见——通过这些包装在 include 后实现。
+ * 解码失败统一返回 NULL,调用方按"开关关/宁漏勿误伤"处理。 */
+static const char *siglog_sentinel(char *buf, size_t buflen) {
+    return lsg_s(LSGS_SIGLOG_SENTINEL, buf, buflen);
+}
+static const char *siglog_logname(char *buf, size_t buflen) {
+    return lsg_s(LSGS_LOGNAME, buf, buflen);
+}
+static const char *siglog_testlog_env(char *buf, size_t buflen) {
+    return lsg_s(LSGS_ENV_TESTLOG, buf, buflen);
+}
+static const char *siglog_testapk_env(char *buf, size_t buflen) {
+    return lsg_s(LSGS_ENV_TESTAPK, buf, buflen);
+}
 
 static void siglog_c(int prio, lsg_id_t id, const char *detail) {
     char msg[512];
@@ -327,7 +378,9 @@ static int find_apk_path(char *out, size_t outlen) {
 #ifdef SIGCHECK_HOST_TEST
     /* 宿主测试：直接用环境变量指定的路径 */
     {
-        const char *t = getenv("SIGCHECK_TEST_APK");
+        char ev[24];
+        const char *evn = lsg_s(LSGS_ENV_TESTAPK, ev, sizeof(ev));
+        const char *t = evn ? getenv(evn) : NULL;
         if (t && *t) {
             snprintf(out, outlen, "%s", t);
             LOGI("apk path from test env: %s", out);
@@ -709,7 +762,12 @@ static void sig_verify(void) {
     LSGI0(LSG_FIND_START);
 
     if (find_apk_path(apk_path, sizeof(apk_path)) != 0) {
-        LOGE("apk not found (maps+data/app both failed), pkg from cmdline see above");
+        /* LSGS 密文化(2026-10-16):原文案直接暴露"这是签名校验"。 */
+        {
+            char m[64];
+            const char *mm = lsg_s(LSGS_ERR_APK_NOT_FOUND, m, sizeof(m));
+            if (mm) LOGE("%s", mm);
+        }
         /*LSG:NOT_FOUND|【失败】三条定位路径(maps/so反推/data/app)全部失败*/
         LSGE0(LSG_NOT_FOUND);
         goto fail;
@@ -727,9 +785,12 @@ static void sig_verify(void) {
 
     if (extract_cert_der(fd, &der, &der_len) != 0) {
         close(fd);
-        LOGE("no v2/v3 signing block or parse failed: %s "
-             "(重签工具必须启用 v2 方案: apksigner 默认开;MT 管理器需勾选 v2)",
-             apk_path);
+        /* LSGS 密文化(2026-10-16):原文案暴露"这是签名校验"+教会攻击者怎么重签。 */
+        {
+            char m[64];
+            const char *mm = lsg_s(LSGS_ERR_NO_SIGN_BLOCK, m, sizeof(m));
+            if (mm) LOGE("%s: %s", mm, apk_path);
+        }
         /*LSG:BLK_FAIL|【失败】无 v2/v3 签名块或解析失败(重签工具须启用 v2)*/
         LSGE(LSG_BLK_FAIL, "%s", apk_path);
         goto fail;
