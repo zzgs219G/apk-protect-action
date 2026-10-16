@@ -41,12 +41,25 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 
 | 冻结模块 | 职责 | 钉死的回归测试 |
 |---|---|---|
-| `scripts/sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `tests/test_sig_check.sh`(宿主端编译+实包验证,若存在) |
+| `scripts/sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `scripts/sigcheck/javalink/tests/test-javacheck.sh`(11 大项,host 编译+对拍) + `scripts/sigcheck/tests/test-lsgs-strings.sh`(密文零泄漏) |
+| `scripts/sigcheck/src/env_check.c` | 环境检测(10 探针/反调试抢占/so 自校验/心跳检查端) | 同上两套 + `scripts/sigcheck/tests/test-lsgs-strings.sh` |
+| `scripts/sigcheck/src/nc_link.c` | Java↔Native 桥接(ncVerify/heartbeat + 心跳武装) | test-javacheck.sh(判决对拍) + 心跳语义对拍(变更历史 10-16 条) |
 | `scripts/inject/inject-loadlib.py` | loadLibrary 插桩(幂等、多 dex、AXMLPrinter) | `tests/test_inject_loadlib.py`(冒烟,若存在) |
 | `scripts/sigcheck/hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景,若存在) |
 | `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: 回归测试内嵌 |
 | `tools/dcc/`(解压产物;真源 `tools/dcc.zip`) | 第三方 dcc 工具(含内置 androguard) | 严禁任何改动(历史: 报错三/九);真源包 `tools/dcc.zip` 严禁改包/换版 |
 | `tools/dcc/tools/apktool.jar` | 解包/重打包工具(apktool 3.0.3,随 dcc.zip 解压) | 严禁替换版本(历史: 报错四/五) |
+
+### LSGS 密文机制约束(2026-10 新增,改 sig_check.c/env_check.c 前必读)
+
+- 上述两个 C 文件里的**所有功能语义字符串**(中文文案/检测特征串/外围串)
+  一律走 `/*LSG:NAME|...*/` 或 `/*LSGS:NAME|...*/` 标记 → 构建期
+  `scripts/sigcheck/log/make-sig-log.py` 扫描加密 → so 里只有密文。
+- **新增/修改标记必须重新生成** `sig_log_data.h`(protect.sh 自动做);
+  直接写明文字符串 = 改坏了(strings 零泄漏断言会红)。
+- 注释里**禁止书写 LSGS 标记的字面形态**(嵌套注释提前终结,编译炸,
+  报错速查已留档)。
+- `sig_log_data.h` 是构建中间产物,不进 git,不存在"改坏"一说。
 
 ### 为什么"100% 正确"也必须冻结
 
