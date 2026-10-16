@@ -16,6 +16,7 @@
       "type": "parent",
       "default": false,
       "arg": "--dcc",
+      "group_label": "dcc 类目保护规则",
       "children": [
         {
           "key": "rules_file",
@@ -39,6 +40,7 @@
       "type": "parent",
       "default": false,
       "arg": "--dex2c",
+      "group_label": "dex2c 类目保护规则",
       "children": [
         {
           "key": "rules_file",
@@ -62,6 +64,7 @@
       "type": "parent",
       "default": false,
       "arg": "--stringenc",
+      "group_label": "字符串加密类目保护规则",
       "children": [
         {
           "key": "rules_file",
@@ -93,7 +96,7 @@
       "arg": "--anti-diff"
     },
     { "key": "envcheck", "label": "环境检测", "desc": "Frida/Xposed/调试器", "type": "leaf", "default": false, "arg": "--envcheck" },
-    { "key": "packer", "label": "基础加壳", "desc": "dex整体加密（须最后执行）", "type": "parent", "default": false, "arg": "--packer", "children": [
+    { "key": "packer", "label": "基础加壳", "desc": "dex整体加密（须最后执行）", "type": "parent", "default": false, "arg": "--packer", "group_label": "壳加固选项", "children": [
       { "key": "smaller", "label": "体积优化", "desc": "性价比极高", "type": "checkbox", "default": true, "value_kind": "flag", "arg_on": "--packer-smaller" },
       { "key": "exclude_x86", "label": "排除模拟器架构", "desc": "产物剔除 x86/x86_64 的 so 目录（多数手机只需 arm/arm64）；代价：x86 模拟器无法安装运行加壳包", "type": "checkbox", "default": false, "value_kind": "arg_value", "arg_on": "--exclude-abi", "arg_value": "x86,x86_64" }
     ] }
