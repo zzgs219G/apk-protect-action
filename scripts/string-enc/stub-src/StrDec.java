@@ -7,11 +7,20 @@
  * 全部见 scripts/string-enc/README.md(改本文件前必读其"易错点"一节)。
  *
  * 【两层拆分:壳 d() / 内核 dn()】2026-10 字符串加密↔dex2c 联动引入。
- *   - d()  留在 dex 的 Java 壳:只做 try/catch 兜底,再转调 dn()。
- *   - dn() 算法本体,方法体内【不含任何 try/catch】→ 可被 dex2c 转译进
- *     libnc.so(转译器不支持异常表);联动勾选后 dex 侧变 native 壳。
- * 拆分后:算法/种子/常量全部随 dn() 进 so,dex 内不再有可读实现;
+ *   - d()  解密入口,只做 try/catch 兜底,再转调 dn()。
+ *   - dn() 算法本体,方法体内【不含任何 try/catch】。
+ * 拆分后:算法/种子/常量全部随联动转译进 so,dex 内不再有可读实现;
  * 防崩语义不变 —— 密文损坏时 dn() 抛异常,由 d() 捕获后原样返回密文。
+ *
+ * 【2026-12 更正】原注释称"dn() 必须无 try/catch 才能转译,否则 dex2c
+ * 不支持异常表"——该说法已被实测证伪。T1~T8 八个 try/catch 形态验证
+ * dex2c v1.0.2 对异常表的支持:全部转译成功,生成 EX_LandingPad +
+ * d2c_is_instance_of 分发,catch(Throwable) 兜底在 C 侧完整保留
+ * (goto 返回原密文)。故 stringenc↔dex2c 联动已改为【全抽】:
+ * filter 覆盖 d/dn/mix64/keyByte 四个方法,d() 的 try/catch 壳也进 so。
+ * 保留拆分的原因不再是转译限制,而是:①算法与兜底分层可读;
+ * ②失败兜底语义在 C 侧仍由 catch(Throwable) 分发承担,与 Java 等价;
+ * ③dn() 是报错二十二的寄存器自检锚点(真正调用系统 Base64 解码的方法)。
  */
 public final class StrDec {
 
@@ -41,8 +50,10 @@ public final class StrDec {
     }
 
     /** 解密:payload = Base64( offset_be24 || cipher )。失败时原样返回。
-     *  【壳】只做 try/catch 兜底,实际计算转调 native dn() —— 异常表必须留在
-     *  这一层:dex2c 不支持异常表,而 dn() 要能被转译进 so。 */
+     *  【壳】try/catch 兜底,实际计算转调 dn()。
+     *  注:dex2c 已实测支持异常表,故本方法在 stringenc↔dex2c 全抽联动时
+     *  也会随 filter 进入 so;C 侧兜底由 d2c_is_instance_of(Throwable)
+     *  分发承担,与 Java catch 等价。 */
     public static String d(String payload) {
         try {
             return dn(payload);
@@ -53,8 +64,8 @@ public final class StrDec {
     }
 
     /** 解密内核:算法本体(与拆分前的 d() 逐字一致),【方法体内无 try/catch】。
-     *  这条是能被 dex2c 转译进 libnc.so 的方法 —— 转译器不支持异常表,
-     *  所以异常兜底必须留在外面的壳 d() 里。
+     *  本方法是报错二十二的寄存器自检锚点(真正调用系统 Base64 解码的方法),
+     *  也是 stringenc↔dex2c 联动转译进 libnc.so 的目标。
      *  失败语义:本方法不捕获异常,任何异常向上冒泡给 d() 兜底。 */
     public static String dn(String payload) throws java.io.UnsupportedEncodingException {
         String hit = (String) CACHE.get(payload);

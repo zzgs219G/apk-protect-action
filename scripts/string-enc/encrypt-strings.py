@@ -1504,25 +1504,33 @@ def main():
     # ── 联动(stringenc↔dex2c):输出桩内核的 filter 规则 ─────────────────
     # 为什么要单独产出:桩名是每包随机的(STUB_DESC),protect.sh 无法预知,
     # 只能由本脚本(唯一知道桩名的环节)反向写出来给 dex2c 的 filter 追加。
-    # 规则只针对 dn()(解密内核),不碰 d() —— d() 是 try/catch 壳,dex2c
-    # 不支持异常表,转它只会生成坏 C(详见 README「两层拆分」)。
+    # 规则覆盖 d()/dn()/mix64()/keyByte() 四个方法(2026-12 全抽:dex2c 已实测
+    # 支持异常表,故含 try/catch 的 d() 也一并转译进 so;详见 README「两层拆分」)。
     # 只在桩确实存在时写文件(本次新注入 或 续跑复用),否则 dex2c 追加一条
     # 命中不存在类的规则只是空转,还掩盖"没加密却勾了联动"的配置错误。
     if args.emit_stub_filter:
         if find_stub_path(args.decompiled) is not None:
             # full_name = Lcom/pkg/Cls;method(args)ret；filter 是正则、按 search 匹配。
-            # 【必须覆盖三个方法,不能只写 dn】dex2c 只转译 filter 命中的方法,
+            # 【必须覆盖四个方法】dex2c 只转译 filter 命中的方法,
             # 未命中的方法即使被调用也只是留一个 JNI 反调(实测:只写 dn 时
             # mix64/keyByte 留在 dex 被 D2C_RESOLVE_STATIC_METHOD 反调,
-            # splitmix64 常量与密钥流逻辑仍可读)。三者一并抽走,
+            # splitmix64 常量与密钥流逻辑仍可读)。四者一并抽走,
             # 算法才真正整体进 so。
-            #    dn()      解密内核(控制流/偏移/XOR)
-            #    mix64()   splitmix64 混合函数(核心常量在这里)
+            #    d()      解密入口(含 try/catch 兜底壳)
+            #    dn()     解密内核(控制流/偏移/XOR)
+            #    mix64()  splitmix64 混合函数(核心常量在这里)
             #    keyByte() 密钥流单字节(README 记为对拍契约,运行期不调用,
             #             但一起抽走可避免"半截算法"形态)
-            # d() 刻意不写:它是 try/catch 壳,dex2c 不支持异常表。
+            # d() 曾刻意不写:理由是"dex2c 不支持异常表"。该理由已被实测证伪——
+            # 2026-12 用 T1~T8 八个 try/catch 形态(简单/两段不连续/finally/
+            # JNI引用+NPE/多类型分发/循环内)验证 dex2c v1.0.2 对异常表的支持:
+            # 全部转译成功且能生成 EX_LandingPad + d2c_is_instance_of 分发,
+            # catch(Throwable) 兜底在 C 侧完整保留(goto L2 返回原密文)。
+            # 故改为全抽。全抽后失败兜底由 Java catch 变为 C 侧
+            # d2c_is_instance_of(Throwable) 分发,降级语义等价。
             lines = [STUB_DESC + m + r'(.*)'
-                     for m in (STUB_KERNEL_METHOD, 'mix64', 'keyByte')]
+                     for m in (STUB_DECRYPT_METHOD, STUB_KERNEL_METHOD,
+                               'mix64', 'keyByte')]
             with open(args.emit_stub_filter, 'w', encoding='utf-8') as fp:
                 fp.write('\n'.join(lines) + '\n')
             if not args.quiet:

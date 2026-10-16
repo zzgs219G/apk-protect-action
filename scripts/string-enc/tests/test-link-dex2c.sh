@@ -7,7 +7,7 @@
 #
 # 断言：
 #   ① dn/mix64/keyByte 三个方法都被转译（只写 dn 会让算法半截留在 dex）
-#   ② 壳 d() 不被转译（它带异常表，dex2c 不支持，转译必出坏 C）
+#   ② 壳 d() 也一并转译（2026-12 全抽：dex2c 已实测支持异常表）
 #   ③ <clinit>/<init> 不被转译（上游守卫）
 #   ④ splitmix64 常量内联进 C（十进制有符号形式）
 #   ⑤ dn→mix64 的 JNI 反调目标必须是 so 内的导出符号
@@ -130,14 +130,21 @@ cat "$CM"; echo
 echo "--- 生成的 C ---"
 ls work/proj/jni/nc/*.cpp | xargs -n1 basename
 echo "--- 断言 ---"
-# ① dn/mix64/keyByte 三个都必须在
+# ① dn/mix64/keyByte 三个方法都必须在
 for m in dn mix64 keyByte; do
     grep -q ";$m(" "$CM" && echo "   ✅ $m() 已转译" \
         || { echo "   ❌ $m() 未转译"; exit 1; }
 done
-# ② 壳 d() 绝不能被转译(带异常表,转译必出坏 C)
-grep -qE ';d\(' "$CM" && { echo "   ❌ d() 被误转译"; exit 1; } \
-    || echo "   ✅ d() 未被转译（壳留在 dex）"
+# ② 壳 d() 也必须被转译(2026-12 全抽:dex2c 已实测支持异常表,
+#    catch(Throwable) 兜底在 C 侧由 d2c_is_instance_of 分发承担)
+#    ⚠️ 桩名每包随机,d() 不叫 d —— 判据用入口方法签名
+#    (Ljava/lang/String;)Ljava/lang/String; 中除 dn() 外的那一个。
+D_RAND="$(awk -F';' '/\(Ljava\/lang\/String;\)Ljava\/lang\/String;$/ && $0 !~ /;dn\(/ {print $2}' "$CM" | sed 's/(.*//')"
+if [[ -n "$D_RAND" ]]; then
+    echo "   ✅ d()（随机名 $D_RAND）已转译，含 try/catch 兜底，全抽生效"
+else
+    echo "   ❌ d() 未被转译（全抽未生效，filter 应覆盖 d）"; exit 1
+fi
 # ③ <clinit>/<init> 不能被转译(上游守卫,桩自身也不该破例)
 grep -qE ';<clinit>|<init>' "$CM" && { echo "   ❌ 构造器被转译"; exit 1; } \
     || echo "   ✅ 构造器未被转译"

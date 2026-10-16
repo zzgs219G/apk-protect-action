@@ -11,20 +11,27 @@
 
 | 层 | 方法 | 内容 | 联动后去向 |
 |---|---|---|---|
-| 壳 | `d()` | 只做 try/catch 兜底 + 转调 `dn()` | **留在 dex** |
+| 壳 | `d()` | try/catch 兜底 + 转调 `dn()` | **进 so**（2026-12 起全抽） |
 | 内核 | `dn()` / `mix64()` / `keyByte()` | 算法本体、splitmix64 常量、密钥流 | **进 so**（勾选 `--dex2c-stub`） |
 
-**为什么必须拆**：dex2c 转译器不支持异常表（`dcc.py:132` 读入 `exceptions`
-后再未使用，`dex2c/` 全目录无任何 try/catch 发射逻辑）。整包 try/catch 的方法体
-被转译时异常处理器被静默丢弃 → 生成能编译但语义错的 C（失败兜底丢失，
-遇到脏密文从"降级"变"崩溃"）。所以异常表必须留在 dex 的壳里，
-内核保持无异常表才能被转译。
+**为什么还保留两层拆分**（2026-12 更正）：原设计理由"dex2c 不支持异常表"
+已被实测证伪——T1~T8 八个 try/catch 形态全部转译成功，生成
+`EX_LandingPad` + `d2c_is_instance_of` 分发，`catch(Throwable)` 兜底在
+C 侧完整保留（`goto` 返回原密文）。故联动已改为**全抽**：filter 覆盖
+`d`/`dn`/`mix64`/`keyByte` 四条，`d()` 的 try/catch 壳也进 so。
+保留拆分的现理由：①算法与兜底分层可读；②失败兜底语义在 C 侧仍由
+`d2c_is_instance_of(Throwable)` 分发承担，与 Java 等价；③`dn()` 是报错
+二十二的寄存器自检锚点（真正调用系统 Base64 解码的方法）。
+**全抽后的变化**：`d()` 变成 native 方法，dex 内只剩壳；失败兜底从
+Java catch 变为 C 侧 `d2c_is_instance_of(Throwable)` 分发。已验证
+`Throwable` 宽类型通过，具体子类（IllegalArgumentException 等）的继承链
+匹配未做针对性验证，建议真机用损坏密文包验一次降级路径。
 
-**为什么 filter 要写 3 条而不是 1 条**：dex2c 只转译 filter 命中的方法，
+**为什么 filter 要写 4 条而不是 1 条**：dex2c 只转译 filter 命中的方法，
 未命中的方法即使被调用也只是留一个 JNI 反调。只写 `dn` 时
 `mix64`/`keyByte` 留在 dex 被 `D2C_RESOLVE_STATIC_METHOD` 反调，
 splitmix64 常量与密钥流逻辑仍可读——"算法进 so"名不副实。
-故 `--emit-stub-filter` 固定产出 dn/mix64/keyByte 三条。
+故 `--emit-stub-filter` 固定产出 d/dn/mix64/keyByte 四条。
 
 联动机制与代价见 `docs/流程文档.md` §3.7；不变量由 `tests/test-link-dex2c.sh`
 的 7 项断言锁死。
