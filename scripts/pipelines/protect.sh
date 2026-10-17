@@ -347,25 +347,31 @@ if [[ $WANT_ENVCHECK -eq 1 ]]; then
     fi
   fi
 fi
-# so 静态加固(2026-12):开箱代码进 NDK 工程 —— ndk_write_mk 的两级 wildcard
-# 已收 *.c，nc_guard_unlock.c 放 jni/nc/ 或 jni/ 根都会被编译进 libnc.so。
-# 它无主动执行逻辑，由调用方在需要时调 ncguard_unlock()。
-# 布局对齐：联合(dex2c)方案源码在 jni/nc/，单独 sigcheck/envcheck 在 jni/ 根。
-# ⚠️ nc_guard_key.c 必须一起拷：2026-12 加 MAC 校验后，nc_guard_unlock.c
-#    include 了 nc_guard_key.h 并调 khmac_sha256()。漏拷 = 直接编译失败
-#    （不是运行期报错，是 ndk-build 就红，fail-fast 反而是好事）。
+# so 静态加固(2026-10-18 自解谜版):开箱代码进 NDK 工程
+#
+# ⚠️ 本轮改动：nc_guard_unlock.c → nc_guard_boot.c（零冻结路线）
+#   unlock.c 仍是冻结资产、保留在仓库，但【不再进 NDK 工程】。
+#   boot.c 承接运行期职责：明文 stub(.text) + unlock 本体(.ncguard_head 密文)。
+#   理由：把"开锁器"也锁进箱子，否则 unlock.c 整份逻辑在 .text 明文可读
+#   （外部逆向报告 docs/so层防御/简盒-06 §6.2 的实测结论）。
+#   不改 unlock.c 本身 = 不动冻结纪律；它以历史存档形式留存。
+#
+# ndk_write_mk 的两级 wildcard 已收 *.c，放 jni/nc/ 或 jni/ 根都能编入。
+# ⚠️ nc_guard_key.c 必须一起拷：boot.c 的 unlock 本体 include 了
+#    nc_guard_key.h 并调 khmac_sha256()（HMAC 校验）。漏拷 = ndk-build 就红
+#    （fail-fast 反而是好事，比运行期 SIGILL 好定位）。
 if [[ -d "$WORK/project/jni/nc" ]]; then
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/nc/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/nc/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"    "$WORK/project/jni/nc/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"    "$WORK/project/jni/nc/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"    "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_boot.c"  "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c" "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"   "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"   "$WORK/project/jni/nc/"
 else
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"    "$WORK/project/jni/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"    "$WORK/project/jni/"
-  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"    "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_boot.c"  "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c" "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"   "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"   "$WORK/project/jni/"
 fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc
 
@@ -423,8 +429,9 @@ repack_unpack "$WORK/decompiled" "$STEP5_APK"
 
 # ── so 静态加固(2026-12):把 .ncguard 段锁成密文（构建期"锁箱"）──────
 # 位置在 STEP5 解包后：so 已编译完但【还没进 APK】→ 锁的是即将打包的产物。
-# 运行期由 nc_guard_unlock.c 的 ncguard_unlock() 解密；磁盘上 IDA 读到的
-# .ncguard 是 RC4 密文（现为 4012/2750 字节的 12 个 env_check 探针）。
+# 运行期由 nc_guard_boot.c 的明文 stub 解出 unlock 本体，再由本体解
+# .ncguard；磁盘上 IDA 读到的 .ncguard 是 RC4 密文（现为 4012/2750 字节的
+# 12 个 env_check 探针 + dex2c 转译产物）。
 # 抄自 XopProtector 的 .bitcode 自解密机制。
 # cert 与 package 都由 so-section-lock.py 从 $IN_APK 自己提（定点读 Signing
 # Block + AXML 解析），protect.sh 不重复实现 —— 单一职责。
@@ -432,10 +439,24 @@ repack_unpack "$WORK/decompiled" "$STEP5_APK"
 if [[ -d "$WORK/project/libs" ]]; then
   for so in "$WORK"/project/libs/*/libnc.so; do
     [[ -f "$so" ]] || continue
+    # 一级锁箱：.ncguard 业务段（k_so 由证书 HKDF 派生）
     python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" \
       --section .ncguard --from-apk "$IN_APK" \
       2>&1 | sed 's/^/  [lock] /' || {
       echo "❌ .ncguard 锁箱失败（段未标记？cert/包名提取失败？）——so 静态加固未生效" >&2
+      exit 1
+    }
+    # 二级锁箱（2026-10-18 自解谜）：把 unlock 本体也锁进 .ncguard_head。
+    # ⚠️ 顺序有依赖：必须先跑一级再跑二级。原因是一级会改 .ncguard 内容，
+    #    而二级要锁的 .ncguard_head 是另一个段，本无先后；但若二级先跑，
+    #    unlock 本体已变密文，此时一级锁箱器本身不依赖 unlock（纯 Python
+    #    读盘），所以其实可交换 —— 但保持"先业务后本体"更易读。
+    # ⚠️ 二级失败必须 fail-fast：stub 见 slot 无 magic 会静默放行，
+    #    head 段保持明文 → 自解谜没发生 → 静态攻击者照旧读 unlock 本体。
+    #    那种"以为防了其实没防"的静默降级正是本机制最该避免的。
+    python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" --lock-head \
+      2>&1 | sed 's/^/  [lock2] /' || {
+      echo "❌ 二级锁箱失败（.ncguard_head 未标记？符号被 strip？）——unlock 本体仍可静态读取" >&2
       exit 1
     }
   done

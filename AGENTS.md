@@ -49,7 +49,8 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 | `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: 回归测试内嵌 |
 | `tools/dcc/`(解压产物;真源 `tools/dcc.zip`) | dcc 工具(**引擎已下架**,现仅为 apktool.jar + 内置 androguard 载体) | 严禁任何改动(历史: 报错三/九);真源包 `tools/dcc.zip` 严禁改包/换版/**删除** |
 | `tools/dcc/tools/apktool.jar` | 解包/重打包工具(apktool 3.0.3,随 dcc.zip 解压) | 严禁替换版本(历史: 报错四/五);dcc 引擎下架后这是该 zip 的唯一存在理由 |
-| `scripts/sigcheck/src/nc_guard_unlock.c` | `.ncguard` 段运行期自解密(构建期锁箱见 `scripts/lib/so-section-lock.py`) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化;改动前必读 `docs/流程文档.md` §3.12 的 8 条审查点 |
+| `scripts/sigcheck/src/nc_guard_unlock.c` | `.ncguard` 段运行期自解密(**2026-10-18 起已退出 NDK 工程**,保留为历史存档;现行入口是 `nc_guard_boot.c`) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化;改动前必读 `docs/流程文档.md` §3.12 的 8 条审查点 |
+| `scripts/sigcheck/src/nc_guard_boot.c` | 自解谜设施:明文 stub(`.text`)+ unlock 本体(`.ncguard_head` 密文) | 真机链路已验证: 两级锁箱后 dlopen → add/mul/selftest 全对;**绝不可把 `ncg_head_unlock` 标进 `.ncguard`**(它得先被 stub 解出来);stub 用简单 XOR 而非 RC4,`lock_head()` 必须同算法 |
 | `scripts/sigcheck/src/nc_guard_key.c` | HKDF-SHA256 + 证书 DER 提取(`k_so = HKDF(master, SHA256(certDER), info)` ) | 无调用方,是"HKDF 契约的可执行证明";sha256/hmac/hkdf 三组测试向量对拍过,勿重写密码学原语 |
 | `scripts/sigcheck/src/nc_guard_probe.c` | `.ncguard`/`.nckey` 两段的**唯一定义处**(`ncg_key_slot[80]` 就是 `.nckey` 段全部内容) | 改数组长度必须同步 `so-section-lock.py` 的 `assert len(blob)==80` 与 `nc_guard_unlock.c` 的 `NCG_SLOT_SIZE`——不一致在构建期即 AssertionError |
 | `scripts/lib/so_section_mark.py` | 通用段标记器(第2层设施):规则=函数头正则,零模块逻辑 | 新消费者接入前必读 `docs/流程文档.md` §3.12.1 的接入清单;改规则必须跑 `--check -v` 实测命中,不许只看正则可编译 |

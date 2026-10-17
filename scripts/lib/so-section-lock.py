@@ -46,6 +46,22 @@ SLOT_NAME = '.nckey'                # 密钥槽段（Xop 用 .protwrap）
 SLOT_MAGIC = b'NCKEYLOCK' + b'\x00' * 7      # 16 字节，打包器扫这个定位
 XOR_KEY = bytes([0x5A, 0xC3, 0x11, 0x9E, 0xF0, 0x37, 0xB2, 0x6D])  # 与 LSGS 同源
 
+# ── 自解谜二级锁箱（2026-10-18，nc_guard_boot.c）──────────────────
+# 把"开锁器本身"也锁进密文段，让静态攻击者不能直接读解锁逻辑。
+#   HEAD_NAME    装 unlock 本体的段（ncg_head_unlock 及其私有函数）
+#   STUB_SLOT    stub 的密钥槽（.text 里的明文 stub 靠它解出 head）
+#   STUB_MAGIC   slot 前 8 字节，stub 判"是否已锁"用
+#   STUB_ENTRY   入口符号名——锁箱器要从 .symtab 读它的值算出 entry_delta
+# slot 布局（32 字节，与 nc_guard_boot.c 的 stub 逐字节一致）：
+#   [0:8)   magic NCSTUBLK
+#   [8:24)  wrapped k_stub = k_stub ^ XOR_KEY
+#   [24:28) head_size（.ncguard_head 段字节数，小端 u32）
+#   [28:32) entry_delta（入口符号 - 段起始偏移，小端 u32）
+HEAD_NAME = '.ncguard_head'
+STUB_SLOT = '.nckey_stub'
+STUB_MAGIC = b'NCSTUBLK'
+STUB_ENTRY = 'ncg_head_unlock'
+
 
 class ElfError(Exception):
     pass
@@ -99,6 +115,34 @@ class Elf:
         for s in self.sections:
             end = self._strtab.find(b'\x00', s['name_off'])
             s['name'] = self._strtab[s['name_off']:end].decode('utf-8', 'replace')
+
+        # 符号表（lock_head 需要它算 entry_delta：入口符号 - 段起始偏移）。
+        # 只取 FUNC/OBJECT 的 st_value，按符号名索引。
+        # .symtab 被 strip 过时 symbols 为空 —— lock_head 会 fail-fast 报错，
+        # 而不是拿一个错地址去锁（错地址 = 锁完 stub 找不到入口 = 起不来）。
+        self.symbols = {}
+        symtab = self.find('.symtab')
+        if symtab is not None:
+            strtab = self.find('.strtab')
+            if strtab is not None:
+                if self.is64:
+                    SY_FMT, SY_SIZE = '<IBBHQQ', 24
+                else:
+                    SY_FMT, SY_SIZE = '<IIIBBH', 16
+                n = symtab['size'] // SY_SIZE
+                names = bytes(self.data[strtab['offset']:strtab['offset'] + strtab['size']])
+                for i in range(n):
+                    off = symtab['offset'] + i * SY_SIZE
+                    f = struct.unpack_from(SY_FMT, self.data, off)
+                    st_name, st_value = f[0], f[-2]
+                    if st_name == 0 or st_name >= len(names):
+                        continue
+                    e = names.find(b'\x00', st_name)
+                    if e < 0:
+                        continue
+                    nm = names[st_name:e].decode('utf-8', 'replace')
+                    if nm:
+                        self.symbols[nm] = st_value
 
     def find(self, name: str):
         for s in self.sections:
@@ -444,6 +488,101 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     return 0
 
 
+# ── 二级锁箱：把 unlock 本体也锁进密文（自解谜）───────────────────
+def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
+    """锁 .ncguard_head 段，并给明文 stub 写它的密钥槽。
+
+    这是"把开锁器锁进它开的那只箱子"的构建期半边：
+      .ncguard_head（unlock 本体）← 用 k_stub 锁
+      .nckey_stub（stub 的槽）    ← 写 magic + wrapped_k_stub + head_size
+                                     + entry_delta，让明文 stub 能解它
+
+    k_stub 与 k_so 必须是两把钥匙：stub 只负责解 head，head 才负责解
+    业务段。复用一把 = 解开 head 就等于拿到业务段的钥匙，分级失去意义。
+
+    entry_delta 从 .symtab 读 STUB_ENTRY 符号值减段起始得到——
+    明文 stub 靠 `&符号 - delta` 反推段起始地址，不需要读盘。
+    """
+    with open(so_path, 'rb') as f:
+        raw = f.read()
+    elf = Elf(raw)
+
+    head = elf.find(HEAD_NAME)
+    if head is None:
+        print('⚠️ 段 %s 不存在（未接入 nc_guard_boot.c），跳过二级锁箱' % HEAD_NAME)
+        return 0
+
+    slot = elf.find(STUB_SLOT)
+    if slot is None:
+        print('❌ 密钥槽段 %s 不存在（nc_guard_boot.c 的 ncg_stub_slot 未编入）'
+              % STUB_SLOT, file=sys.stderr)
+        return 1
+
+    if head['size'] == 0:
+        print('❌ 段 %s 长度为 0，没有 unlock 本体可锁' % HEAD_NAME, file=sys.stderr)
+        return 1
+
+    # 幂等：已锁（slot magic 在）默认拒绝，防二次加密毁数据
+    existing = bytes(elf.data[slot['offset']: slot['offset'] + 8])
+    if existing == STUB_MAGIC and not force:
+        print('❌ %s 已被锁（stub 槽 magic 已写）。二次锁会毁数据。'
+              % so_path, file=sys.stderr)
+        return 1
+
+    # entry_delta：从符号表读入口符号的链接期地址
+    entry = elf.symbols.get(STUB_ENTRY)
+    if entry is None:
+        print('❌ 符号 %s 不在 .symtab —— 无法算 entry_delta。'
+              '请确认 so 未被 strip，且 nc_guard_boot.c 已编入。'
+              % STUB_ENTRY, file=sys.stderr)
+        return 1
+    entry_delta = entry - head['addr']
+    if entry_delta < 0 or entry_delta >= head['size']:
+        print('❌ entry_delta=%d 越界（段大小 %d）—— 符号不在 %s 内？'
+              % (entry_delta, head['size'], HEAD_NAME), file=sys.stderr)
+        return 1
+
+    # k_stub：与 k_so 独立的第二把钥匙（hardcode 的理由同 master ——
+    # 真正的盐是证书指纹，占位值公开不影响"换 key 重打包即失效"）
+    k_stub = bytes([0x3B, 0x7C, 0x19, 0x5E, 0xA2, 0xDF, 0x48, 0x31,
+                    0x6C, 0x85, 0xEA, 0x27, 0x54, 0x9B, 0x0F, 0xD6])
+
+    plain = bytes(elf.data[head['offset']: head['offset'] + head['size']])
+    # ⚠️ 必须是【简单循环 XOR】，不能用 rc4()！
+    # 2026-10-18 实测踩过：这里抄了 rc4()，而 stub 侧是
+    #   `for(i<head_size) start[i] ^= k[i & 15];`
+    # 两边算法不同 → 解出来是乱 C → dlopen 即 SIGILL（exit 132）。
+    # 刻意不用 RC4 的理由：明文 stub 里不能出现 256 字节 S 盒初始化循环
+    # —— 那本身就是"这是 RC4"的活招牌，且会显著撑大 stub。简单 XOR 的
+    # 代价由 HMAC 兜底（见 .ncguard 业务段的 MAC，head 段同理可加）。
+    cipher = bytes(b ^ k_stub[i % len(k_stub)] for i, b in enumerate(plain))
+
+    elf.data[head['offset']: head['offset'] + head['size']] = cipher
+
+    # stub 槽（32 字节）：magic(8) + wrapped(16) + head_size(4) + delta(4)
+    import struct as _s
+    wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_stub))
+    blob = (STUB_MAGIC + wrapped
+            + _s.pack('<I', head['size'])
+            + _s.pack('<I', entry_delta))
+    assert len(blob) == 32, 'stub blob %d != 32' % len(blob)
+    assert len(blob) == slot['size'], \
+        'blob %d != slot size %d（.nckey_stub 段需为 32 字节）' \
+        % (len(blob), slot['size'])
+    elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
+
+    with open(out_path, 'wb') as f:
+        f.write(bytes(elf.data))
+
+    print('✅ 二级锁箱: %s → %s' % (so_path, out_path))
+    print('   段 %s: %d 字节已加密（unlock 本体）' % (HEAD_NAME, head['size']))
+    print('   密钥槽 %s: %d 字节（magic + wrapped_k_stub + size + delta）'
+          % (STUB_SLOT, len(blob)))
+    print('   入口符号 %s: delta=0x%x' % (STUB_ENTRY, entry_delta))
+    print('   ⚠️ 静态视角：unlock 本体已不可读，只剩明文 stub')
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='把 so 的代码段加密锁死（构建期锁箱）')
     ap.add_argument('input', help='输入 .so')
@@ -460,6 +599,9 @@ def main(argv=None):
     ap.add_argument('--package', default='', help='包名（HKDF info 的一部分）')
     ap.add_argument('--force', action='store_true', help='允许对已锁文件二次加密（调试用）')
     ap.add_argument('--dry-run', action='store_true', help='只演示不写文件')
+    ap.add_argument('--lock-head', action='store_true',
+                    help='二级锁箱：把 unlock 本体也锁进 %s（自解谜，需先跑过一级锁箱）'
+                         % HEAD_NAME)
     args = ap.parse_args(argv)
 
     # 证书与包名来源：
@@ -483,6 +625,8 @@ def main(argv=None):
         cert = b'\x00' * 32
 
     try:
+        if args.lock_head:
+            return lock_head(args.input, args.output, args.force)
         return lock(args.input, args.output, args.section, cert,
                     package, args.force, args.dry_run)
     except ElfError as e:
