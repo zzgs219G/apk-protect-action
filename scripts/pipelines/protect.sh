@@ -364,22 +364,6 @@ ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一）�
 
 log_step 4 6 "NDK 编译"
 ndk_build "$WORK/project"
-
-# ── so 静态加固(2026-12):把 .ncguard 段锁成密文（构建期"锁箱"）──────
-# 运行期由 nc_guard_unlock.c 的 ncguard_unlock() 解密；磁盘上 IDA 读到的
-# .ncguard 是 RC4 密文。抄自 XopProtector 的 .bitcode 自解密机制。
-# 幂等：已锁文件默认拒绝（防二次加密毁数据），故不加 --force。
-if [[ -d "$WORK/project/libs" ]]; then
-  for so in "$WORK"/project/libs/*/libnc.so; do
-    [[ -f "$so" ]] || continue
-    # fail-fast：段不存在/已锁 都算配置错误，静默跳过等于"以为防了其实没防"
-    python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" \
-      --section .ncguard 2>&1 | sed 's/^/  [lock] /' || {
-      echo "❌ .ncguard 锁箱失败（段未标记？或已锁？）——so 静态加固未生效" >&2
-      exit 1
-    }
-  done
-fi
 fi   # 有 so 需求的组合才执行 STEP 3/4(报错二十三:纯 stringenc 组合跳过)
 
 # ── STEP 5: 解包 → smali 处理 → 放 so → 回编（全组合只做这一次） ────
@@ -393,6 +377,32 @@ if [[ $LINK_STUB -eq 1 ]]; then
 fi
 log_step 5 6 "解包注入重打包"
 repack_unpack "$WORK/decompiled" "$STEP5_APK"
+
+# ── so 静态加固(2026-12):把 .ncguard 段锁成密文（构建期"锁箱"）──────
+# 位置选在【STEP5 解包之后】：此时 apktool.yml 已在 → 能拿真实包名做 HKDF
+# info；so 已编译完但【还没进 APK】→ 锁的是即将打包的产物。
+# 运行期由 nc_guard_unlock.c 的 ncguard_unlock() 解密；磁盘上 IDA 读到的
+# .ncguard 是 RC4 密文（现为 4012/2750 字节的 12 个 env_check 探针）。
+# 抄自 XopProtector 的 .bitcode 自解密机制。
+if [[ -d "$WORK/project/libs" ]]; then
+  PKG="$(sed -n 's/^package:[[:space:]]*//p' "$WORK/decompiled/apktool.yml" 2>/dev/null | head -1)"
+  if [[ -z "$PKG" ]]; then
+    echo "❌ 无法从 apktool.yml 取包名（so 锁箱需要它做 HKDF info）" >&2
+    exit 1
+  fi
+  for so in "$WORK"/project/libs/*/libnc.so; do
+    [[ -f "$so" ]] || continue
+    # 证书绑定：k_so = HKDF(master, SHA256(certDER), "nc-so-v1"+PKG)。
+    # cert 由 so-section-lock.py 自己从输入 APK 提（定点读 Signing Block）。
+    # 换 key 重打包 → cert 变 → k_so 变 → 密文解不开（fail-closed）。
+    python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" \
+      --section .ncguard --from-apk "$IN_APK" --package "$PKG" \
+      2>&1 | sed 's/^/  [lock] /' || {
+      echo "❌ .ncguard 锁箱失败（段未标记？cert 提取失败？）——so 静态加固未生效" >&2
+      exit 1
+    }
+  done
+fi
 
 if [[ $WANT_TRANSPILE -eq 1 ]]; then
   # native 化：把已抽进 so 的方法在 smali 里改成 native 壳，并插 System.loadLibrary("nc")

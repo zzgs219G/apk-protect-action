@@ -153,6 +153,95 @@ def derive_app_keys(master: bytes, cert_sha256: bytes, package: str) -> dict:
 
 
 # ── 锁箱主流程 ────────────────────────────────────────────────────
+def apk_first_signer_cert_sha256(apk_path: str) -> bytes:
+    """从 APK 提取第一签名者证书 DER 的 SHA-256（32 字节）。
+
+    与 C 侧 nc_guard_key.c 的 ncg_apk_first_cert_der() 同规则（照抄 XopProtector
+    crypto/apk_sign.cpp）：只读 EOCD + Central Directory + APK Signing Block
+    （几十 KB 定点读，不读整个 APK）。v3(0xf05368c0) 优先，回退 v2(0x7109871a)。
+    """
+    import struct as _s  # noqa: F811  与模块级 struct 同模块，此处为可读性起别名
+    with open(apk_path, 'rb') as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        if fsize < 64:
+            raise ElfError('APK 过小: %d' % fsize)
+        # 1) EOCD：尾部前 64KB 反向找 PK\x05\x06
+        search = max(0, fsize - 65557)
+        pos = fsize - 22
+        while pos >= search:
+            f.seek(pos)
+            eocd = f.read(22)
+            if eocd[:4] == b'PK\x05\x06':
+                break
+            pos -= 1
+        else:
+            raise ElfError('未找到 EOCD')
+        cd_off = _s.unpack('<I', eocd[16:20])[0]
+        if cd_off < 32 or cd_off >= fsize:
+            raise ElfError('CD 偏移非法: %d' % cd_off)
+        # 2) Signing Block footer
+        f.seek(cd_off - 24)
+        footer = f.read(24)
+        if len(footer) < 24:
+            raise ElfError('footer 读失败')
+        # 照抄 XopProtector crypto/apk_sign.cpp:21-22/198：
+        #   kMagicLo = 0x20676953204b5041 ("APK Sig ")
+        #   kMagicHi = 0x3234206b636f6c42 ("Block 42")
+        # ⚠️ 必须校验两个 8 字节——我第一版只查了 "APK Sig Block "（14 字节，
+        # 既漏了结尾 "42" 又比切片长），magic 永不匹配 → 真 APK 也提取失败。
+        if footer[8:16] != b'APK Sig ' or footer[16:24] != b'Block 42':
+            raise ElfError('非 APK Signing Block magic')
+        block_size = _s.unpack('<Q', footer[:8])[0]
+        if block_size < 24 or block_size + 8 > cd_off:
+            raise ElfError('block_size 非法: %d' % block_size)
+        # 3) 只读 block 进内存
+        total = block_size + 8
+        f.seek(cd_off - total)
+        blk = f.read(total)
+        if _s.unpack('<Q', blk[:8])[0] != block_size:
+            raise ElfError('block size 不匹配')
+        # 4) 遍历 id-value 对，找 v3/v2
+        v3 = v2 = None
+        i = 8
+        while i + 12 <= len(blk):
+            (pl,) = _s.unpack('<Q', blk[i:i + 8])
+            i += 8
+            if pl < 4 or i + pl > len(blk):
+                break
+            (bid,) = _s.unpack('<I', blk[i:i + 4])
+            val = blk[i + 4:i + pl]
+            if bid == 0xf05368c0:
+                v3 = val
+            elif bid == 0x7109871a:
+                v2 = val
+            i += pl
+    der = _first_cert_der(v3) or _first_cert_der(v2)
+    if der is None:
+        raise ElfError('v3/v2 中均未找到证书 DER')
+    return hashlib.sha256(der).digest()
+
+
+def _first_cert_der(scheme: bytes):
+    """v2/v3 scheme block 里第一个 certificate 的 DER。"""
+    if not scheme or len(scheme) < 12:
+        return None
+    i = 8   # scheme 前 8 字节是长度字段（signer 列表 length）
+    while i + 12 <= len(scheme):
+        sl = int.from_bytes(scheme[i:i + 4], 'little')
+        i += 4
+        if i + sl > len(scheme):
+            break
+        if sl >= 4:
+            certs = int.from_bytes(scheme[i + sl - 4:i + sl], 'little')
+            if certs > 0 and i + sl + 4 <= len(scheme):
+                cl = int.from_bytes(scheme[i + sl:i + sl + 4], 'little')
+                if 0 < cl <= len(scheme) - i - sl - 4:
+                    return scheme[i + sl + 4:i + sl + 4 + cl]
+        i += sl
+    return None
+
+
 def lock(so_path: str, out_path: str, section: str, cert: bytes,
          package: str, force: bool, dry: bool) -> int:
     with open(so_path, 'rb') as f:
@@ -187,7 +276,19 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
         print('⚠️ --force：对已锁文件强制二次加密', file=sys.stderr)
 
     # 派生 so 域密钥
-    keys = derive_app_keys(b'\x11' * 32, cert, package)   # master 由打包侧注入，此处占位
+    # 派生 so 域密钥（2026-12 证书绑定，照抄 XopProtector key ladder）：
+    #   k_so = HKDF-SHA256(ikm=master, salt=SHA256(certDER), info="nc-so-v1"+pkg, 16)
+    # master 仍由打包侧注入（此处占位；占位值公开无所谓——盐是证书指纹，
+    # 换 key 重打包 → cert 变 → k_so 变 → 密文解不开）。
+    # ⚠️ C 侧 nc_guard_key.c 的 ncg_derive_k_so() 必须与本函数逐字节同规则，
+    #    改一侧必须同步另一侧（本轮已用 3 场景对拍验证 HKDF/HMAC/SHA256）。
+    if cert == b'\x00' * 32:
+        # cert 全零 = 调用方没传真证书 → 拒绝锁箱。
+        # 静默用全零 salt 等于把密钥暴露给"能跑本脚本的人"（仓库是公开的），
+        # 那 4012 字节密文秒变明文。fail-fast，逼调用方提供真证书。
+        raise ElfError('cert 全零：必须提供 --cert-hex（证书绑定；全零 salt 会使'
+                       '密文可被公开脚本解开）')
+    keys = derive_app_keys(b'\x11' * 32, cert, package or '')
     k_so = keys['so']
 
     plain = bytes(elf.data[sec['offset']: sec['offset'] + sec['size']])
@@ -229,13 +330,30 @@ def main(argv=None):
     ap.add_argument('--section', default=SECTION_NAME,
                     help='要锁的段名（默认 %s）' % SECTION_NAME)
     ap.add_argument('--cert-hex', default='',
-                    help='证书 SHA-256（hex，32 字节）。留空则用占位（不安全）')
+                    help='证书 SHA-256（hex，32 字节）。与 --from-apk 二选一')
+    ap.add_argument('--from-apk', default='',
+                    help='从 APK 自动提取第一签名者证书 SHA-256（与 --cert-hex 等价，'
+                         '但免去手工提证书；v3 优先回退 v2）')
+    ap.add_argument('--cert-only', action='store_true',
+                    help='只打印 APK 证书 SHA-256 后退出（供流水线校验/搬运）')
     ap.add_argument('--package', default='', help='包名（HKDF info 的一部分）')
     ap.add_argument('--force', action='store_true', help='允许对已锁文件二次加密（调试用）')
     ap.add_argument('--dry-run', action='store_true', help='只演示不写文件')
     args = ap.parse_args(argv)
 
-    cert = bytes.fromhex(args.cert_hex) if args.cert_hex else b'\x00' * 32
+    # 证书来源：--from-apk 优先（真证书），--cert-hex 次之；都无则全零 →
+    # lock() 会 fail-fast（全零 salt 会让公开脚本解出密钥，等于没锁）
+    if args.from_apk:
+        cert = apk_first_signer_cert_sha256(args.from_apk)
+        if args.cert_only:
+            print(cert.hex())
+            return 0
+        # 顺手把包名从 APK 路径旁路的义务留给调用方；--package 必填
+    elif args.cert_hex:
+        cert = bytes.fromhex(args.cert_hex)
+    else:
+        cert = b'\x00' * 32
+
     try:
         return lock(args.input, args.output, args.section, cert,
                     args.package, args.force, args.dry_run)

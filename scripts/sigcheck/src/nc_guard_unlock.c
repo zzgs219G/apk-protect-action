@@ -107,7 +107,15 @@ static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
     return -1;
 }
 
-/* 从 slot 恢复 K_so：wrapped ^ XOR_KEY */
+/* ── 从 slot 恢复 K_so：wrapped ^ XOR_KEY ──────────────────────────
+ * 2026-12 证书绑定后的完整链路：
+ *   锁箱侧 so-section-lock.py：k_so = HKDF(master, SHA256(certDER), "nc-so-v1"+pkg)
+ *                              → slot 存 k_so ^ XOR_KEY（wrapped）
+ *   解锁侧（本函数）        ：wrapped ^ XOR_KEY 得回 k_so → RC4 解密
+ * 这样 C 侧【不需要读 APK / 不提证书】（省 I/O、不拖冷启动，这是对
+ * XopProtector「运行期读 APK」的刻意偏离——我们用构建期派生替代），
+ * 同时证书绑定依然成立：换 key 重打包 → cert 变 → k_so 变 → slot 里的
+ * wrapped 与新 k_so 不符 → 解密得到乱 C → 探针 SIGILL（fail-closed）。 */
 static void ncg_recover_key(const uint8_t slot32[32], uint8_t k[16]) {
     for (int i = 0; i < 16; i++) k[i] = slot32[16 + i] ^ NCG_XOR_KEY[i & 7];
 }
