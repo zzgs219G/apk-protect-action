@@ -222,11 +222,100 @@ def apk_first_signer_cert_sha256(apk_path: str) -> bytes:
     return hashlib.sha256(der).digest()
 
 
+def manifest_package(apk_path: str) -> str:
+    """从 APK 的二进制 AndroidManifest.xml 取 package 属性（stdlib 实现，零依赖）。
+
+    为什么不用 androguard：本脚本是"锁箱"单一职责，为拿一个包名把整个
+    dcc 解压链（tools/dcc + sys.path hack）拖进来不划算。
+    AXML 规范：XML 头(8) + string pool + element chunk；package 属性挂在
+    <manifest> START_ELEMENT 上，值通常是 type=0x03(STRING) 的 pool 索引。
+    """
+    import struct as _s
+    RES_STRING_POOL_TYPE = 0x0001
+    RES_XML_START_ELEMENT_TYPE = 0x0102
+    import zipfile
+    with zipfile.ZipFile(apk_path) as z:
+        raw = z.read('AndroidManifest.xml')
+    if raw[:2] != b'\x03\x00':
+        raise ElfError('非二进制 AXML（magic=%r）' % raw[:4])
+
+    # 1) 收集 chunk
+    off = 8
+    chunks = {}
+    while off + 8 <= len(raw):
+        ctype, hsize, csize = _s.unpack_from('<HHI', raw, off)
+        if csize < 8 or off + csize > len(raw):
+            break
+        chunks.setdefault(ctype, []).append((off, csize))
+        off += csize
+    pools = chunks.get(RES_STRING_POOL_TYPE, [])
+    if not pools:
+        raise ElfError('AXML 无 string pool')
+    poff, psize = pools[0]
+
+    # ResStringPool_header（相对 chunk 开头 poff）：
+    #   0:type(2) 2:hsize(2) 4:size(4) 8:stringCount(4) 12:styleCount(4)
+    #   16:flags(4) 20:stringsStart(4) 24:stylesStart(4)
+    # ⚠️ stringsStart 是【相对 chunk 开头】的偏移，不是绝对地址
+    string_count = _s.unpack_from('<I', raw, poff + 8)[0]
+    flags = _s.unpack_from('<I', raw, poff + 16)[0]
+    strings_start = _s.unpack_from('<I', raw, poff + 20)[0]
+    is_utf8 = bool(flags & 0x100)
+
+    pool = []
+    sp = poff + strings_start
+    for _i in range(string_count):
+        if is_utf8:
+            slen = raw[sp]; sp += 1
+            if slen & 0x80:
+                slen = ((slen & 0x7F) << 8) | raw[sp]; sp += 1
+            pool.append(raw[sp:sp + slen].decode('utf-8', 'replace'))
+            sp += slen + 1
+        else:
+            slen = raw[sp] | (raw[sp + 1] << 8); sp += 2
+            if slen & 0x8000:
+                slen = ((slen & 0x7FFF) << 16) | (raw[sp] | (raw[sp + 1] << 8)); sp += 2
+            pool.append(raw[sp:sp + slen * 2].decode('utf-16-le', 'replace'))
+            sp += slen * 2 + 2
+
+    # 2) 找 <manifest> START_ELEMENT 的 package 属性
+    # RES_XML_START_ELEMENT: ns(4) name(4) attrStart(2) attrSize(2)
+    #                         attrCount(2) idIdx(2) classIdx(2) styleIdx(2)
+    for eoff, _esize in chunks.get(RES_XML_START_ELEMENT_TYPE, []):
+        # ResXML_tree_node: header(8) lineNumber(4) comment(4) → 16
+        # ResXML_tree_attrExt: ns(4) name(4) attrStart(2) attrSize(2)
+        #                       attrCount(2) idIdx(2) classIdx(2) styleIdx(2)
+        # ⚠️ name 在 eoff+20（不是 +16——那是 comment 尾部，曾读成 -1 全不匹配）
+        name_idx = _s.unpack_from('<i', raw, eoff + 20)[0]
+        if not (0 <= name_idx < len(pool)) or pool[name_idx] != 'manifest':
+            continue
+        attr_start = _s.unpack_from('<H', raw, eoff + 24)[0]
+        attr_size = _s.unpack_from('<H', raw, eoff + 26)[0]
+        attr_count = _s.unpack_from('<H', raw, eoff + 28)[0]
+        for i in range(attr_count):
+            # ⚠️ attrStart 相对 attrExt 开头，需先跳过 16 字节 node header
+            #    （漏了这 16 字节 → 属性名全错位成 1310740/-1，曾实测）
+            ao = eoff + 16 + attr_start + i * attr_size
+            aname = _s.unpack_from('<i', raw, ao + 4)[0]
+            atype = raw[ao + 15]
+            adata = _s.unpack_from('<I', raw, ao + 16)[0]
+            if 0 <= aname < len(pool) and pool[aname] == 'package':
+                if atype == 0x03 and 0 <= adata < len(pool):
+                    return pool[adata]
+                return ''
+    raise ElfError('未找到 <manifest package=...>')
+
+
 def _first_cert_der(scheme: bytes):
-    """v2/v3 scheme block 里第一个 certificate 的 DER。"""
+    """v2/v3 scheme block 里第一个 certificate 的 DER。
+
+    scheme 布局：signer 列表长度(4字节,值=1居多) + [ signedData长度(4) + signedData
+    + signedData长度(4,再写一次) + 证书数(4) + 各证书(长度(4)+DER) ]。
+    这里从 signedData 尾部反推：signedData 的最后 4 字节是证书数，
+    其后紧跟第一张证书的长度 + DER。"""
     if not scheme or len(scheme) < 12:
         return None
-    i = 8   # scheme 前 8 字节是长度字段（signer 列表 length）
+    i = 8
     while i + 12 <= len(scheme):
         sl = int.from_bytes(scheme[i:i + 4], 'little')
         i += 4
@@ -341,14 +430,21 @@ def main(argv=None):
     ap.add_argument('--dry-run', action='store_true', help='只演示不写文件')
     args = ap.parse_args(argv)
 
-    # 证书来源：--from-apk 优先（真证书），--cert-hex 次之；都无则全零 →
-    # lock() 会 fail-fast（全零 salt 会让公开脚本解出密钥，等于没锁）
+    # 证书与包名来源：
+    #   --from-apk  自动提 cert（定点读 Signing Block）+ package（AXML 解析）
+    #   --cert-hex  手工给 cert；package 仍可缺省（HKDF info 只有 label 前缀，
+    #               换 key 重打包依然解不开——cert 才是关键 salt）
+    #   都无 → cert 全零 → lock() fail-fast（全零 salt = 公开脚本可解，等于没锁）
+    package = args.package
     if args.from_apk:
         cert = apk_first_signer_cert_sha256(args.from_apk)
         if args.cert_only:
             print(cert.hex())
             return 0
-        # 顺手把包名从 APK 路径旁路的义务留给调用方；--package 必填
+        if not package:
+            # 自动补包名（原来指望 apktool.yml 的 package 字段——那字段不存在，
+            # 2026-10-17 CI 因此 fail-fast；改为从 AXML 直接解析）
+            package = manifest_package(args.from_apk)
     elif args.cert_hex:
         cert = bytes.fromhex(args.cert_hex)
     else:
@@ -356,7 +452,7 @@ def main(argv=None):
 
     try:
         return lock(args.input, args.output, args.section, cert,
-                    args.package, args.force, args.dry_run)
+                    package, args.force, args.dry_run)
     except ElfError as e:
         print('❌ ELF 错误: %s' % e, file=sys.stderr)
         return 1

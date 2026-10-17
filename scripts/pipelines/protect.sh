@@ -379,26 +379,20 @@ log_step 5 6 "解包注入重打包"
 repack_unpack "$WORK/decompiled" "$STEP5_APK"
 
 # ── so 静态加固(2026-12):把 .ncguard 段锁成密文（构建期"锁箱"）──────
-# 位置选在【STEP5 解包之后】：此时 apktool.yml 已在 → 能拿真实包名做 HKDF
-# info；so 已编译完但【还没进 APK】→ 锁的是即将打包的产物。
+# 位置在 STEP5 解包后：so 已编译完但【还没进 APK】→ 锁的是即将打包的产物。
 # 运行期由 nc_guard_unlock.c 的 ncguard_unlock() 解密；磁盘上 IDA 读到的
 # .ncguard 是 RC4 密文（现为 4012/2750 字节的 12 个 env_check 探针）。
 # 抄自 XopProtector 的 .bitcode 自解密机制。
+# cert 与 package 都由 so-section-lock.py 从 $IN_APK 自己提（定点读 Signing
+# Block + AXML 解析），protect.sh 不重复实现 —— 单一职责。
+# 换 key 重打包 → cert 变 → k_so 变 → 密文解不开（fail-closed）。
 if [[ -d "$WORK/project/libs" ]]; then
-  PKG="$(sed -n 's/^package:[[:space:]]*//p' "$WORK/decompiled/apktool.yml" 2>/dev/null | head -1)"
-  if [[ -z "$PKG" ]]; then
-    echo "❌ 无法从 apktool.yml 取包名（so 锁箱需要它做 HKDF info）" >&2
-    exit 1
-  fi
   for so in "$WORK"/project/libs/*/libnc.so; do
     [[ -f "$so" ]] || continue
-    # 证书绑定：k_so = HKDF(master, SHA256(certDER), "nc-so-v1"+PKG)。
-    # cert 由 so-section-lock.py 自己从输入 APK 提（定点读 Signing Block）。
-    # 换 key 重打包 → cert 变 → k_so 变 → 密文解不开（fail-closed）。
     python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" \
-      --section .ncguard --from-apk "$IN_APK" --package "$PKG" \
+      --section .ncguard --from-apk "$IN_APK" \
       2>&1 | sed 's/^/  [lock] /' || {
-      echo "❌ .ncguard 锁箱失败（段未标记？cert 提取失败？）——so 静态加固未生效" >&2
+      echo "❌ .ncguard 锁箱失败（段未标记？cert/包名提取失败？）——so 静态加固未生效" >&2
       exit 1
     }
   done
