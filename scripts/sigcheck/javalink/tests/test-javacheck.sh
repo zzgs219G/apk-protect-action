@@ -81,7 +81,6 @@ javac -nowarn -d "$T/classes" \
   "$T/stubs/android/os/"*.java \
   "$T/stubs/android/util/"*.java \
   "$JL/stub-src/NcLink.java" \
-  "$JL/stub-src/NcGuard.java" \
   "$JL/stub-src/Guard.java"
 ok "javac 语义真相源编译通过(Guard/NcLink 与桩 API 形态一致)"
 

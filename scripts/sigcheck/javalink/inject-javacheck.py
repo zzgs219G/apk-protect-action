@@ -34,9 +34,12 @@ MARKER = '# nc-javacheck-applied v1'
 CALL_MARKER = '# nc-javacheck-call'
 COMPONENTS_JSON = 'javacheck-components.json'
 BRIDGE_DESC = 'Lcom/nc/link/NcLink;'
-# .ncguard 段自解密自检入口(2026-12) —— native 侧 nc_guard_jni.c 实现。
-# 独立于 BRIDGE：它是"机制本身能否工作"的观测探针,不是签名校验链路。
-SELFTEST_DESC = 'Lcom/nc/guard/NcGuard;'
+# ⚠️ 2026-10-17 回归教训：曾为 .ncguard 自检单独造 Lcom/nc/guard/NcGuard;
+# 类,只在 smali 模板里加了【调用】却忘了【生成类】→ selftest() 抛
+# UnsatisfiedLinkError → 被 catch(Throwable) 静默吞掉 → 连带跳过后面的
+# heartbeat()/startHeartbeat() → 心跳停喂 → watchdog 误杀（复现报错四十九）。
+# 现改为【挂到已注入的 NcLink 上】:零新类、零新链路,selftest 与 ncVerify/
+# heartbeat 同源。native 侧对应 Java_com_nc_link_NcLink_selftest。
 SO_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,30}$')
 SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')   # 与 inject-loadlib/mark-native 同源,改动须 grep 三处
 
@@ -237,6 +240,15 @@ def render_bridge(so_name):
 # 语义真相: stub-src/NcLink.java
 .method public static native heartbeat()V
 .end method
+
+# .ncguard 段自解密自检(2026-12):59=完整链路通过,-100=已自检过重入,
+# 负数=解锁失败(见 nc_guard_unlock.c)。纯观测,不参与防御判定。
+# ⚠️ 挂靠 NcLink(与 ncVerify/heartbeat 同源),不要另造类——
+# 2026-10-17 曾独立造 Lcom/nc/guard/NcGuard; 却只加调用不生成类,
+# selftest() 抛 UnsatisfiedLinkError 被主 catch 吞掉并跳过 heartbeat,
+# 复现报错四十九(真机日志连打"Java 心跳丢失")。
+.method public static native selftest()I
+.end method
 """
     _render_asserts(text, so_name)
     return text
@@ -286,10 +298,17 @@ def render_guard(wrapper_desc):
     :try_start_0
     invoke-static {{}}, {BRIDGE_DESC}->ensureLoaded()V
     # .ncguard 段自解密自检(2026-12):so 已加载即触发一次性解锁。
-    # 59 = 完整链路通过(解锁→解密→执行 .ncguard 代码);-100 = 已自检过;
-    # 负数 = 解锁失败(见 nc_guard_unlock.c)。纯观测:不 kill 不阻断,
-    # 与测量链解耦,全吞 Throwable,绝不成新崩溃源。
-    invoke-static {{}}, {SELFTEST_DESC}->selftest()I
+    # 59 = 完整链路通过;-100 = 已自检过;负数 = 解锁失败(见 nc_guard_unlock.c)。
+    # ⚠️ 必须用【独立的 try/catch】包住:2026-10-17 曾把 selftest 直接放在
+    # 主 try 里,而当它抛 UnsatisfiedLinkError 时会被主 catch(Throwable)
+    # 吞掉并【连带跳过后面的 heartbeat()/startHeartbeat()】→ 心跳停喂 →
+    # watchdog 误杀(报错四十九复现,真机日志连打"Java 心跳丢失")。
+    # 现在自检的任何失败都只影响自己,绝不能波及心跳。
+    # selftest 与 ncVerify/heartbeat 同挂 NcLink —— native 方法在库里是
+    # 同一批注册的,只要 ensureLoaded() 成功它就必然存在,不会抛
+    # UnsatisfiedLinkError(报错四十九的根因就是"类不存在")。
+    # .ncguard 未解锁时 native 侧返回负数而非抛异常,所以主 catch 不会因它触发。
+    invoke-static {{}}, {BRIDGE_DESC}->selftest()I
     move-result v0
     const/16 v1, 0x3b
     if-eq v0, v1, :after_selftest

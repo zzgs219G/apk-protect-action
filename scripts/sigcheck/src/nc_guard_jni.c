@@ -8,7 +8,11 @@
  * 本文件给一个显式入口，让 CI/真机能拿到【可判读的回执】：
  *
  *   Java:  NcGuard.selftest()
- *   C:     jint Java_com_nc_guard_NcGuard_selftest(JNIEnv*, jobject)
+ *   C:     jint Java_com_nc_link_NcLink_selftest(JNIEnv*, jobject)
+ * 注(2026-10-17): 曾用独立的 Lcom/nc/guard/NcGuard; 类,但那类从未被
+ * inject-javacheck.py 生成 → selftest() 抛 UnsatisfiedLinkError 被
+ * catch 吞掉 → 连带跳过 heartbeat → 复现报错四十九。现挂到已注入的
+ * NcLink 上,与 ncVerify/heartbeat 同源。
  *
  *   返回值语义（Android 上才能测出的部分）：
  *     59     ✅ 完整链路通过：解锁 → 解密 → 执行 .ncguard 代码
@@ -50,7 +54,7 @@ static atomic_int ncg_selftest_done = 0;
  * 不加这个 JNI 符号不会被导出，Java 侧照旧找不到。 */
 __attribute__((visibility("default")))
 JNIEXPORT jint JNICALL
-Java_com_nc_guard_NcGuard_selftest(JNIEnv *env, jobject thiz) {
+Java_com_nc_link_NcLink_selftest(JNIEnv *env, jobject thiz) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&ncg_selftest_done, &expected, 1)) {
         return (jint) -100;      /* 已自检过，拒绝重入 */

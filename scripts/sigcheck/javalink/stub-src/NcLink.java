@@ -35,4 +35,12 @@ public final class NcLink {
      *    否则运行期 UnsatisfiedLinkError(喂循环吞掉,watchdog 超时兜底)。
      */
     public static native void heartbeat();
+
+    /**
+     * .ncguard 段自解密自检(2026-12)。
+     * 返回 59 = 完整链路通过(解锁→解密→执行 .ncguard 里的密文代码)；
+     * -100 = 已自检过(原子守门挡重入)；负数 = 解锁失败，见 nc_guard_unlock.c。
+     * 纯观测探针，不参与任何防御判定。改名必须同步 nc_guard_jni.c。
+     */
+    public static native int selftest();
 }

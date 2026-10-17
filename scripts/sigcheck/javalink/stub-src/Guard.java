@@ -85,7 +85,7 @@ public final class Guard {
     }
 
     /* ── .ncguard 段自解密自检(2026-12) ────────────────────────────
-     * native 侧 com/nc/guard/NcGuard.selftest() 返回：
+     * native 侧 com/nc/link/NcLink.selftest() 返回：
      *   59   完整链路通过（解锁→解密→执行 .ncguard 代码）
      *   -100 已自检过（原子守门挡住重入）
      *   负数 解锁失败（段定位/mprotect 等，见 nc_guard_unlock.c）
@@ -93,7 +93,7 @@ public final class Guard {
      * 全吞 Throwable——自检本身绝不许成为新崩溃源。 */
     private static void ncguardSelftest() {
         try {
-            int r = com.nc.guard.NcGuard.selftest();
+            int r = com.nc.link.NcLink.selftest();
             if (r != 59) {
                 android.util.Log.w("ncguard", "selftest rc=" + r);
             }
