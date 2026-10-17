@@ -1,17 +1,34 @@
-/* ncguard-unlock.c — 运行期"开箱"：原地解密 .ncguard 段
+/* nc_guard_unlock.c — so 段加密设施的运行期"开箱"（基础设施，非模块专属）
+ *
+ * ⚠️ 2026-10-18 定位重构：这套东西原本只服务 sigcheck 的探针加密，文件名、
+ * 注释、命名（ncguard_*）都容易读成"签名校验模块的加密器"。
+ * 实际它是【全项目共用的 so 段加密设施】：任何模块的代码只要被标进
+ * .ncguard 段，就由本文件负责在运行期还原。
+ *
+ * 设施分层（详见 docs/流程文档.md §3.12）：
+ *   第1层 本文件 + so-section-lock.py + nc_guard_key.c = 段加密服务
+ *         （RC4 / HMAC / 密钥槽 / mprotect / clear_cache）
+ *   第2层 so_section_mark.py = 通用标记器（规则=函数头正则，零模块逻辑）
+ *   第3层 消费者，各自零侵入：
+ *         - sigcheck/envcheck 探针（env_check.c 手动 __attribute__）
+ *         - ncguard_probe()（本目录，样例）
+ *         - dex2c 转译产物（经标记器，规则匹配 JNI 函数头）
+ *         - 未来新模块：加一条规则即可，不需要改本文件
+ *
+ * 用法：在 JNI_OnLoad 或 so constructor 里调一次 ncguard_unlock()。
+ *       必须在任何 .ncguard 段的函数被调用之前。
  *
  * 与 scripts/lib/so-section-lock.py（构建期"锁箱"）配套。
  * 抄自 XopProtector crypto/section_decrypt.cpp，剥离其 6 个私有模块依赖
  * （hook/risk/so_guard/business_so/apk_sign/runtime_state），只保留
  * ELF 段定位 + RC4 解密 + mprotect + clear_cache 四件事。
  *
- * 用法：在 JNI_OnLoad 或 so constructor 里调一次 ncguard_unlock()。
- *       必须在任何 .ncguard 段的函数被调用之前。
- *
- * 密钥来源：.nckey 段的 slot = magic(16) + wrapped(16)。
- *   wrapped = k_so ^ XOR_KEY， recover 后就是 HKDF 派生的 so 域密钥。
- *   Xop 用 HKDF(master, cert_sha256, "nc-so-v1"+package)——本实现把
- *   derive_app_keys 内联进来，避免依赖 key_ladder。
+ * 密钥来源：.nckey 段的 slot（80 字节）= magic(16) + wrapped_k_so(16)
+ *           + wrapped_k_mac(16) + expect_mac(32)。
+ *   k_so  = HKDF(master, SHA256(certDER), "nc-so-v1"+package)
+ *   k_mac = HKDF(master, SHA256(certDER), "nc-so-mac-v1"+package)
+ *   ⚠️ 证书绑定目前只在【构建期】生效（运行期不做 HKDF、不读 APK），
+ *   这是已知短板，见 docs/so层防御/简盒-06-防御强度统一评判.md §1.2。
  */
 #include <elf.h>
 #include <fcntl.h>
@@ -238,4 +255,32 @@ int ncguard_unlock(void) {
                           PROT_READ | PROT_EXEC) != 0) return -10;
     ncg_unlocked = 1;
     return 0;
+}
+
+/* ── 兜底触发：so 加载即尝试解锁（2026-10-18 追加，只追加不改上方逻辑）──
+ *
+ * 为什么需要（这是一个"接入即必炸"的坑，不是假设）：
+ *   unlock 此前只有两个触发点 ——
+ *     ① Java 侧 NcLink.selftest()   ← inject-javacheck.py 只在 --sigcheck 时跑
+ *     ② env_check_entry() constructor ← env_check.c 只在 --sigcheck/--envcheck 时入工程
+ *   而 protect.sh 的 nc_guard 拷贝是【无条件】的（只要有 so 需求就拷）。
+ *   于是【只勾 dex2c】时：标记器把转译函数锁进 .ncguard，却没有任何人调
+ *   ncguard_unlock() → 段永为密文 → 调第一个转译方法即执行密文 → SIGILL。
+ *
+ * 为什么加在设施层而不是让消费者各自接线：
+ *   这是第1层设施的一部分。任何消费者（dex2c / stringenc / 未来模块）零侵入，
+ *   不需要知道"要调 unlock"这回事。与 ① ② 三方重复调用安全 ——
+ *   ncguard_unlock() 内有 static 幂等标志，且未锁（slot 无 magic）时返回 0。
+ *
+ * 为什么失败不在此处 abort：
+ *   构造函数里 abort 会把"根本没锁任何东西"的正常构建也弄崩
+ *   （例如未来某组合不标记任何函数 → find_section 返回 -2）。
+ *   段保持密文 + 调用时 SIGILL 已是 fail-closed，且 selftest 能从 Java
+ *   侧读到失败码，没必要在这里提前杀。
+ *
+ * 与 env_check.c 的 env_check_entry 同形态：static + constructor，
+ * 该形态已在真机验证过（探针解锁链路）。 */
+__attribute__((constructor(101)))
+static void ncg_auto_unlock(void) {
+    (void) ncguard_unlock();
 }

@@ -1,13 +1,19 @@
-/* nc_guard_probe.c — .ncguard 段机制的 Android 试探实现（非冻结，可随时删）
+/* nc_guard_probe.c — so 段加密设施的密钥槽定义 + 样例消费者
  *
- * ⚠️ 这是一个【试探性】文件，唯一目的是在 Android/CI 上验证"段加密 → 运行期
- * 自解密"机制能否工作。验证通过后，此文件的职责由 env_check.c 等冻结模块
- * 的 __attribute__((section(".ncguard"))) 标记接手，届时可整体删除。
+ * ⚠️ 2026-10-18 定位纠正（此处曾有过期且危险的描述）：
+ *   本文件头部曾写"这是试探性文件，验证通过后可整体删除"。
+ *   【错。】`ncg_key_slot[80]` 就是 .nckey 段的全部内容——删掉本文件 =
+ *   .nckey 段消失 → ncguard_unlock() 返回 -3 → 段保持密文 → 探针踩密文
+ *   → SIGILL → App 起不来。它不是试探残留，是设施的承重墙。
  *
- * 为什么单独放一个文件而不是直接改 env_check.c：
- *   该机制从未在 Android linker 上验证过（本地只在 Linux/ELF64 上跑通）。
- *   直接改三个冻结文件再验证，一旦 CI 炸就要回滚冻结资产。用非冻结文件试探
- *   是零成本降险：炸了删掉本文件即可，冻结模块零牵扯。
+ * 本文件在通用设施（见 docs/流程文档.md §3.12）中承担两个角色：
+ *   ① 【设施本体】ncg_key_slot —— .nckey 段的唯一定义处，锁箱侧往里写
+ *      wrapped_k_so / wrapped_k_mac / expect_mac
+ *   ② 【样例消费者】ncguard_probe() —— 演示"一个函数如何进 .ncguard"，
+ *      对拍契约 probe(0)==59
+ *
+ * 新增消费者（dex2c 转译产物等）不需要改本文件，也不需要手写
+ * __attribute__ —— 用通用标记器 scripts/lib/so_section_mark.py 按规则注入。
  *
  * 机制（抄自 XopProtector .bitcode 自解密）：
  *   编译期：ncguard_probe() 进 .ncguard 段

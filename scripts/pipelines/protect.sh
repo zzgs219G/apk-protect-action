@@ -369,6 +369,42 @@ else
 fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc
 
+# ── 通用段标记（2026-10 设施化第2层）──────────────────────────────
+# 让 dex2c 转译产物吃上 .ncguard 加密：用规则把 JNI 函数打进加密段。
+# 位置必须在 ndk_build 【之前】——标记器改的是源码，编译后才跑就晚了。
+#
+# 为什么要单独一层：sigcheck/envcheck 的探针是手写 __attribute__ 的
+# （env_check.c 冻结，只追加）；dex2c 产物由引擎生成，不该为它改冻结的
+# 引擎。有了标记器，加一个消费者 = 加一条规则，谁也不写自己的防御。
+# 详见 docs/流程文档.md §3.12 的三层设施说明。
+if [[ $WANT_TRANSPILE -eq 1 ]]; then
+  echo "[mark] 段标记：dex2c 转译产物 → .ncguard"
+
+  # 先数一下源码里到底有多少 JNI 函数头（用于判定"静默失防"）
+  JNI_HDRS=$(grep -rlE 'JNIEXPORT[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+JNICALL' \
+             "$WORK/project/jni" --include='*.cpp' --include='*.cc' --include='*.c' 2>/dev/null | wc -l)
+
+  python3 "$ROOT/scripts/lib/so_section_mark.py" "$WORK/project/jni" \
+    --rule dex2c-jni --exclude nc_guard_jni.c -v 2>&1 | sed 's/^/  [mark] /' || {
+    echo "❌ 段标记失败——dex2c 转译产物未吃上加密（用户明确要求）" >&2
+    exit 1
+  }
+
+  # 静默失防检测：有 JNI 头却没标上任何一个 → 规则与产物形态脱节
+  # （例如 writer.py 改了函数头格式）。此时不能放行——那等于"以为防了
+  # 其实没防"，正是本机制最该避免的假绿。
+  MARKED=$(grep -rc 'section(".ncguard")' "$WORK/project/jni" \
+           --include='*.cpp' --include='*.cc' --include='*.c' 2>/dev/null \
+           | awk -F: '{s+=$2} END {print s+0}')
+  if [[ $JNI_HDRS -gt 0 && $MARKED -eq 0 ]]; then
+    echo "❌ 检出 $JNI_HDRS 个含 JNIEXPORT 的源文件，但段标记命中 0" >&2
+    echo "   → dex2c 的 writer.py 可能改了函数头格式，规则已脱节" >&2
+    echo "   → 修 scripts/lib/so_section_mark.py 的 dex2c-jni 规则，不许静默放行" >&2
+    exit 1
+  fi
+  echo "[mark] 完成：$MARKED 处 .ncguard 标记（含探针与转译函数）"
+fi
+
 log_step 4 6 "NDK 编译"
 ndk_build "$WORK/project"
 fi   # 有 so 需求的组合才执行 STEP 3/4(报错二十三:纯 stringenc 组合跳过)

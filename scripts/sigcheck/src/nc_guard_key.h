@@ -2,8 +2,16 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* nc_guard_key.c 的对外接口：SHA-256 / HMAC / HKDF / APK 证书 DER / K_so 派生
- * 与 scripts/lib/so-section-lock.py 的派生规则逐字节一致（契约，改一侧必须同步另一侧）。 */
+/* so 段加密设施（全项目共用）的密钥派生接口：SHA-256 / HMAC / HKDF /
+ * APK 证书 DER / K_so / K_mac 派生。
+ * 与 scripts/lib/so-section-lock.py 的派生规则逐字节一致（契约，改一侧必须同步另一侧）。
+ *
+ * ⚠️ 2026-10-18 定位重构：文件名仍叫 nc_guard_key.c（改名会动冻结清单、牵连
+ * 回归测试，收益不抵风险），但它是【设施层】而非某个模块的私有代码：
+ *   第1层 段加密服务：本文件 + nc_guard_unlock.c + so-section-lock.py
+ *   第2层 通用标记器：so_section_mark.py（规则=函数头正则）
+ *   第3层 消费者：sigcheck 探针 / ncguard_probe / dex2c 转译产物 / 未来模块
+ */
 
 /* SHA-256（实现照抄 sig_check.c 已验证版本；此处只暴露不透明句柄） */
 typedef struct ksha_ctx_s ksha_ctx;

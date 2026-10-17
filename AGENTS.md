@@ -52,6 +52,7 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 | `scripts/sigcheck/src/nc_guard_unlock.c` | `.ncguard` 段运行期自解密(构建期锁箱见 `scripts/lib/so-section-lock.py`) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化;改动前必读 `docs/流程文档.md` §3.12 的 8 条审查点 |
 | `scripts/sigcheck/src/nc_guard_key.c` | HKDF-SHA256 + 证书 DER 提取(`k_so = HKDF(master, SHA256(certDER), info)` ) | 无调用方,是"HKDF 契约的可执行证明";sha256/hmac/hkdf 三组测试向量对拍过,勿重写密码学原语 |
 | `scripts/sigcheck/src/nc_guard_probe.c` | `.ncguard`/`.nckey` 两段的**唯一定义处**(`ncg_key_slot[80]` 就是 `.nckey` 段全部内容) | 改数组长度必须同步 `so-section-lock.py` 的 `assert len(blob)==80` 与 `nc_guard_unlock.c` 的 `NCG_SLOT_SIZE`——不一致在构建期即 AssertionError |
+| `scripts/lib/so_section_mark.py` | 通用段标记器(第2层设施):规则=函数头正则,零模块逻辑 | 新消费者接入前必读 `docs/流程文档.md` §3.12.1 的接入清单;改规则必须跑 `--check -v` 实测命中,不许只看正则可编译 |
 
 ### LSGS 密文机制约束(2026-10 新增,改 sig_check.c/env_check.c 前必读)
 
