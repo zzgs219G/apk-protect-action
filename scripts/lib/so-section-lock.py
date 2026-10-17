@@ -51,16 +51,22 @@ XOR_KEY = bytes([0x5A, 0xC3, 0x11, 0x9E, 0xF0, 0x37, 0xB2, 0x6D])  # 与 LSGS �
 #   HEAD_NAME    装 unlock 本体的段（ncg_head_unlock 及其私有函数）
 #   STUB_SLOT    stub 的密钥槽（.text 里的明文 stub 靠它解出 head）
 #   STUB_MAGIC   slot 前 8 字节，stub 判"是否已锁"用
-#   STUB_ENTRY   入口符号名——锁箱器要从 .symtab 读它的值算出 entry_delta
-# slot 布局（32 字节，与 nc_guard_boot.c 的 stub 逐字节一致）：
-#   [0:8)   magic NCSTUBLK
-#   [8:24)  wrapped k_stub = k_stub ^ XOR_KEY
-#   [24:28) head_size（.ncguard_head 段字节数，小端 u32）
-#   [28:32) entry_delta（入口符号 - 段起始偏移，小端 u32）
+# slot 布局（40 字节，与 nc_guard_boot.c 的 stub 逐字节一致）：
+#   [ 0: 8) magic NCSTUBLK
+#   [ 8:24) wrapped k_stub = k_stub ^ XOR_KEY
+#   [24:28) stub_sh_addr —— .nckey_stub 段自身的链接期虚拟地址
+#   [28:32) head_sh_addr —— .ncguard_head 段的链接期虚拟地址
+#   [32:36) head_size    —— .ncguard_head 段字节数
+#   [36:40) 预留（对齐与将来扩展）
+#
+# ⚠️ 2026-10-18 不存 entry_delta（入口符号 − 段起始偏移）：那需要从 .symtab
+# 读符号地址，而 NDK ndk-build 默认 strip 符号表（CI 39074690534 实测因此
+# fail-fast）。也不能靠"让 CI 不 strip"绕过——那会把 frida_port_probe /
+# xposed_maps_probe 等探针名暴露进符号表，等于泄露检测意图。
+# 改用 section header table：strip 只删 .symtab/.strtab，段表始终完整。
 HEAD_NAME = '.ncguard_head'
 STUB_SLOT = '.nckey_stub'
 STUB_MAGIC = b'NCSTUBLK'
-STUB_ENTRY = 'ncg_head_unlock'
 
 
 class ElfError(Exception):
@@ -115,34 +121,6 @@ class Elf:
         for s in self.sections:
             end = self._strtab.find(b'\x00', s['name_off'])
             s['name'] = self._strtab[s['name_off']:end].decode('utf-8', 'replace')
-
-        # 符号表（lock_head 需要它算 entry_delta：入口符号 - 段起始偏移）。
-        # 只取 FUNC/OBJECT 的 st_value，按符号名索引。
-        # .symtab 被 strip 过时 symbols 为空 —— lock_head 会 fail-fast 报错，
-        # 而不是拿一个错地址去锁（错地址 = 锁完 stub 找不到入口 = 起不来）。
-        self.symbols = {}
-        symtab = self.find('.symtab')
-        if symtab is not None:
-            strtab = self.find('.strtab')
-            if strtab is not None:
-                if self.is64:
-                    SY_FMT, SY_SIZE = '<IBBHQQ', 24
-                else:
-                    SY_FMT, SY_SIZE = '<IIIBBH', 16
-                n = symtab['size'] // SY_SIZE
-                names = bytes(self.data[strtab['offset']:strtab['offset'] + strtab['size']])
-                for i in range(n):
-                    off = symtab['offset'] + i * SY_SIZE
-                    f = struct.unpack_from(SY_FMT, self.data, off)
-                    st_name, st_value = f[0], f[-2]
-                    if st_name == 0 or st_name >= len(names):
-                        continue
-                    e = names.find(b'\x00', st_name)
-                    if e < 0:
-                        continue
-                    nm = names[st_name:e].decode('utf-8', 'replace')
-                    if nm:
-                        self.symbols[nm] = st_value
 
     def find(self, name: str):
         for s in self.sections:
@@ -494,14 +472,15 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
 
     这是"把开锁器锁进它开的那只箱子"的构建期半边：
       .ncguard_head（unlock 本体）← 用 k_stub 锁
-      .nckey_stub（stub 的槽）    ← 写 magic + wrapped_k_stub + head_size
-                                     + entry_delta，让明文 stub 能解它
+      .nckey_stub（stub 的槽）    ← 写 magic + wrapped_k_stub + stub/head 段
+                                     链接期地址 + head_size，让明文 stub 能解它
 
     k_stub 与 k_so 必须是两把钥匙：stub 只负责解 head，head 才负责解
     业务段。复用一把 = 解开 head 就等于拿到业务段的钥匙，分级失去意义。
 
-    entry_delta 从 .symtab 读 STUB_ENTRY 符号值减段起始得到——
-    明文 stub 靠 `&符号 - delta` 反推段起始地址，不需要读盘。
+    段地址取自 section header table（strip 只删 .symtab/.strtab，段表始终
+    完整）。明文 stub 靠 `&ncg_stub_slot(PC 相对) - stub_sh_addr` 算出镜像
+    基址，再加 head_sh_addr 定位 head 段 —— 全程不读盘、不碰符号表。
     """
     with open(so_path, 'rb') as f:
         raw = f.read()
@@ -529,18 +508,13 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
               % so_path, file=sys.stderr)
         return 1
 
-    # entry_delta：从符号表读入口符号的链接期地址
-    entry = elf.symbols.get(STUB_ENTRY)
-    if entry is None:
-        print('❌ 符号 %s 不在 .symtab —— 无法算 entry_delta。'
-              '请确认 so 未被 strip，且 nc_guard_boot.c 已编入。'
-              % STUB_ENTRY, file=sys.stderr)
-        return 1
-    entry_delta = entry - head['addr']
-    if entry_delta < 0 or entry_delta >= head['size']:
-        print('❌ entry_delta=%d 越界（段大小 %d）—— 符号不在 %s 内？'
-              % (entry_delta, head['size'], HEAD_NAME), file=sys.stderr)
-        return 1
+    # ⚠️ 2026-10-18 不再从 .symtab 读入口符号 —— NDK ndk-build 默认 strip
+    # 符号表，CI 39074690534 实测因此 fail-fast（"符号 ncg_head_unlock 不在
+    # .symtab"）。也不能靠"让 CI 不 strip"绕过：那会把 frida_port_probe /
+    # xposed_maps_probe 等探针名暴露进符号表，等于泄露检测意图。
+    # 改用【section header table】——strip 只删 .symtab/.strtab，段表始终完整。
+    # stub 侧靠 slot 里的 stub_sh_addr + 自身 PC 相对地址算出镜像基址，
+    # 再加 head_sh_addr 定位 head 段，全程不碰符号表。
 
     # k_stub：与 k_so 独立的第二把钥匙（hardcode 的理由同 master ——
     # 真正的盐是证书指纹，占位值公开不影响"换 key 重打包即失效"）
@@ -559,15 +533,20 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
 
     elf.data[head['offset']: head['offset'] + head['size']] = cipher
 
-    # stub 槽（32 字节）：magic(8) + wrapped(16) + head_size(4) + delta(4)
+    # stub 槽（40 字节）：magic(8) + wrapped_k_stub(16) + stub_sh_addr(4)
+    #                       + head_sh_addr(4) + head_size(4) + 预留(4)
+    # ⚠️ 全程用 section header table 的 sh_addr/size，不碰 .symtab（见上方注释）
     import struct as _s
     wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_stub))
     blob = (STUB_MAGIC + wrapped
+            + _s.pack('<I', slot['addr'])
+            + _s.pack('<I', head['addr'])
             + _s.pack('<I', head['size'])
-            + _s.pack('<I', entry_delta))
-    assert len(blob) == 32, 'stub blob %d != 32' % len(blob)
+            + _s.pack('<I', 0))
+    assert len(blob) == 40, 'stub blob %d != 40' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nckey_stub 段需为 32 字节）' \
+        'blob %d != slot size %d（.nckey_stub 段需扩到 40 字节；' \
+        '改 nc_guard_boot.c 的 NCG_STUB_SIZE 必须同步这里）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
 
@@ -576,9 +555,10 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
 
     print('✅ 二级锁箱: %s → %s' % (so_path, out_path))
     print('   段 %s: %d 字节已加密（unlock 本体）' % (HEAD_NAME, head['size']))
-    print('   密钥槽 %s: %d 字节（magic + wrapped_k_stub + size + delta）'
+    print('   密钥槽 %s: %d 字节（magic + wrapped_k_stub + stub/head addr + size）'
           % (STUB_SLOT, len(blob)))
-    print('   入口符号 %s: delta=0x%x' % (STUB_ENTRY, entry_delta))
+    print('   段地址: stub=0x%x head=0x%x size=0x%x（取自 section header table）'
+          % (slot['addr'], head['addr'], head['size']))
     print('   ⚠️ 静态视角：unlock 本体已不可读，只剩明文 stub')
     return 0
 

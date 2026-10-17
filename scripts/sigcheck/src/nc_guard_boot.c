@@ -56,7 +56,7 @@
 #define NCG_SLOT_MAGIC   "NCKEYLOCK"
 #define NCG_STUB_MAGIC   "NCSTUBLK"
 #define NCG_SLOT_SIZE    80
-#define NCG_STUB_SIZE    32
+#define NCG_STUB_SIZE    40
 
 static const uint8_t NCG_XOR_KEY[8] =
         {0x5A, 0xC3, 0x11, 0x9E, 0xF0, 0x37, 0xB2, 0x6D};
@@ -218,11 +218,22 @@ int ncg_head_unlock(void) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* stub 的密钥槽：由 so-section-lock.py 在锁箱时写入
- *   [0:8)   magic "NCSTUBLK"
- *   [8:24)  wrapped k_stub = k_stub ^ XOR_KEY（16 字节）
- *   [24:28) head_size（.ncguard_head 段字节数）
- *   [28:32) entry_delta（ncg_head_unlock 距段起始的偏移）
- * retain + used：防 --gc-sections 回收；const volatile 避免 W+X PT_LOAD。 */
+ *   [ 0: 8) magic "NCSTUBLK"
+ *   [ 8:24) wrapped k_stub = k_stub ^ XOR_KEY（16 字节）
+ *   [24:28) stub_slot_sh_addr —— .nckey_stub 自身的链接期虚拟地址
+ *   [28:32) head_sh_addr      —— .ncguard_head 段的链接期虚拟地址
+ *   [32:36) head_size         —— .ncguard_head 段字节数
+ *   [36:40) 预留（对齐与将来扩展）
+ *
+ * ⚠️ 2026-10-18 为什么不存 entry_delta（入口符号 − 段起始偏移）：
+ *   那需要从 .symtab 读符号地址，而 NDK ndk-build 默认 strip 符号表
+ *   （CI 39074690534 实测：lock_head 报「符号 ncg_head_unlock 不在
+ *   .symtab」→ protect.sh exit 1 → 构建失败）。
+ *   也不能靠"让 CI 不 strip"绕过——那会把 frida_port_probe /
+ *   xposed_maps_probe 等探针名暴露进符号表，等于泄露检测意图。
+ *   改用【段头信息】推导：strip 只删 .symtab/.strtab，section header
+ *   table 始终完整，段地址与段大小照样拿得到。
+ *   镜像基址 = &ncg_stub_slot(运行期, PC 相对) − stub_slot_sh_addr(链接期) */
 __attribute__((section(NCG_STUB_SLOT), used, aligned(1), retain))
 static const volatile unsigned char ncg_stub_slot[NCG_STUB_SIZE] = {0};
 
@@ -253,14 +264,22 @@ static void ncg_stub_recover(void) {
     uint8_t k[16];
     for (int i = 0; i < 16; i++) k[i] = (uint8_t)(slot[8 + i] ^ NCG_XOR_KEY[i & 7]);
 
-    uint32_t head_size  = ncg_rd32(slot + 24);
-    uint32_t entry_delta = ncg_rd32(slot + 28);
-    if (head_size == 0 || head_size > (64u << 20)) return;   /* 合理性守卫 */
+    uint32_t stub_sh_addr = ncg_rd32(slot + 24);
+    uint32_t head_sh_addr = ncg_rd32(slot + 28);
+    uint32_t head_size    = ncg_rd32(slot + 32);
 
-    /* 段起始 = 入口符号运行期地址 - 入口在段内偏移。
-     * &ncg_head_unlock 由编译器生成 PC 相对引用，运行期天然正确。 */
-    extern int ncg_head_unlock(void);
-    uint8_t *start = (uint8_t *)(uintptr_t)&ncg_head_unlock - entry_delta;
+    /* 合理性守卫：任一为 0 或段大小荒谬 → 视为未锁/损坏，直接放弃 */
+    if (head_size == 0 || head_size > (64u << 20)
+        || stub_sh_addr == 0 || head_sh_addr == 0) return;
+
+    /* 镜像基址 = slot 自身运行期地址 − slot 链接期地址。
+     * &ncg_stub_slot 由编译器生成 PC 相对引用（adr/add），运行期天然正确，
+     * 且该符号是 static —— strip .symtab 不影响它的可链接性（本地编译产物
+     * 里 nm 看不到它，但代码照常引用）。这是绕开"符号表被 strip"的关键。 */
+    uintptr_t base = (uintptr_t) &ncg_stub_slot - stub_sh_addr;
+
+    /* head 段起始 = 基址 + head 段链接期虚拟地址 */
+    uint8_t *start = (uint8_t *)(base + head_sh_addr);
 
     uintptr_t ps = getpagesize();
     uintptr_t s = (uintptr_t) start & ~(ps - 1);
