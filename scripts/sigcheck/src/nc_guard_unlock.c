@@ -143,6 +143,16 @@ int ncguard_unlock(void) {
         return 0;   /* 未锁，无需解锁 */
     }
 
+    /* ⚠️ 内存级幂等：本函数可能被调用两次（Java 侧 NcLink.selftest() 与
+     * env_check_entry 的 constructor 各一次）。此前靠 pwrite 擦磁盘 magic
+     * 来防重入，但那会破坏 MAP_PRIVATE 的 .text 映射导致 SIGILL（见下方
+     * 注释）。改用 static 标志：已解锁过就直接返回 0。
+     * 进程内有效；跨进程由磁盘 magic 天然保证（新进程读到的还是密文）。 */
+    static int ncg_unlocked = 0;
+    if (ncg_unlocked) {
+        return 0;
+    }
+
     uint8_t key[16];
     ncg_recover_key(slotdata, key);
 
@@ -161,25 +171,22 @@ int ncguard_unlock(void) {
     memset(key, 0, sizeof(key));
     memset(slotdata, 0, 16);
 
-    /* ⚠️ 必须把"已解锁"状态回写磁盘：否则第二次调本函数时又会从磁盘读到
-       完好 magic → 再解密一次 → 而 .ncguard 此刻已是明文 → 双重 RC4 把它
-       变回密文 → 调用密文代码 = SIGILL（2026-10-17 实测踩过：第一次 59
-       成功，第二次 Illegal instruction）。
-       做法：以可写方式重开 so，把 slot 前 16 字节（magic）清零。
-       失败不致命（只失去幂等性），故不返回错误。 */
-    {
-        int wfd = open(so_path, O_WRONLY);
-        if (wfd >= 0) {
-            uint8_t zero[16] = {0};
-            ssize_t wr = pwrite(wfd, zero, 16, slot.sh_offset);
-            (void) wr;                     /* 只写 magic；wrapped 留作取证 */
-            close(wfd);
-        }
-    }
+    /* ⚠️ 不要在运行时 pwrite 回写磁盘 slot！
+     * 2026-10-17 真机实测：解锁成功后 pwrite 清零磁盘 magic 后，进程随即
+     * SIGILL（PC 0x958c 落在 .text 尾部，ILL_ILLOPC）。根因是 so 的 .text
+     * 是 MAP_PRIVATE 文件映射，pwrite 修改被映射文件会让同页映射失效/数据
+     * 不一致 —— 而 .ncguard 与 .text 尾部共享同一页（0x95f4 起，页首 0x9000
+     * 含 104 字节 .text），于是 .text 被连带破坏。
+     * 幂等改由 nc_guard_jni.c 的原子守门（ncg_selftest_done）保证；
+     * 本函数不再碰磁盘。slot 里的 wrapped 密钥留在磁盘也无妨 —— 它是密文，
+     * 且 cert 绑定后换 key 重打包即失效。 */
+    memset(key, 0, sizeof(key));
+    memset(slotdata, 0, 16);
 
     __builtin___clear_cache((char *)target, (char *)(target + sec.sh_size));
 
     if (ncg_page_mprotect(target, target + sec.sh_size,
                           PROT_READ | PROT_EXEC) != 0) return -10;
+    ncg_unlocked = 1;
     return 0;
 }
