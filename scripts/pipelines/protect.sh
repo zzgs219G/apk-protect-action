@@ -351,14 +351,21 @@ fi
 # 已收 *.c，nc_guard_unlock.c 放 jni/nc/ 或 jni/ 根都会被编译进 libnc.so。
 # 它无主动执行逻辑，由调用方在需要时调 ncguard_unlock()。
 # 布局对齐：联合(dex2c)方案源码在 jni/nc/，单独 sigcheck/envcheck 在 jni/ 根。
+# ⚠️ nc_guard_key.c 必须一起拷：2026-12 加 MAC 校验后，nc_guard_unlock.c
+#    include 了 nc_guard_key.h 并调 khmac_sha256()。漏拷 = 直接编译失败
+#    （不是运行期报错，是 ndk-build 就红，fail-fast 反而是好事）。
 if [[ -d "$WORK/project/jni/nc" ]]; then
   cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"    "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"    "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"    "$WORK/project/jni/nc/"
 else
   cp "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c"  "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"    "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"    "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"    "$WORK/project/jni/"
 fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc
 

@@ -10,6 +10,16 @@
 编译瘦身，没有任何一层作用在【函数体可读性】上。XopProtector 的
 .bitcode 自解密段是业界成熟做法，本脚本是其"锁箱"半边的等价实现。
 
+2026-12 第二版追加 HMAC 完整性校验（.ncguard 从"改坏"升级为"检测到"）：
+  对【密文】算 HMAC-SHA256，密钥用独立的 mac 域（label "nc-so-mac-v1"，
+  绝不复用 so 域——复用等于"知道 RC4 密钥就能伪造 MAC"，校验形同虚设）。
+  .nckey slot 布局（80 字节，改这里必须同步 C 侧 nc_guard_unlock.c）：
+    [0:16]  magic        'NCKEYLOCK' + 7 个 0
+    [16:32] wrapped_k_so   k_so ^ XOR_KEY
+    [32:48] wrapped_k_mac  k_mac ^ XOR_KEY
+    [48:80] expect_mac     HMAC-SHA256(k_mac, 密文)
+  前 32 字节布局与旧版完全一致 → 旧 C 侧开箱代码仍能解出 k_so。
+
 与 XopProtector 的对应关系（照抄逻辑、改名以清晰）：
   Xop: PROTECTOR_ENCRYPT 宏 → SECTION(".bitcode")        本: __attribute__((section(SECTION_NAME)))
   Xop: packer/SoSectionEncryptor.java (Java + Gradle)    本: 本脚本 (Python，protect.sh 可直接调)
@@ -143,10 +153,16 @@ def hmac_sha256(key: bytes, msg: bytes) -> bytes:
 
 
 def derive_app_keys(master: bytes, cert_sha256: bytes, package: str) -> dict:
-    """HKDF 派生四把域密钥（label 规则与 Xop 一致，便于日后对拍）。"""
+    """HKDF 派生五把域密钥（label 规则与 Xop 一致，便于日后对拍）。
+
+    2026-12 追加 mac 域：它只参与"密文段是否被改过"的 HMAC 计算，
+    绝不能与 so 域复用同一把钥匙——复用等于把 MAC 降级成"知道 RC4 密钥
+    就能伪造"，完整性校验形同虚设。域分隔靠 label 前缀，convention 同 Xop。
+    """
     out = {}
     for label, dom in (('nc-dex-v1', 'dex'), ('nc-insn-v1', 'insn'),
-                       ('nc-so-v1', 'so'), ('nc-warm-v1', 'warm')):
+                       ('nc-so-v1', 'so'), ('nc-warm-v1', 'warm'),
+                       ('nc-so-mac-v1', 'mac')):
         info = (label + package).encode('utf-8')
         out[dom] = hkdf_sha256(master, cert_sha256, info, 16)
     return out
@@ -379,27 +395,43 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
                        '密文可被公开脚本解开）')
     keys = derive_app_keys(b'\x11' * 32, cert, package or '')
     k_so = keys['so']
+    k_mac = keys['mac']          # 2026-12 完整性校验专用，与 so 域硬分隔
 
     plain = bytes(elf.data[sec['offset']: sec['offset'] + sec['size']])
     cipher = rc4(k_so, plain)
+
+    # 期望 MAC 对【密文】算，不对明文算：密文在解密前就可读，于是可以
+    # "先验后解" —— 一旦被改过，根本不会把明文装进 .ncguard（fail-closed）。
+    # 若对明文算，就必须先解密再验，篡改的明文已经落盘生效，晚一步。
+    # 另一个理由是 RC4 是流密码：改密文 1 位恰好只翻明文 1 位，未必崩溃，
+    # 攻击者可以"改一位→跑→看行为"做廉价 oracle；MAC 让这种试探第一次就暴露。
+    expect_mac = hmac_sha256(k_mac, cipher)
 
     if dry:
         print('[dry-run] 段 %s: %d 字节 → %d 字节（size-preserving=%s）'
               % (section, len(plain), len(cipher), len(plain) == len(cipher)))
         print('[dry-run] 密钥（hex）: %s' % k_so.hex())
+        print('[dry-run] mac 域（hex）: %s' % k_mac.hex())
+        print('[dry-run] 期望 MAC（hex，对密文算）: %s' % expect_mac.hex())
         print('[dry-run] 未写文件')
         return 0
 
     # 写回密文（原地，长度不变）
     elf.data[sec['offset']: sec['offset'] + sec['size']] = cipher
 
-    # 密钥槽：magic(16) + wrapped(16) = 32 字节，正好填满 .nckey 段（32B）
+    # 密钥槽：magic(16) + wrapped_k_so(16) + wrapped_k_mac(16) + expect_mac(32)
+    #          = 80 字节，.nckey 段必须同步扩到 80（否则 assert 炸）
     # ⚠️ 切片窗口必须与 blob 等长：elf.data[a:b] = blob 若 len(blob) > b-a，
     # Python 会【插入】而非覆盖，把后续字节（段表/相邻段）顶坏。本人踩过。
+    # 布局保持 magic+wrapped_k_so 在前 32 字节【不变】——2026-12 之前的 C 侧
+    # ncg_recover_key() 正是从 offset 16 读 k_so 的，向前兼容。
     wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_so))
-    blob = SLOT_MAGIC + wrapped
+    wrapped_mac = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_mac))
+    blob = SLOT_MAGIC + wrapped + wrapped_mac + expect_mac
+    assert len(blob) == 80, 'blob %d != 80' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d' % (len(blob), slot['size'])
+        'blob %d != slot size %d（.nckey 段需扩到 80；改了一侧必须同步另一侧）' \
+        % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
 
     with open(out_path, 'wb') as f:

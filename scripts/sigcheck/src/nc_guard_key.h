@@ -30,3 +30,12 @@ int ncg_apk_first_cert_der(const char *apk_path, uint8_t *der, size_t der_cap,
 /* k_so = HKDF-SHA256(ikm=master, salt=SHA256(certDER), info="nc-so-v1"+pkg, 16) */
 int ncg_derive_k_so(const uint8_t master[32], const uint8_t cert_sha256[32],
                     const char *pkg, uint8_t out[16]);
+
+/* k_mac = HKDF-SHA256(..., info="nc-so-mac-v1"+pkg, 16)
+ * 2026-12 完整性校验专用域，只参与 .ncguard 密文的 HMAC 计算。
+ * ⚠️ 与 k_so 必须用不同 label —— 复用同一把钥匙等于"知道 RC4 密钥就能
+ * 伪造 MAC"，校验形同虚设。改 label 必须同步 so-section-lock.py 的
+ * derive_app_keys()（本轮已用真证书对拍验证两侧逐字节一致）。
+ * 当前无调用方（unlock 走 slot 里的 wrapped_k_mac），它是契约证明。 */
+int ncg_derive_k_mac(const uint8_t master[32], const uint8_t cert_sha256[32],
+                     const char *pkg, uint8_t out[16]);

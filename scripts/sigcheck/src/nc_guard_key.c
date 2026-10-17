@@ -266,3 +266,17 @@ int ncg_derive_k_so(const uint8_t master[32],const uint8_t cert_sha256[32],
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
     return 0;
 }
+
+/* ── 派生 K_mac（与 so-section-lock.py 的 derive_app_keys['mac'] 一致）──
+ * k_mac = HKDF-SHA256(ikm=master, salt=SHA256(certDER), info="nc-so-mac-v1"+pkg, 16)
+ * 2026-12 完整性校验专用：只参与 .ncguard 密文的 HMAC 计算，绝不与 so 域复用
+ * 同一把钥匙（复用 = 知道 RC4 密钥即可伪造 MAC，校验形同虚设）。 */
+int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
+                     const char *pkg,uint8_t out[16]){
+    if(!master||!cert_sha256||!pkg||!pkg[0]||!out) return -1;
+    uint8_t info[128]; size_t n=0;
+    memcpy(info,"nc-so-mac-v1",12); n=12;
+    { size_t l=strlen(pkg); if(l>sizeof info-13) l=sizeof info-13; memcpy(info+n,pkg,l); n+=l; }
+    khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
+    return 0;
+}

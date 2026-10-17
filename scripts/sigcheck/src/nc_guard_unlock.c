@@ -23,10 +23,28 @@
 #include <sys/stat.h>
 #include <dlfcn.h>
 
+#include "nc_guard_key.h"   /* khmac_sha256：完整性校验用，见下方 -11 分支 */
+
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一处 ── */
 #define NCG_SECTION   ".ncguard"
 #define NCG_SLOT      ".nckey"
 #define NCG_SLOT_MAGIC "NCKEYLOCK"
+#define NCG_SLOT_SIZE  80    /* magic(16)+wrapped_k_so(16)+wrapped_k_mac(16)+expect_mac(32) */
+
+/* .nckey slot 布局（2026-12，与 so-section-lock.py 文件头的图逐字节一致）：
+ *   [ 0:16) magic NCKEYLOCK
+ *   [16:32) k_so  ^ XOR_KEY
+ *   [32:48) k_mac ^ XOR_KEY   ← 本轮新增
+ *   [48:80) expect_mac        ← HMAC-SHA256(k_mac, 密文)
+ * ⚠️ 关于"向后兼容"的诚实口径：so-section-lock.py 的 lock() 有
+ *   assert len(blob) == slot['size']，所以 .nckey 只有 32 字节的旧 so
+ *   会在【构建期】就直接 AssertionError 失败，根本产不出工件。
+ *   因此下面 have_mac 的降级分支在正常流水线下不可达——它保留是
+ *   defense-in-depth：防手工构造/裁剪过的畸形 so 把 .nckey 之后 48 字节
+ *   （那是别的段的数据）当成期望 MAC，从而误判 -11 把自己锁死。 */
+#define NCG_OFF_K_MAC   32
+#define NCG_OFF_EXPMAC  48
+
 static const uint8_t NCG_XOR_KEY[8] =
         {0x5A, 0xC3, 0x11, 0x9E, 0xF0, 0x37, 0xB2, 0x6D};
 
@@ -132,16 +150,20 @@ int ncguard_unlock(void) {
     if (sec.sh_size == 0) return -4;
     if ((sec.sh_flags & SHF_ALLOC) == 0) return -5;
 
-    /* slot 校验：magic 必须匹配，否则视为未锁/已解锁（幂等返回 0） */
-    uint8_t slotdata[32];
+    /* slot 校验：magic 必须匹配，否则视为未锁/已解锁（幂等返回 0）
+     * 读 80 字节（新版布局）；旧版 so 的 .nckey 只有 32 字节 → pread 只回
+     * 32，下面走"跳过 MAC"降级路径（旧槽没有 k_mac/expect_mac 可验）。 */
+    uint8_t slotdata[NCG_SLOT_SIZE];
+    memset(slotdata, 0, sizeof(slotdata));
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return -6;
-    ssize_t got = pread(fd, slotdata, 32, slot.sh_offset);
+    ssize_t got = pread(fd, slotdata, sizeof(slotdata), slot.sh_offset);
     close(fd);
-    if (got != 32) return -7;
+    if (got < 32) return -7;
     if (memcmp(slotdata, NCG_SLOT_MAGIC, strlen(NCG_SLOT_MAGIC)) != 0) {
         return 0;   /* 未锁，无需解锁 */
     }
+    int have_mac = (got >= NCG_SLOT_SIZE) && (slot.sh_size >= NCG_SLOT_SIZE);
 
     /* ⚠️ 内存级幂等：本函数可能被调用两次（Java 侧 NcLink.selftest() 与
      * env_check_entry 的 constructor 各一次）。此前靠 pwrite 擦磁盘 magic
@@ -157,6 +179,33 @@ int ncguard_unlock(void) {
     ncg_recover_key(slotdata, key);
 
     uint8_t *target = (uint8_t *)base + sec.sh_addr;
+
+    /* ── 完整性校验：先验后解（2026-12 追加）───────────────────────
+     * 对【内存里的密文】算 HMAC-SHA256，与 slot 里的期望值逐字节比。
+     * 位置刻意选在 mprotect/解密【之前】：一旦不符，.ncguard 一个字都
+     * 不会被改动 → 段保持密文状态 → 后续调用踩密文 = SIGILL（fail-closed）。
+     * 若放到解密之后，篡改的明文已经生效，晚一步。
+     * 为什么值得做：RC4 是流密码，改密文 1 位只翻明文 1 位，未必崩溃；
+     * 没有 MAC 时攻击者可以"改一位→跑→看行为"做廉价 oracle，把 4012
+     * 字节反推出来。有了 MAC，第一次试探就暴露，且暴露方式是"整段失效"。
+     * 恒定时间比较：防时序侧信道（不提前退出的 memcmp 自己写）。 */
+    if (have_mac) {
+        uint8_t k_mac[16], got_mac[32];
+        for (int i = 0; i < 16; i++)
+            k_mac[i] = (uint8_t)(slotdata[NCG_OFF_K_MAC + i] ^ NCG_XOR_KEY[i & 7]);
+        khmac_sha256(k_mac, 16, target, sec.sh_size, got_mac);
+        const uint8_t *want = slotdata + NCG_OFF_EXPMAC;
+        uint8_t diff = 0;
+        for (int i = 0; i < 32; i++) diff |= (uint8_t)(got_mac[i] ^ want[i]);
+        memset(k_mac, 0, sizeof(k_mac));
+        memset(got_mac, 0, sizeof(got_mac));
+        if (diff != 0) {
+            /* -11 = 密文段被改过（或密钥与密文不匹配）。
+             * 不解密、不动 mprotect —— 段保持密文，调用方拿到可判读的码。 */
+            memset(key, 0, sizeof(key));
+            return -11;
+        }
+    }
 
     if (ncg_page_mprotect(target, target + sec.sh_size,
                           PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return -8;

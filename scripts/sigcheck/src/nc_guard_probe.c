@@ -28,9 +28,14 @@
  * .rodata（只读），运行时再 mprotect 改写。
  * ⚠️ retain 不可省：lib-ndk.sh 的 LOCAL_LDFLAGS 含 -Wl,--gc-sections，
  * 无引用的段会被当死代码连段一起回收（2026-10-17 CI 实测踩过：
- * .ncguard 整个消失在 so 的段表里）。 */
+ * .ncguard 整个消失在 so 的段表里）。
+ * ⚠️ 数组长度 80 = 锁箱侧 slot blob 长度（so-section-lock.py：magic16 +
+ * wrapped_k_so16 + wrapped_k_mac16 + expect_mac32）。这个数组【就是
+ * .nckey 段的全部内容】—— 长度不一致时 Python 的
+ * assert len(blob)==slot['size'] 会当场炸，属好消息；
+ * 坏消息是它只在跑过锁箱后才暴露，所以改一侧必须立刻改另一侧。 */
 __attribute__((section(".nckey"), used, aligned(1), retain))
-static const volatile unsigned char ncg_key_slot[32] = {0};
+static const volatile unsigned char ncg_key_slot[80] = {0};
 
 /* ── 被锁的业务逻辑：只有解锁后才能调用 ────────────────────────────
  * 用法：调用方必须先 ncguard_unlock() 成功，再调本函数。
