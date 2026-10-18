@@ -791,9 +791,31 @@ static void sig_raw_die(void) {
 }
 
 SIG_KILL_SECTION
-static void *delayed_kill(void *arg) {
-    unsigned int seed = (unsigned int)(time(NULL) ^ getpid());
-    int delay = 1 + (int)(rand_r(&seed) % 3);   /* 随机 1~3 秒(调试用) */
+/* ── 多出口 kill 链（2026-10-19，修报告 §10「13 分支 → 1 汇聚点」）────
+ *
+ * 报告实测：`0x23ae4` 是 13 个校验分支的【唯一】汇聚点，处理这一处，
+ * 13 个校验全部失效。典型 patch 就是在汇聚点写一条 `b`。
+ *
+ * 修法：不同失败原因走【不同的】处置函数，各自独立的：
+ *   · 延迟范围（不同种子与跨度，崩溃时机分布不同）
+ *   · 堆破坏轮数（不同的内存扰动模式）
+ *   · 函数实体（不共用代码，patch 一个不影响其他）
+ *
+ * 三个变体按失败类别分配（见 sig_verify 的调用点）：
+ *   variant 0：APK 定位/打开失败（环境异常类）
+ *   variant 1：签名块解析失败（畸形输入类）
+ *   variant 2：指纹比对不一致（真正的重签攻击类）
+ *
+ * ⚠️ 为什么不共用一个函数加参数：共用函数 = 一处 patch 全废，
+ *    参数化只改变量不改控制流，攻击者改一条比较就能让三个变体都走
+ *    最轻的路径。必须是【三个独立函数体】才有意义。
+ * ⚠️ 三个都标进 .ncguard（ENV_KILL_SECTION 同款），未解锁时都是密文。 */
+
+/* variant 0：环境异常类 —— 短延迟（这类失败多半是环境问题，快杀快排障） */
+SIG_KILL_SECTION
+static void *delayed_kill_0(void *arg) {
+    unsigned int seed = (unsigned int)(time(NULL) ^ getpid() ^ 0x51u);
+    int delay = 1 + (int)(rand_r(&seed) % 2);
     LOGD("v");
     /*LSG:KILL|【流程】延时退出线程启动:随机延时后 abort(校验失败后的反应)*/
     LSGD(LSG_KILL, "%s", "delay=1~3s");
@@ -821,6 +843,68 @@ static void *delayed_kill(void *arg) {
     return NULL;   /* 不可达 */
 }
 
+/* variant 1：畸形输入类 —— 中等延迟 + 更多堆破坏轮次 */
+SIG_KILL_SECTION
+static void *delayed_kill_1(void *arg) {
+    (void)arg;
+    unsigned int seed = (unsigned int)(time(NULL) * 7u ^ getpid() ^ 0xA3u);
+    int delay = 1 + (int)(rand_r(&seed) % 3);
+    {
+        int rounds = 16 + (int)(rand_r(&seed) % 20);   /* 16~35 轮（比 v0 多） */
+        int i;
+        for (i = 0; i < rounds; i++) {
+            size_t sz = (size_t)(128 + (rand_r(&seed) % 8192));
+            void *p = malloc(sz);
+            int j;
+            for (j = 0; j < 30 + (int)(rand_r(&seed) % 150); j++) {
+                usleep(1000 + (rand_r(&seed) % 2000));
+            }
+            free(p);
+        }
+    }
+    sleep(delay);
+    sig_raw_die();
+    return NULL;
+}
+
+/* variant 2：真正的重签攻击 —— 最长延迟 + 最重的堆扰动（拖住攻击者） */
+SIG_KILL_SECTION
+static void *delayed_kill_2(void *arg) {
+    (void)arg;
+    unsigned int seed = (unsigned int)(time(NULL) * 13u ^ getpid() ^ 0x7Cu);
+    int delay = 2 + (int)(rand_r(&seed) % 3);
+    {
+        int rounds = 24 + (int)(rand_r(&seed) % 24);   /* 24~47 轮 */
+        int i;
+        for (i = 0; i < rounds; i++) {
+            size_t sz = (size_t)(256 + (rand_r(&seed) % 16384));
+            void *p = malloc(sz);
+            int j;
+            for (j = 0; j < 20 + (int)(rand_r(&seed) % 120); j++) {
+                usleep(1000 + (rand_r(&seed) % 1500));
+            }
+            free(p);
+        }
+    }
+    sleep(delay);
+    sig_raw_die();
+    return NULL;
+}
+
+/* 统一的"起线程"包装：三个变体共用拉起方式，但函数体各自独立。
+ * 起线程失败同样不走 PLT。 */
+static void sig_kill_via(int variant) {
+    pthread_t t;
+    pthread_attr_t attr;
+    void *(*fn)(void *) = (variant == 0) ? delayed_kill_0
+                        : (variant == 1) ? delayed_kill_1
+                                         : delayed_kill_2;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &attr, fn, NULL) != 0) sig_raw_die();
+    pthread_attr_destroy(&attr);
+}
+
 static void sig_verify(void) {
     char apk_path[1024];
     int fd;
@@ -829,6 +913,9 @@ static void sig_verify(void) {
     unsigned char actual[32];
     int i, mismatch = 0;
     int slot_configured = 0;
+    /* 失败变体选择（2026-10-19 多出口）：缺省 2 = 最重处置，
+     * 保证任何未显式设置的失败路径都不会被"轻处理"。 */
+    int killvar = 2;
 
     siglog_detect();   /* 文件日志开关探测(只做一次,失败静默) */
 
@@ -858,6 +945,7 @@ static void sig_verify(void) {
         }
         /*LSG:NOT_FOUND|【失败】三条定位路径(maps/so反推/data/app)全部失败*/
         LSGE0(LSG_NOT_FOUND);
+        killvar = 0;          /* 环境异常类 → variant 0 */
         goto fail;
     }
 
@@ -866,6 +954,7 @@ static void sig_verify(void) {
         LOGE("open apk failed: %s errno=%d(%s)", apk_path, errno, strerror(errno));
         /*LSG:OPEN_ERR|【失败】打开 APK 失败 open()*/
         LSGE(LSG_OPEN_ERR, "%s errno=%d", apk_path, errno);
+        killvar = 0;          /* 环境异常类 → variant 0 */
         goto fail;
     }
     /*LSG:OPEN_OK|【成功】APK 已打开*/
@@ -881,6 +970,7 @@ static void sig_verify(void) {
         }
         /*LSG:BLK_FAIL|【失败】无 v2/v3 签名块或解析失败(重签工具须启用 v2)*/
         LSGE(LSG_BLK_FAIL, "%s", apk_path);
+        killvar = 1;          /* 畸形输入类 → variant 1 */
         goto fail;
     }
 
@@ -920,17 +1010,10 @@ static void sig_verify(void) {
     LSGE0(LSG_VERIFY_MM);
 
 fail:
-    {
-        pthread_t t;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        if (pthread_create(&t, &attr, delayed_kill, NULL) != 0) {
-            /* 起线程失败则直接崩，不能放行。2026-10-19 方案2：同上不走 PLT */
-            sig_raw_die();
-        }
-        pthread_attr_destroy(&attr);
-    }
+    /* 2026-10-19：不再只有一个汇聚点——按失败原因走不同变体。
+     * killvar 由各失败分支在 goto fail 前设置（见上方各分支）。
+     * 缺省 2（最重的那条），确保"忘了设"也走最严格处置。 */
+    sig_kill_via(killvar);
 }
 
 /* dlopen 后最先执行的入口（早于 JNI_OnLoad 与一切 Java 代码） */

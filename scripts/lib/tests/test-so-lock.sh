@@ -22,6 +22,7 @@
 #   T10 kill 逻辑进加密段（env_delayed_kill 落在 .ncguard 内且不可反汇编）
 #   T11 master 已随机化（0x11×32 明文零命中）★ 2026-10-19
 #   T12 master 藏在密文段（.ncguard_head_ro 内容每次构建不同、非全零）
+#   T13 kill 链多出口（三个独立函数体，非共用；全在加密段）★ 2026-10-19
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -271,6 +272,23 @@ PYT12
     fi
 else
     bad "T12 缺 .ncguard_head_ro 段 —— master 无处存放"
+fi
+
+# ── T13 kill 链必须是多个【独立函数体】──────────────────────
+# 报告 §10：13 个校验分支 → 1 个汇聚点，patch 一处全废。
+# 本项断言 delayed_kill_0/1/2 三个符号存在且【地址互不相同】
+# （共用函数体 = 参数化 = 攻击者改一条比较即可让三者同时失效）。
+k0=$(nm libnc.so 2>/dev/null | awk '/delayed_kill_0$/{print $1}')
+k1=$(nm libnc.so 2>/dev/null | awk '/delayed_kill_1$/{print $1}')
+k2=$(nm libnc.so 2>/dev/null | awk '/delayed_kill_2$/{print $1}')
+if [ -n "$k0" ] && [ -n "$k1" ] && [ -n "$k2" ]; then
+    if [ "$k0" != "$k1" ] && [ "$k1" != "$k2" ] && [ "$k0" != "$k2" ]; then
+        ok "T13 kill 链多出口（3 个独立函数体 @0x$k0/0x$k1/0x$k2）"
+    else
+        bad "T13 kill 变体共用同一函数体（参数化 = 一处 patch 全废）"
+    fi
+else
+    skip "T13 本组合未编入 sig_check.c，跳过"
 fi
 
 # ── T4/T5 运行期：需构造 fake Android 环境 ──
