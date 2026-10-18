@@ -27,6 +27,8 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <errno.h>
+#include <signal.h>     /* 2026-10-19 方案2：SIGABRT（sig_raw_die 用） */
+#include <sys/syscall.h> /* __NR_tgkill / gettid */
 #include <android/log.h>
 
 #include "sig_hash.h"
@@ -704,6 +706,89 @@ static void derive_expected(const unsigned char actual[32], unsigned char out[32
  *   delay = 90 + rand_r(&seed) % 180
  *   (通用格式: 下限 + rand_r(&seed) % 跨度, 跨度=上限-下限+1)
  * ⚠️ 发布前记得改回大延时,否则 hook 绕过成本大幅下降。 */
+/* ── kill 链进加密段（2026-10-19 方案4）────────────────────────────
+ *
+ * 与 env_check.c 的 env_delayed_kill 同一策略：把真正的处置逻辑标进
+ * .ncguard 密文段，让攻击者【找不到】它，而不是改成静默污染
+ * （那需要业务语义知识，无法对任意 APK 通用）。
+ *
+ * 实测报告 §12.1 的绕过路径是"改 3 个 PLT 桩废掉 380 个调用点"。
+ * 本方案把 kill 函数藏进密文段后，静态搜 abort@plt 的引用只能看到
+ * "某处 bl 进了一段解不开的东西"。
+ *
+ * ⚠️ 时序前提：delayed_kill 只在 sig_verify 判定失败后被 pthread_create
+ *    拉起，而 sig_verify 由 sig_check_entry(constructor) 调用；解锁入口
+ *    ncg_auto_unlock 是 constructor(50)，优先级早于默认 constructor ——
+ *    所以线程真正执行到本函数时，段必定已是明文。已实测 selftest=59 通过。
+ * ⚠️ 条件化：SIGCHECK_HOST_TEST 下不标段（宿主没有解锁设施）。
+ * ⚠️ 本函数是【被调用方】，调用方 sig_verify/sig_check_entry 不标段
+ *    （它们是 unlock 的使用者，标进去会导致"解锁前就要调用密文"）。 */
+#if defined(NC_GUARD_SECTIONED) && !defined(SIGCHECK_HOST_TEST)
+#  define SIG_KILL_SECTION __attribute__((section(".ncguard"), retain, used, noinline))
+#else
+#  define SIG_KILL_SECTION
+#endif
+
+/* ── 不依赖 PLT 的强制终止（2026-10-19 方案2，本文件自带一份）────────
+ *
+ * 为什么不复用 env_check.c 的 env_raw_die：**sigcheck-only 组合下
+ * env_check.c 不参与编译**（protect.sh 的拷贝清单里只有 env_check 勾选时
+ * 才拷它）。跨文件依赖会让"只勾签名校验"直接链接失败。
+ * 为什么用 static：两个文件同时参与编译时（sigcheck+envcheck）会各自
+ * 有一份 static 副本，互不冲突，也不导出符号扩大攻击面。多 100 字节
+ * 代码换"任何组合都能编过"，值得。
+ *
+ * 语义：svc 直投 tgkill(SIGABRT) → 立即终止；信号被拦时 __builtin_trap()
+ * 生成 brk #1 兜底。两条路径都不经 libc，二进制里没有 abort@plt/
+ * raise@plt 可改——这正是实测报告 §12.1 的软目标。 */
+#if defined(__aarch64__)
+static inline long sig_raw_syscall(long n, long a0, long a1, long a2,
+                                   long a3, long a4, long a5) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                     : "memory");
+    return x0;
+}
+#elif defined(__arm__)
+static inline long sig_raw_syscall(long n, long a0, long a1, long a2,
+                                   long a3, long a4, long a5) {
+    register long r7 __asm__("r7") = n;
+    register long r0 __asm__("r0") = a0;
+    register long r1 __asm__("r1") = a1;
+    register long r2 __asm__("r2") = a2;
+    register long r3 __asm__("r3") = a3;
+    register long r4 __asm__("r4") = a4;
+    register long r5 __asm__("r5") = a5;
+    __asm__ volatile("svc #0"
+                     : "+r"(r0)
+                     : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
+                     : "memory");
+    return r0;
+}
+#endif
+
+__attribute__((noreturn, noinline))
+static void sig_raw_die(void) {
+#if defined(__aarch64__) || defined(__arm__)
+#  ifdef __NR_tgkill
+    /* tid 也用 syscall 拿：gettid() 在部分老 bionic 上是 API 21+ 符号，
+     * 直调 __NR_gettid 免依赖（本函数存在的意义就是"不经 libc"）。 */
+    long tid = sig_raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
+    (void) sig_raw_syscall(__NR_tgkill, (long)getpid(), tid, SIGABRT, 0, 0, 0);
+#  endif
+#endif
+    __builtin_trap();      /* 不可达兜底；SIGILL 也会留 tombstone */
+}
+
+SIG_KILL_SECTION
 static void *delayed_kill(void *arg) {
     unsigned int seed = (unsigned int)(time(NULL) ^ getpid());
     int delay = 1 + (int)(rand_r(&seed) % 3);   /* 随机 1~3 秒(调试用) */
@@ -729,8 +814,9 @@ static void *delayed_kill(void *arg) {
         }
     }
     sleep(delay);
-    abort();
-    return NULL;
+    /* 2026-10-19 方案2：不用 abort@plt（改 4 字节即废所有调用点） */
+    sig_raw_die();
+    return NULL;   /* 不可达 */
 }
 
 static void sig_verify(void) {
@@ -838,7 +924,8 @@ fail:
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&t, &attr, delayed_kill, NULL) != 0) {
-            abort(); /* 起线程失败则直接崩，不能放行 */
+            /* 起线程失败则直接崩，不能放行。2026-10-19 方案2：同上不走 PLT */
+            sig_raw_die();
         }
         pthread_attr_destroy(&attr);
     }

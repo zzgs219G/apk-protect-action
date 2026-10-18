@@ -153,6 +153,16 @@ static void envlog_c(int is_err, lsg_id_t id, const char *detail) {
  * 前向声明:safe_syscall 定义在下方 a0b 节(探针可信化),本节的处置需要提前用它。 */
 static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, long a5);
 
+/* 2026-10-19 方案2：不依赖任何 PLT 表项的强制终止（实现见 a0b 节）。
+ * 前向声明放这里，因为 env_delayed_kill / env_fail 要在它之前调用。
+ * 与 abort() 的语义差异：本函数 noreturn 且不经 libc，二进制里没有
+ * abort@plt 那种"改 4 字节废全部"的软目标。 */
+__attribute__((noreturn)) static void env_raw_die(long n, long a0, long a1,
+                                                  long a2, long a3, long a4,
+                                                  long a5);
+static inline long env_raw_syscall(long n, long a0, long a1, long a2,
+                                   long a3, long a4, long a5);
+
 /* * 2026-10 增强(方案 F):让处置"不直白、难 hook、难归因"
  *   ① 延时堆破坏:先以随机间隔 malloc/free 不同尺寸的块(不写入业务内存),
  *      使进程堆布局碎片化。攻击者即便 hook 掉后续的发信号/abort,进程状态
@@ -164,6 +174,42 @@ static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, lo
  *   ③ 保留随机延时:崩溃时机不可预测,攻击者难以把崩溃与"刚触发了什么"关联。
  *
  * 失败兜底:syscall 不可用(被 seccomp 拦等)时回落 abort(),绝不静默放行。 */
+/* ── kill 链进加密段（2026-10-19，方案4：去掉 PLT 单点的可发现性）────
+ *
+ * 修的是外部实测报告（docs/so层防御/简盒-so层静态防御实测报告.md §12.1）
+ * 指出的最廉价绕过路径：
+ *   `abort@plt` / `_exit@plt` / `raise@plt` 三个 PLT 桩，各改 4 字节，
+ *   380 个调用点全部失效 —— 攻击者 30 秒拿到可在真机常驻运行的绕过包。
+ *
+ * 本方案不是"改成静默污染"（那需要业务语义知识，无法对任意 APK 通用），
+ * 而是让攻击者【找不到】kill 逻辑：把真正的处置函数标进 .ncguard 密文段。
+ * 未解锁时它是密文，`strings`/`objdump` 都看不到；静态搜 `abort@plt`
+ * 的引用也只能看到"某处 bl 进了一段解不开的东西"。
+ *
+ * ⚠️ 三条纪律（违反任一即死锁或崩溃）：
+ *   ① env_fail()【绝不能】进 .ncguard —— 它是本函数的调用方，且被
+ *      env_check_run() 在构造期调用。锁进去 = 开锁器锁进箱子 = 死锁。
+ *      本处只标【被调用】的 env_delayed_kill。
+ *   ② 必须条件化 NC_GUARD_SECTIONED（同 nc_link.c 的理由：宿主编译没有
+ *      解锁设施，标了段就读到密文 → 假红）。
+ *   ③ 调用时序必须安全 —— 已确认：env_check_entry 首行就是
+ *      ncguard_unlock()，所以 env_fail → 线程 → env_delayed_kill
+ *      这条链上，段必定已是明文。
+ *
+ * 为什么放在 .ncguard 而不是 .ncguard_ro：这是【代码】不是常量表，
+ * 需要执行权限，.ncguard_ro 是 AWR 不可执行段。
+ *
+ * 效果边界（如实）：它提高的是【发现成本】，不是【patch 成本】。
+ * 攻击者若能离线解开 .ncguard（当前 master 仍是占位符，报告实测 8 分钟），
+ * 就又能看到这段代码。真正断绝这条路要靠 master 随机化（P1-1，未做）
+ * 与内联 svc 打散出口（方案2，未做）。本方案是纵深的一层，不是终点。 */
+#if defined(NC_GUARD_SECTIONED) && !defined(ENVCHECK_HOST_TEST)
+#  define ENV_KILL_SECTION __attribute__((section(".ncguard"), retain, used, noinline))
+#else
+#  define ENV_KILL_SECTION
+#endif
+
+ENV_KILL_SECTION
 static void *env_delayed_kill(void *arg) {
     (void)arg;
     unsigned int seed = (unsigned int)(time(NULL) ^ getpid());
@@ -192,8 +238,14 @@ static void *env_delayed_kill(void *arg) {
         /* 信号已投递;若因屏蔽未致死,下面兜底 */
     }
 #endif
-    abort();   /* ③ 兜底:syscall 失败或被拦时仍要死,绝不静默放行 */
-    return NULL;
+    /* ③ 兜底:syscall 失败或被拦时仍要死,绝不静默放行。
+     * 2026-10-19 方案2：不再走 abort@plt（改 4 字节即废），改 svc 直投
+     * SIGABRT / brk 兜底，二进制里没有对应的 PLT 表项可改。 */
+    {
+        long tid = env_raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
+        env_raw_die(__NR_tgkill, (long)getpid(), tid, SIGABRT, 0, 0, 0);
+    }
+    return NULL;   /* 不可达，仅为满足 noreturn 语义 */
 }
 
 static void env_fail(void) {
@@ -203,7 +255,12 @@ static void env_fail(void) {
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&t, &attr, env_delayed_kill, NULL) != 0) {
-        abort();   /* 起线程失败则直接崩,不能放行 */
+        /* 起线程失败则直接崩，不能放行。
+         * 2026-10-19 方案2：同上，不用 abort@plt。 */
+        {
+            long tid = env_raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
+            env_raw_die(__NR_tgkill, (long)getpid(), tid, SIGABRT, 0, 0, 0);
+        }
     }
     pthread_attr_destroy(&attr);
 }
@@ -243,8 +300,95 @@ static void anti_debug_preempt(void) {
  *      由调用方的"宁漏勿误伤"兜底接住,绝不误判。
  *
  * 本函数只负责【读一段文件到内存】,不做任何判定 —— 探针的判定逻辑一行不改。 */
+/* ── 2026-10-19 方案2：内联 svc，去掉 syscall@plt 这个软目标 ──────────
+ *
+ * 背景（实测报告 §12.1）：攻击者发现 `abort@plt` / `_exit@plt` / `raise@plt`
+ * 三个 PLT 桩各 4 字节，改掉即废 380 个调用点。本文件此前虽然已经
+ * "syscall 直调绕过 libc"，但那是调用 libc 的 syscall() —— 它【本身也是一个
+ * PLT 表项】（syscall@plt）。所以真正的绕过成本只是"改 4 个桩而不是 3 个"。
+ *
+ * 现在改为内联 svc #0：编译器直接发指令，二进制里没有 syscall@plt 可改。
+ * 攻击者要拦，只能在指令层逐处 patch（每个调用点 4 字节，且分散在密文段内
+ * 看不见），或上内核级 hook。
+ *
+ * 双 ABI 差异（这是必须分架构的原因，不是冗余）：
+ *   arm64 : 系统调用号在 x8，参数 x0-x5，返回 x0；指令 svc #0
+ *   armv7 : 系统调用号在 r7，参数 r0-r5，返回 r0；指令 svc #0（EABI）
+ * 用 GNU 内联汇编的具名寄存器变量绑定，让编译器自己安排其余寄存器，
+ * 不写死 x0-x5 的物理分配（写死会与编译器分配的实参寄存器冲突）。
+ *
+ * 失败语义完全不变：返回 -errno 由内核给出，与 syscall() 一致；
+ * 调用方的"宁漏勿误伤"兜底逻辑一行未动。
+ * ⚠️ 本函数【不】执行任何判定，只做系统调用转发。 */
+#if defined(__aarch64__)
+/* 强制终止，且不经过任何 PLT 表项（2026-10-19 方案2）。
+ * 用 tgkill 直投 SIGABRT：内核立刻发信号，不返回。
+ * 为什么不用 abort()：abort@plt 是单个 4 字节表项，改掉即废所有调用点
+ * （实测报告 §12.1 的核心绕过路径）。这里没有表项可改。
+ * 为什么不用 _exit()：_exit@plt 同理；且 _exit 不发崩溃信号，
+ * tombstone 里没有记录，反而对攻击者更"友好"。
+ * 为什么带 __attribute__((noreturn))：让编译器知道后续代码不可达，
+ * 避免它把兜底逻辑优化成"可达"而插入多余的分支。 */
+__attribute__((noreturn, noinline))
+static void env_raw_die(long n, long a0, long a1, long a2,
+                        long a3, long a4, long a5);
+static inline long env_raw_syscall(long n, long a0, long a1, long a2,
+                                   long a3, long a4, long a5) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                     : "memory");
+    return x0;
+}
+static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
+    return env_raw_syscall(n, a0, a1, a2, a3, a4, a5);
+}
+#elif defined(__arm__)
+static inline long env_raw_syscall(long n, long a0, long a1, long a2,
+                                   long a3, long a4, long a5) {
+    register long r7 __asm__("r7") = n;
+    register long r0 __asm__("r0") = a0;
+    register long r1 __asm__("r1") = a1;
+    register long r2 __asm__("r2") = a2;
+    register long r3 __asm__("r3") = a3;
+    register long r4 __asm__("r4") = a4;
+    register long r5 __asm__("r5") = a5;
+    __asm__ volatile("svc #0"
+                     : "+r"(r0)
+                     : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
+                     : "memory");
+    return r0;
+}
+static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
+    return env_raw_syscall(n, a0, a1, a2, a3, a4, a5);
+}
+#else
+/* 非 ARM 平台（宿主编译）走 libc：没有 svc 指令，且宿主测试不关心这条 */
 static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
     return syscall(n, a0, a1, a2, a3, a4, a5);
+}
+#endif
+
+__attribute__((noreturn, noinline))
+static void env_raw_die(long n, long a0, long a1, long a2,
+                        long a3, long a4, long a5) {
+#if defined(__aarch64__) || defined(__arm__)
+    (void) env_raw_syscall(n, a0, a1, a2, a3, a4, a5);
+    /* 理论不可达：tgkill(SIGABRT) 会立刻终止本线程。
+     * 若信号被屏蔽/被 seccomp 拦，走到这里说明本进程已不可信 —— 用
+     * 非法指令兜底。SIGILL 同样产生 tombstone，且没有 PLT 依赖。 */
+    __builtin_trap();
+#else
+    (void) n; (void) a0; (void) a1; (void) a2; (void) a3; (void) a4; (void) a5;
+    __builtin_trap();
+#endif
 }
 
 /* 读整个文件到 calloc 的缓冲(调用方 free)。成功返回长度(不含结尾 \0),失败返回 -1。

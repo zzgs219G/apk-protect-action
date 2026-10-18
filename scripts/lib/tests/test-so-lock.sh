@@ -18,6 +18,8 @@
 #   T6 明文路标归零（NCKEYLOCK / NCSTUBLK 不可 strings 搜到）
 #   T7 签名表进加密段（SIG_SALT/SIG_HASH_STORED 明文零命中）★ 2026-10-19
 #   T8 篡改 .ncguard_ro 1 字节 → MAC 拒解（-11），证明 MAC 覆盖两段
+#   T9 kill 链无 PLT 软目标（abort/_exit/raise/syscall 四个桩全部消失）★
+#   T10 kill 逻辑进加密段（env_delayed_kill 落在 .ncguard 内且不可反汇编）
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -50,8 +52,12 @@ if [ ! -f "$APK" ]; then
     exit 0
 fi
 
+# 拷【全量】源文件：env_check.c 必须一起编，否则 T10（kill 链进加密段）
+# 会被跳过 —— 一项关键断言被静默跳过比失败更糟。
+# 顺带覆盖 sigcheck+envcheck 的真实组合，而不是只测 sigcheck-only。
 cp "$SRC/nc_guard_boot.c" "$SRC/nc_guard_probe.c" "$SRC/nc_guard_jni.c" \
-   "$SRC/nc_guard_key.c" "$SRC/nc_guard_key.h" "$SRC/nc_link.c" "$WORK/"
+   "$SRC/nc_guard_key.c" "$SRC/nc_guard_key.h" "$SRC/nc_link.c" \
+   "$SRC/env_check.c" "$SRC/sig_check.c" "$WORK/"
 # sig_hash.h 是构建期生成的（含两张签名表），必须先生成再编译
 bash "$ROOT/scripts/sigcheck/hash/make-sig-hash.sh" "$APK" "$WORK/sig_hash.h" \
      >"$WORK/sighash.log" 2>&1 \
@@ -64,8 +70,12 @@ cd "$WORK" || { echo "cd 失败"; exit 2; }
 CFLAGS="-fPIC -shared -fvisibility=hidden -fno-ident -Oz \
         -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED"
 LDFLAGS="-Wl,--gc-sections -Wl,--build-id=none"
+# sig_log_data.h 依赖 sig_check.c + env_check.c 的 LSG 标记，必须先跑生成器
+python3 "$ROOT/scripts/sigcheck/log/make-sig-log.py" \
+     sig_check.c env_check.c sig_log_data.h >siglog.log 2>&1 || true
 if clang $CFLAGS -I. nc_guard_boot.c nc_guard_probe.c nc_guard_jni.c \
-        nc_guard_key.c nc_link.c $LDFLAGS -o libnc.so 2>build.log; then
+        nc_guard_key.c nc_link.c env_check.c sig_check.c \
+        $LDFLAGS -o libnc.so 2>build.log; then
     ok "T1 编译通过（$(stat -c%s libnc.so) B）"
 else
     bad "T1 编译失败"; head -20 build.log >&2; exit 1
@@ -154,7 +164,74 @@ else
     skip "T7 无 sig_hash.h，跳过"
 fi
 
+# ── T9 kill 链无 PLT 软目标（2026-10-19 方案2）────────────────────
+# 实测报告 §12.1：改 abort/_exit/raise 三个 PLT 桩各 4 字节 → 380 个
+# 调用点全废。本项断言这四个符号在产物里【不再是未定义符号】，
+# 即二进制里没有这些 PLT 表项可供 patching。
+bad_syms=""
+for sym in abort _exit raise syscall; do
+    if nm -D -u libnc.so 2>/dev/null | grep -qw "$sym"; then
+        bad_syms="$bad_syms $sym"
+    fi
+done
+if [ -z "$bad_syms" ]; then
+    ok "T9 kill 链无 PLT 软目标（abort/_exit/raise/syscall 均已改为内联 svc）"
+else
+    bad "T9 仍依赖 PLT 软目标:$bad_syms（攻击者可改 4 字节废掉整条 kill 链）"
+fi
+
+# ── T10 kill 逻辑必须进加密段 ──────────────────────────────────────
+# 判据：env_delayed_kill 的符号地址落在 .ncguard 段 [addr, addr+size) 内。
+# 若为 0 或落在 .text，说明段标记没生效 —— 攻击者静态就能看到 kill 逻辑。
+if nm libnc.so 2>/dev/null | grep -q "env_delayed_kill"; then
+    killaddr=$(nm libnc.so | awk '/env_delayed_kill$/{print $1}')
+    insec=$(python3 - "$killaddr" <<'PYT10'
+import struct, sys
+addr = int(sys.argv[1], 16)
+d = open('libnc.so', 'rb').read()
+sh = struct.unpack('<Q', d[0x28:0x30])[0]
+es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]
+si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+for i in range(en):
+    o = sh + i*es
+    no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    if nm == '.ncguard':
+        sa = struct.unpack('<Q', d[o+0x10:o+0x18])[0]
+        sz = struct.unpack('<Q', d[o+0x20:o+0x28])[0]
+        print('yes' if sa <= addr < sa + sz else 'no')
+        break
+else:
+    print('no')
+PYT10
+)
+    [ "$insec" = "yes" ] && ok "T10 kill 逻辑在 .ncguard 内（env_delayed_kill @ 0x$killaddr）" \
+        || bad "T10 env_delayed_kill 不在加密段（攻击者可静态定位 kill 逻辑）"
+else
+    skip "T10 本组合未编入 env_check.c（sigcheck-only），跳过"
+fi
+
 # ── T4/T5 运行期：需构造 fake Android 环境 ──
+# 编入 env_check.c/sig_check.c 后会引入 liblog 依赖（__android_log_print）。
+# 宿主没有 bionic，给个桩让 dlopen 能解析到（仅测试用，不进产物）。
+cat > logstub.c <<'EOF'
+#include <stdarg.h>
+#include <stdio.h>
+int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
+    (void)prio; (void)tag;
+    va_list ap; va_start(ap, fmt);
+    int n = vfprintf(stderr, fmt, ap);
+    va_end(ap); fputc('\n', stderr);
+    return n;
+}
+int __android_log_write(int prio, const char *tag, const char *text) {
+    (void)prio; (void)tag; return fprintf(stderr, "%s\n", text);
+}
+EOF
+clang -shared -fPIC logstub.c -o liblog.so 2>/dev/null
+
 cat > t.c <<'EOF'
 #include <dlfcn.h>
 #include <stdio.h>
@@ -178,7 +255,8 @@ else
     # run_so：崩溃时 stdout 可能为空（SIGILL/SIGSEGV 打断），
     # 所以返回码与输出分开判断，别把"空输出"当成"没通过"的唯一依据。
     run_so() {
-        out=$(bash -c "exec -a $PKG '$WORK/t' ./lib/arm64-v8a/libnc.so" 2>/dev/null)
+        out=$(LD_PRELOAD="$WORK/liblog.so" \
+              bash -c "exec -a $PKG '$WORK/t' ./lib/arm64-v8a/libnc.so" 2>/dev/null)
         rc=$?
         if [ $rc -ne 0 ]; then printf 'CRASH(%d)' "$rc"; else printf '%s' "$out"; fi
     }

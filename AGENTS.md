@@ -42,7 +42,7 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 | 冻结模块 | 职责 | 钉死的回归测试 |
 |---|---|---|
 | `scripts/sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `scripts/sigcheck/javalink/tests/test-javacheck.sh`(11 大项,host 编译+对拍) + `scripts/sigcheck/tests/test-lsgs-strings.sh`(密文零泄漏) |
-| `scripts/sigcheck/src/env_check.c` | 环境检测(10 探针/反调试抢占/so 自校验/心跳检查端) | 同上两套 + `scripts/sigcheck/tests/test-lsgs-strings.sh` |
+| `scripts/sigcheck/src/env_check.c` | 环境检测(10 探针/反调试抢占/so 自校验/心跳检查端) | 同上两套 + `scripts/sigcheck/tests/test-lsgs-strings.sh`。**2026-10-19**:`env_delayed_kill` 进 `.ncguard`;`safe_syscall` 改内联 `svc`(arm64 `x8`/armv7 `r7`)、新增 `env_raw_die`——**`syscall()` 本身也是 PLT 表项**,验收必查 `nm -D -u \| grep -wE "abort\|syscall\|_exit\|raise"` 为空。**kill 函数标段、调用方(`env_fail`)不标段**(后者是 unlock 使用者,标了即死锁) |
 | `scripts/sigcheck/src/nc_link.c` | Java↔Native 桥接(ncVerify/heartbeat + 心跳武装) | test-javacheck.sh(判决对拍) + 心跳语义对拍(变更历史 10-16 条) |
 | `scripts/inject/inject-loadlib.py` | loadLibrary 插桩(幂等、多 dex、AXMLPrinter) | `tests/test_inject_loadlib.py`(冒烟,若存在) |
 | `scripts/sigcheck/hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景,若存在) |
