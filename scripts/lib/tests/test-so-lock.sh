@@ -334,6 +334,8 @@ done
     || bad "T15 路径仍明文:$path_leak"
 
 # ── T16 段名中性化 ────────────────────────────────────────────
+# ⚠️ 这条断言必须检查【旧名】。段名已中性化为 .ncx*，若这里也跟着写成
+# .ncx，断言就恒真了（假绿）。2026-10-19 检查时发现正是如此。
 if readelf -SW libnc.so 2>/dev/null | grep -qE "\.ncguard|\.nckey"; then
     bad "T16 自解释段名残留（.ncguard/.nckey 会直接暴露机制）"
 else

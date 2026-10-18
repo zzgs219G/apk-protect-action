@@ -416,7 +416,7 @@ fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc
 
 # ── 通用段标记（2026-10 设施化第2层）──────────────────────────────
-# 让 dex2c 转译产物吃上 .ncguard 加密：用规则把 JNI 函数打进加密段。
+# 让 dex2c 转译产物吃上 .ncx 加密：用规则把 JNI 函数打进加密段。
 # 位置必须在 ndk_build 【之前】——标记器改的是源码，编译后才跑就晚了。
 #
 # 为什么要单独一层：sigcheck/envcheck 的探针是手写 __attribute__ 的
@@ -424,7 +424,7 @@ ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一）�
 # 引擎。有了标记器，加一个消费者 = 加一条规则，谁也不写自己的防御。
 # 详见 docs/流程文档.md §3.12 的三层设施说明。
 if [[ $WANT_TRANSPILE -eq 1 ]]; then
-  echo "[mark] 段标记：dex2c 转译产物 → .ncguard"
+  echo "[mark] 段标记：dex2c 转译产物 → .ncx"
 
   # 先数一下源码里到底有多少 JNI 函数头（用于判定"静默失防"）
   JNI_HDRS=$(grep -rlE 'JNIEXPORT[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+JNICALL' \
@@ -447,7 +447,7 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
   # （例如 writer.py 改了函数头格式）。此时不能放行——那等于"以为防了
   # 其实没防"，正是本机制最该避免的假绿。
   # ⚠️ 段名必须与 so_section_mark.py 的 SECTION 常量一致（2026-10-19 已改 .ncx）。
-  #    这里曾经写死 .ncguard，段名中性化后漏改 → MARKED=0 → 下面的
+  #    这里曾经写死旧段名，段名中性化后漏改 → MARKED=0 → 下面的
   #    "静默失防"守卫 fail-fast（CI 39171457222 实证）。守卫本身是对的，
   #    但漏改段名等于把自己的守卫变成误报源。
   MARKED=$(grep -rc 'section(".ncx")' "$WORK/project/jni" \
@@ -502,17 +502,20 @@ if [[ -d "$WORK/project/libs" ]]; then
     # ⚠️ 老产物若没有 .ncguard_ro（未定义 NC_GUARD_SECTIONED），锁箱器会
     #   在 --section 列表里找不到它而报错。故此处先探测段是否存在，
     #   不存在则退回单段（向前兼容，且不会静默降级——会打印明确提示）。
-    _SECTIONS=".ncguard"
-    if readelf -SW "$so" 2>/dev/null | grep -q '\.ncguard_ro'; then
-      _SECTIONS=".ncguard,.ncguard_ro"
+    # ⚠️ 段名必须与 nc_guard_boot.c 的宏 / so-section-lock.py 的常量一致。
+    # 2026-10-19 段名中性化（.ncguard→.ncx）时漏改这里 → 锁箱报
+    # 「段 .ncguard 不存在」→ 构建失败（CI 39176711044 实证）。
+    _SECTIONS=".ncx"
+    if readelf -SW "$so" 2>/dev/null | grep -q '\.ncxr'; then
+      _SECTIONS=".ncx,.ncxr"
     else
-      echo "  [lock] ⚠️ 未发现 .ncguard_ro 段（NC_GUARD_SECTIONED 未定义？）" >&2
+      echo "  [lock] ⚠️ 未发现 .ncxr 段（NC_GUARD_SECTIONED 未定义？）" >&2
       echo "  [lock]    → 签名判定函数已加密，但 SIG_SALT/SIG_HASH_STORED 仍在明文" >&2
     fi
     python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" \
       --section "$_SECTIONS" --from-apk "$IN_APK" \
       2>&1 | sed 's/^/  [lock] /' || {
-      echo "❌ .ncguard 锁箱失败（段未标记？cert/包名提取失败？）——so 静态加固未生效" >&2
+      echo "❌ .ncx 锁箱失败（段未标记？cert/包名提取失败？）——so 静态加固未生效" >&2
       exit 1
     }
     # 二级锁箱（2026-10-18 自解谜）：把 unlock 本体也锁进 .ncguard_head。
@@ -525,7 +528,7 @@ if [[ -d "$WORK/project/libs" ]]; then
     #    那种"以为防了其实没防"的静默降级正是本机制最该避免的。
     python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" --lock-head \
       2>&1 | sed 's/^/  [lock2] /' || {
-      echo "❌ 二级锁箱失败（.ncguard_head 未标记？符号被 strip？）——unlock 本体仍可静态读取" >&2
+      echo "❌ 二级锁箱失败（.ncxh 未标记？符号被 strip？）——unlock 本体仍可静态读取" >&2
       exit 1
     }
   done
