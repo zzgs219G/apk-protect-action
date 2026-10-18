@@ -50,6 +50,11 @@
 
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一侧 ── */
 #define NCG_SECTION      ".ncguard"
+/* 常量表专用段（2026-10-19）：签名表的 salt/期望值放这里。
+ * 为什么不能放 .ncguard：那是 AXR（可执行）段，clang 拒绝让 const 数据
+ * 进去（'causes a section type conflict'）。本段是 AWR，不可执行。
+ * 与 .ncguard 共用同一把 k_so 和同一个 MAC —— 逻辑上是同一份资产。 */
+#define NCG_SECTION_RO   ".ncguard_ro"
 #define NCG_SLOT         ".nckey"
 #define NCG_HEAD         ".ncguard_head"
 #define NCG_STUB_SLOT    ".nckey_stub"
@@ -459,6 +464,31 @@ int ncg_head_unlock(void) {
     }
 
 
+    /* ── 2026-10-19：受保护资产是两个段（代码 + 常量表）────────────
+     * 实测报告 §8.1 的核心缺陷：判定算法（nc_verify_t1）与两张签名表
+     * （SIG_SALT / SIG_HASH_STORED）原先全在明文 .rodata，攻击者 od
+     * 一条命令读出、5 分钟反推出 32 字节通过凭据。加密层只保护了
+     * ncVerify 这个转发壳，核心留在明文中——"锁很好，钥匙挂门上"。
+     *
+     * 现在拆成两段，共用一把 k_so、一个 MAC：
+     *   .ncguard     代码（AXR）—— nc_verify_t1 等
+     *   .ncguard_ro  常量表（AWR，不可执行）—— SIG_SALT / SIG_HASH_STORED
+     * 为什么必须分两段：clang 拒绝 let const 数据进 AXR 段
+     * （'causes a section type conflict'），见 nc_link.c 的注释。
+     *
+     * 向后兼容：老产物只有 .ncguard、没有 .ncguard_ro，此时 nseg=1，
+     * MAC 与解密行为与历史版本逐字节一致（单段时 MAC 输入 == 该段密文）。 */
+    Elf64_Shdr segs[2];
+    int nseg = 0;
+    segs[nseg++] = sec;
+    {
+        Elf64_Shdr ro;
+        if (ncg_find_section(so_path, NCG_SECTION_RO, &ro) == 0
+            && ro.sh_size > 0 && (ro.sh_flags & SHF_ALLOC)) {
+            segs[nseg++] = ro;
+        }
+    }
+
     uint8_t *target = (uint8_t *)base + sec.sh_addr;
 
     /* 完整性校验：先验后解（位置在 mprotect/解密之前）
@@ -476,7 +506,23 @@ int ncg_head_unlock(void) {
             memset(slotdata, 0, sizeof(slotdata));
             return -12;
         }
-        khmac_sha256(k_mac, 16, target, sec.sh_size, got_mac);
+        /* MAC 覆盖【所有段密文的拼接】，顺序与锁箱侧一致（代码段在前）。
+         * 用增量 HMAC：两段不连续，一次性算需要额外拼缓冲（最多几十 KB，
+         * 不值得为它 malloc + memcpy）。增量式零额外内存、零拷贝。 */
+        {
+            /* 不透明类型不能直接开栈对象 → 用对齐的字节缓冲 + 尺寸宏。
+             * nc_guard_key.c 里有 static_assert 保证 sizeof <= KHMAC_CTX_SIZE，
+             * 所以这里开 KHMAC_CTX_SIZE 必定够用。 */
+            _Alignas(KHMAC_CTX_ALIGN) unsigned char hcbuf[KHMAC_CTX_SIZE];
+            khmac_ctx *hc = (khmac_ctx *)hcbuf;
+            khmac_init(hc, k_mac, 16);
+            for (int i = 0; i < nseg; i++) {
+                const uint8_t *p = (const uint8_t *)base + segs[i].sh_addr;
+                khmac_update(hc, p, segs[i].sh_size);
+            }
+            khmac_final(hc, got_mac);
+            memset(hcbuf, 0, sizeof(hcbuf));
+        }
         const uint8_t *want = slotdata + NCG_OFF_EXPMAC;
         uint8_t diff = 0;
         for (int i = 0; i < 32; i++) diff |= (uint8_t)(got_mac[i] ^ want[i]);
@@ -488,23 +534,41 @@ int ncg_head_unlock(void) {
         }
     }
 
+    /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
+     * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
+     * 给数据段加 X 是没有必要的权限扩大——它从来不需要执行。
+     * 页对齐：目标段可能与相邻段同页（历史报错五十：.ncguard 与 .text 尾部
+     * 同页导致 pwrite 写坏代码）。这里是 mprotect 而非 pwrite，同页只会
+     * 让权限短暂放宽，不会破坏内容；但 mprotect 粒度是页，所以范围必须
+     * 按页对齐，否则会失败。 */
     uintptr_t ps = getpagesize();
-    uintptr_t s = (uintptr_t) target & ~(ps - 1);
-    uintptr_t e = ((uintptr_t) target + sec.sh_size - 1 & ~(ps - 1)) + ps;
-    if (mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return -8;
-
-    uint8_t *buf = (uint8_t *)malloc(sec.sh_size);
-    if (!buf) return -9;
-    ncg_rc4(key, 16, target, buf, sec.sh_size);
-    memcpy(target, buf, sec.sh_size);
-    free(buf);
+    for (int i = 0; i < nseg; i++) {
+        uint8_t *tgt = (uint8_t *)base + segs[i].sh_addr;
+        size_t len = (size_t)segs[i].sh_size;
+        /* 数据段不需要 EXEC；代码段需要 */
+        int is_code = (segs[i].sh_flags & SHF_EXECINSTR) != 0;
+        uintptr_t s = (uintptr_t) tgt & ~(ps - 1);
+        uintptr_t e = ((uintptr_t) tgt + len - 1 & ~(ps - 1)) + ps;
+        if (mprotect((void *) s, e - s,
+                     PROT_READ | PROT_WRITE | (is_code ? PROT_EXEC : 0)) != 0) {
+            memset(key, 0, sizeof(key));
+            return -8;
+        }
+        uint8_t *buf = (uint8_t *)malloc(len);
+        if (!buf) { memset(key, 0, sizeof(key)); return -9; }
+        ncg_rc4(key, 16, tgt, buf, len);
+        memcpy(tgt, buf, len);
+        free(buf);
+        if (is_code) __builtin___clear_cache((char *)tgt, (char *)(tgt + len));
+        if (mprotect((void *) s, e - s,
+                     PROT_READ | (is_code ? PROT_EXEC : 0)) != 0) {
+            memset(key, 0, sizeof(key));
+            return -10;
+        }
+    }
 
     memset(key, 0, sizeof(key));
-    memset(slotdata, 0, 16);
-
-    __builtin___clear_cache((char *)target, (char *)(target + sec.sh_size));
-
-    if (mprotect((void *) s, e - s, PROT_READ | PROT_EXEC) != 0) return -10;
+    memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */
     ncg_unlocked = 1;
     return 0;
 }

@@ -439,9 +439,26 @@ repack_unpack "$WORK/decompiled" "$STEP5_APK"
 if [[ -d "$WORK/project/libs" ]]; then
   for so in "$WORK"/project/libs/*/libnc.so; do
     [[ -f "$so" ]] || continue
-    # 一级锁箱：.ncguard 业务段（k_so 由证书 HKDF 派生）
+    # 一级锁箱：.ncguard 代码段 + .ncguard_ro 常量表段（共用 k_so/同一个 MAC）
+    #
+    # 2026-10-19 为什么是两段（实测报告 §8.1 的核心缺陷）：
+    #   此前只锁 .ncguard，而真正的签名判定函数 nc_verify_t1 与两张表
+    #   SIG_SALT/SIG_HASH_STORED 全在明文——加密只保护了 ncVerify 转发壳，
+    #   核心留在 .rodata，`od` 一条命令就能读出并反推通过凭据。
+    #   现在判定函数进 .ncguard（AXR），表进 .ncguard_ro（AWR，不可执行）——
+    #   分两段是 clang 的硬约束：const 数据不能进可执行段。
+    # ⚠️ 老产物若没有 .ncguard_ro（未定义 NC_GUARD_SECTIONED），锁箱器会
+    #   在 --section 列表里找不到它而报错。故此处先探测段是否存在，
+    #   不存在则退回单段（向前兼容，且不会静默降级——会打印明确提示）。
+    _SECTIONS=".ncguard"
+    if readelf -SW "$so" 2>/dev/null | grep -q '\.ncguard_ro'; then
+      _SECTIONS=".ncguard,.ncguard_ro"
+    else
+      echo "  [lock] ⚠️ 未发现 .ncguard_ro 段（NC_GUARD_SECTIONED 未定义？）" >&2
+      echo "  [lock]    → 签名判定函数已加密，但 SIG_SALT/SIG_HASH_STORED 仍在明文" >&2
+    fi
     python3 "$ROOT/scripts/lib/so-section-lock.py" "$so" "$so" \
-      --section .ncguard --from-apk "$IN_APK" \
+      --section "$_SECTIONS" --from-apk "$IN_APK" \
       2>&1 | sed 's/^/  [lock] /' || {
       echo "❌ .ncguard 锁箱失败（段未标记？cert/包名提取失败？）——so 静态加固未生效" >&2
       exit 1

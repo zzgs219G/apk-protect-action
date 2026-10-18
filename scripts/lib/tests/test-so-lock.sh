@@ -16,6 +16,8 @@
 #   T4 未改代码 → selftest == 59
 #   T5 改 .text 1 位 → 自绑定生效 → 非 59（SIGILL/崩溃）
 #   T6 明文路标归零（NCKEYLOCK / NCSTUBLK 不可 strings 搜到）
+#   T7 签名表进加密段（SIG_SALT/SIG_HASH_STORED 明文零命中）★ 2026-10-19
+#   T8 篡改 .ncguard_ro 1 字节 → MAC 拒解（-11），证明 MAC 覆盖两段
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -25,7 +27,10 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tso.XXXXXX" 2>/dev/null \
        || mktemp -d "$HOME/.tso.XXXXXX")
 SRC="$ROOT/scripts/sigcheck/src"
 LOCK="$ROOT/scripts/lib/so-section-lock.py"
-APK=${TEST_APK:-$ROOT/docs/so层防御/jh_patched_signed.apk}
+# 需要一个【已签名】APK（锁箱要提证书）。默认取仓库内样本，可用 TEST_APK 覆盖。
+# 为什么必须已签名：本轮 P1-a 起 k_so 由证书派生，未签名包会在锁箱阶段
+# fail-fast（"非 APK Signing Block magic"）——这是设计行为，不是 bug。
+APK=${TEST_APK:-/storage/emulated/0/简盒/简盒_signed_23_59_49_sign.apk}
 PKG=com.xixin.box
 
 PASS=0; FAIL=0
@@ -40,25 +45,38 @@ echo "=== so 段加密回归（$WORK）==="
 
 # ── T0 前置：需要真签名 APK 与 clang ──
 if ! command -v clang >/dev/null; then skip "无 clang，整套跳过"; exit 0; fi
-if [ ! -f "$APK" ]; then skip "缺测试 APK: $APK"; exit 0; fi
+if [ ! -f "$APK" ]; then
+    skip "缺测试 APK（需已签名）: $APK\n    用 TEST_APK=<已签名.apk> bash $0 指定"
+    exit 0
+fi
 
 cp "$SRC/nc_guard_boot.c" "$SRC/nc_guard_probe.c" "$SRC/nc_guard_jni.c" \
-   "$SRC/nc_guard_key.c" "$SRC/nc_guard_key.h" "$WORK/"
+   "$SRC/nc_guard_key.c" "$SRC/nc_guard_key.h" "$SRC/nc_link.c" "$WORK/"
+# sig_hash.h 是构建期生成的（含两张签名表），必须先生成再编译
+bash "$ROOT/scripts/sigcheck/hash/make-sig-hash.sh" "$APK" "$WORK/sig_hash.h" \
+     >"$WORK/sighash.log" 2>&1 \
+    || { echo "  ⚠️ sig_hash.h 生成失败（详见 $WORK/sighash.log）"; }
 cd "$WORK" || { echo "cd 失败"; exit 2; }
 
 # ── T1 编译 ──
+# -DNC_GUARD_SECTIONED：让判决核心与两张签名表进加密段（生产配置）。
+# 宿主测试路径（test-javacheck.sh）走 NCLINK_HOST_TEST，不受影响。
 CFLAGS="-fPIC -shared -fvisibility=hidden -fno-ident -Oz \
-        -ffunction-sections -fdata-sections"
+        -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED"
 LDFLAGS="-Wl,--gc-sections -Wl,--build-id=none"
 if clang $CFLAGS -I. nc_guard_boot.c nc_guard_probe.c nc_guard_jni.c \
-        nc_guard_key.c $LDFLAGS -o libnc.so 2>build.log; then
+        nc_guard_key.c nc_link.c $LDFLAGS -o libnc.so 2>build.log; then
     ok "T1 编译通过（$(stat -c%s libnc.so) B）"
 else
     bad "T1 编译失败"; head -20 build.log >&2; exit 1
 fi
 
-have_sec() { readelf -S libnc.so 2>/dev/null | grep -q "$1"; }
-for s in .nckey .nckey_stub .ncguard .ncguard_head; do
+# ⚠️ 必须用词边界匹配：`.nckey` 是 `.nckey_stub` 的子串，裸 grep 会漏判
+# （实测踩过：T1 报 ".nckey 缺失"，实际段存在、只是被 .nckey_stub 抢先匹配）。
+have_sec() {
+    readelf -SW libnc.so 2>/dev/null | awk '{print $2}' | grep -qxF "$1"
+}
+for s in .nckey .nckey_stub .ncguard .ncguard_ro .ncguard_head; do
     have_sec "$s" && ok "T1 段 $s 存在" || bad "T1 段 $s 缺失"
 done
 
@@ -78,7 +96,8 @@ PY
 }
 
 # ── T2 一级锁箱 ──
-if python3 "$LOCK" libnc.so libnc.so --from-apk "$APK" >l1.log 2>&1; then
+if python3 "$LOCK" libnc.so libnc.so --section ".ncguard,.ncguard_ro" \
+        --from-apk "$APK" >l1.log 2>&1; then
     ok "T2 一级锁箱成功"
     [ "$(sec_size .nckey)" = 96 ] && ok "T2 .nckey 96 字节" \
         || bad "T2 .nckey 大小 $(sec_size .nckey) != 96"
@@ -103,6 +122,37 @@ for lit in NCKEYLOCK NCSTUBLK; do
     fi
 done
 [ $leak -eq 0 ] && ok "T6 明文路标归零（magic 已改为种子形式）"
+
+# ── T7 签名表必须已加密（2026-10-19，修实测报告 §8.1 最致命缺陷）──
+# 判据：这两张表的内容不应出现在产物的**任何位置**（明文零命中）。
+# 表内容从生成的 sig_hash.h 里解析出来，避免硬编码（每次 salt 随机）。
+if [ -f sig_hash.h ]; then
+    if python3 - <<'PYT7'
+import re, sys
+try:
+    h = open('sig_hash.h').read()
+except OSError:
+    sys.exit(2)
+def grab(name):
+    m = re.search(r'%s\[[^\]]*\]\s*=\s*\{(.*?)\}' % name, h, re.S)
+    if not m: return None
+    return bytes(int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]{2})', m.group(1)))
+so = open('libnc.so', 'rb').read()
+bad = []
+for nm in ('SIG_SALT', 'SIG_HASH_STORED'):
+    v = grab(nm)
+    if v is None: sys.exit(2)
+    if v in so: bad.append(nm)
+if bad:
+    print('明文残留: ' + ', '.join(bad), file=sys.stderr); sys.exit(1)
+sys.exit(0)
+PYT7
+    then ok "T7 签名表已加密（SIG_SALT/SIG_HASH_STORED 明文零命中）"
+    else bad "T7 签名表仍以明文出现在产物中（判定核心未上锁）"
+    fi
+else
+    skip "T7 无 sig_hash.h，跳过"
+fi
 
 # ── T4/T5 运行期：需构造 fake Android 环境 ──
 cat > t.c <<'EOF'
@@ -160,6 +210,37 @@ PY
     rc2=$(run_so)
     [ "$rc2" != "59" ] && ok "T5 改 .text 1 位 → 自毁（实得 $rc2）" \
         || bad "T5 改了代码仍返回 59 —— 代码自绑定未生效"
+    cp ../orig.so lib/arm64-v8a/libnc.so
+
+    # ── T8 篡改 .ncguard_ro 必须拒解（证明 MAC 覆盖两段，不只代码段）──
+    # 这是本轮新增两段结构的关键断言：若 MAC 只算 .ncguard，那么改常量表
+    # 不会触发任何检测 → 攻击者可以直接替换 salt/期望值绕过判定。
+    if python3 - <<'PYT8'
+import struct, sys
+d = bytearray(open('lib/arm64-v8a/libnc.so', 'rb').read())
+sh = struct.unpack('<Q', d[0x28:0x30])[0]
+es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]
+si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+for i in range(en):
+    o = sh + i*es
+    no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    if nm == '.ncguard_ro':
+        off = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
+        d[off] ^= 0x01
+        open('lib/arm64-v8a/libnc.so', 'wb').write(d)
+        sys.exit(0)
+sys.exit(2)
+PYT8
+    then
+        rc3=$(run_so)
+        [ "$rc3" != "59" ] && ok "T8 篡改 .ncguard_ro → 拒解（实得 $rc3，MAC 覆盖两段）" \
+            || bad "T8 改了常量表仍返回 59 —— MAC 未覆盖 .ncguard_ro"
+    else
+        skip "T8 无 .ncguard_ro 段，跳过"
+    fi
     cp ../orig.so lib/arm64-v8a/libnc.so
 fi
 

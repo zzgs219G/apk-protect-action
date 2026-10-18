@@ -29,6 +29,24 @@ void ksha256(const uint8_t *data, size_t len, uint8_t out[32]);
 void khmac_sha256(const uint8_t *key, size_t key_len,
                   const uint8_t *msg, size_t msg_len, uint8_t out[32]);
 
+/* 增量 HMAC（2026-10-19）：分段喂消息，用于 MAC 覆盖多个不连续段。
+ *
+ * 为什么需要它：.ncguard 与 .ncguard_ro 是两个不连续的 ELF 段，
+ * 一次性算 HMAC 得先把两段拼进临时缓冲（最多几十 KB malloc + memcpy）。
+ * 增量式零额外内存、零拷贝。
+ * 语义与 khmac_sha256(k,m1||m2) 完全等价（对拍测试钉死）。
+ * 用法：init → update* → final。ctx 由调用方在栈上开（不透明类型，见下）。 */
+typedef struct khmac_ctx_s khmac_ctx;
+void khmac_init(khmac_ctx *ctx, const uint8_t *key, size_t key_len);
+void khmac_update(khmac_ctx *ctx, const uint8_t *data, size_t len);
+void khmac_final(khmac_ctx *ctx, uint8_t out[32]);
+
+/* 增量 HMAC 的上下文尺寸（构造期断言用；调用方需按此开栈对象）。
+ * ⚠️ 与 nc_guard_key.c 的 struct khmac_ctx_s 保持一致——改一处必须改另一处，
+ *    下面的 static_assert 在编译期把关，不一致会直接编译失败（好事）。 */
+#define KHMAC_CTX_SIZE   256   /* 实际 88+88+32 = 208，留余量防将来扩字段 */
+#define KHMAC_CTX_ALIGN  8
+
 /* HKDF-SHA256（RFC 5869，与 so-section-lock.py 的 hkdf_sha256() 同算法） */
 void khkdf_sha256(const uint8_t *ikm, size_t ikm_len,
                   const uint8_t *salt, size_t salt_len,

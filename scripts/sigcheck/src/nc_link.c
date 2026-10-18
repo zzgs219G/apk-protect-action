@@ -34,6 +34,56 @@ void nc_heartbeat_arm_constructor(void);
 #include <time.h>
 #include "sig_hash.h"
 
+/* ── 判决核心进加密段（2026-10-19，修实测报告 §8.1 最致命缺陷）───────
+ *
+ * 实测报告（docs/so层防御/简盒-so层静态防御实测报告.md §3.6/§8.1）指控：
+ *   加密了壳（ncVerify 转发器），把核留在明文——
+ *   真正的判定算法 nc_verify_t1 与两张表 SIG_SALT/SIG_HASH_STORED
+ *   全在 .rodata，攻击者 `od` 一条命令就能读出来，反问出通过值。
+ *   实测代价：报告作者据此 5 分钟反推出 32 字节通过凭据。
+ *
+ * 本处修复把【判定函数 + 两张表】一并标进 .ncguard 段，运行期由
+ * nc_guard_boot.c 解锁后才可执行/可读：
+ *   - 未解锁时它们是密文 → objdump 读到 <unknown>，od 读到随机字节
+ *   - 解锁后才参与判定（触发点：NcLink.selftest → ncguard_unlock）
+ *
+ * ⚠️ 三条纪律（违反任一即死锁或崩溃）：
+ *   ① ncVerify / heartbeat 这两个 JNI 入口【绝不能】进 .ncguard——
+ *      它们是 unlock 的调用方，锁进去 = 开锁器被锁进箱子 = 死锁。
+ *      本文件只标判决核心，不标 JNI 入口。
+ *   ② 宿主测试（NCLINK_HOST_TEST）下必须【不标段】：宿主 clang 没有
+ *      解锁设施，标了段就读到密文 → 测试假红。用宏条件化。
+ *   ③ 表必须 retain：lib-ndk.sh 的 LOCAL_LDFLAGS 含 -Wl,--gc-sections，
+ *      无引用会被连段回收（报错十一同款）。
+ *
+ * 性能：零开销。段标记只是链接期属性，判定逻辑与数据布局不变；
+ * 解锁本身只在 constructor 跑一次（实测 104 us，其中 RC4 占 102 us）。
+ */
+/* 开关只有一个：NC_GUARD_SECTIONED。
+ * 为什么不用 __ANDROID__ 自动判断——那样宿主端任何一次"想验证段布局"
+ * 的编译都会踩坑（标了段却没人解锁 → 读到密文 → 假红）。显式开关让
+ * "我要标段"成为必须说出口的事，protect.sh 负责定义它。 */
+#if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)
+#  define NC_VERIFY_SECTION __attribute__((section(".ncguard"), retain, used))
+#else
+#  define NC_VERIFY_SECTION            /* 宿主测试/普通宿主构建：不标段 */
+#endif
+
+/* 表进加密段的宏：与函数同理，但额外要求 used+retain（防 gc-sections）。
+ *
+ * ⚠️ 2026-10-19 实测踩坑（必须记住）：表【不能】与函数放同一个段。
+ *    clang 报 `'nc_verify_t1' causes a section type conflict with 'SIG_SALT'`
+ *    —— 因为 .ncguard 是 AXR（可执行）段，而 SIG_SALT 是 const 数据，
+ *    LLVM 拒绝让同一段既装代码又装只读数据。
+ *    解法：数据单独进 .ncguard_ro（AWR，不可执行），由锁箱器一并加密。
+ *    这也更合理——代码段解出来是 RX，数据段解出来是 R，权限各自最小。 */
+#if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)
+#  define NC_VERIFY_TABLE_SECTION \
+        __attribute__((section(".ncguard_ro"), retain, used))
+#else
+#  define NC_VERIFY_TABLE_SECTION
+#endif
+
 /* ── Java 心跳状态(记录侧) ───────────────────────────────────────
  * nc_link.c 是心跳记录的正确归属:它是 Java↔Native 的桥接层,
  * 且在 sigcheck/envcheck 两种勾选组合下都会参与编译(protect.sh:354/363
@@ -99,7 +149,12 @@ int nc_heartbeat_expired(void)
  * 判决核心(宿主可测:NCLINK_HOST_TEST 时编译为纯逻辑函数)。
  * 非静态:由 -fvisibility=hidden 收敛符号面,JNI 入口是唯一导出面。
  * 返回 1 = 判定通过(或调试模式跳过),0 = 判定不过(Java 侧执行杀)。
+ *
+ * ⚠️ NC_VERIFY_SECTION（2026-10-19）：生产构建下本函数进 .ncguard 密文段。
+ *    它【不是】unlock 的调用方，是纯被调方，所以可以安全上锁。
+ *    调用方 ncVerify（JNI 入口）刻意不标——那会造成解锁死锁。
  */
+NC_VERIFY_SECTION
 int nc_verify_t1(const unsigned char *t1, int len)
 {
     unsigned char expected[SIG_HASH_LEN];

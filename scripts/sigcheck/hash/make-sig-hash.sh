@@ -101,13 +101,36 @@ if [[ ${#SALT_HEX} -ne 32 || ${#STORED_HEX} -ne 64 ]]; then
 fi
 
 # 生成 C 头文件（每行 8 字节;SIG_SALT 随机、SIG_HASH_STORED 为派生形态,均非明文指纹）
+#
+# 2026-10-19 段标记：两张表在生产构建下进 .ncguard 加密段。
+#   实测报告 §3.6/§8.1 指出：判定算法与这两张表原先全在 .rodata，
+#   攻击者 `od` 一条命令读出 salt + stored，5 分钟反推出 32 字节通过凭据。
+#   加了段属性后，未解锁时 od 读到的是随机密文。
+# ⚠️ 条件化理由（三条）：
+#   ① 宿主测试（NCLINK_HOST_TEST）没有解锁设施，标段 = 读到密文 = 假红
+#   ② sig_check.c（冻结模块）也用这张表，但它自己的 constructor 在 unlock
+#      之后才跑（50 < 65535），所以标段对它是安全的、且同样受益
+#   ③ 段名与 lib-ndk.sh 的 retain 纪律一致，必须带 used 防 gc-sections 回收
 {
   echo "/* 由流水线自动生成: $(basename "$APK") 证书指纹的双轮派生形态 */"
   echo "/* 攻防说明: 明文指纹不落盘。攻击面分析见 docs/流程文档.md §9(2026-10 存储混淆) */"
+  echo "/* 2026-10-19: 生产构建下两张表进 .ncguard 加密段(NC_GUARD_SECTIONED)。 */"
   echo "#ifndef _SIG_HASH_H_"
   echo "#define _SIG_HASH_H_"
+  echo ""
+  echo "/* 段属性宏：只有明确开启 NC_GUARD_SECTIONED 且非宿主测试时才生效。"
+  echo " * 未开启时退化为空宏 —— 宿主编译/单元测试行为完全不变。 */"
+  echo "#if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)"
+  echo "/* 数据段必须是【不可执行】的独立段：clang 不允许 const 数据进 AXR 段，"
+  echo " * 会报 \"causes a section type conflict\"。见 nc_link.c 的注释。 */"
+  echo "#  define SIG_HASH_SECTION __attribute__((section(\".ncguard_ro\"), retain, used))"
+  echo "#else"
+  echo "#  define SIG_HASH_SECTION"
+  echo "#endif"
+  echo ""
   echo "#define SIG_HASH_LEN 32"
   echo "#define SIG_SALT_LEN 16"
+  echo "SIG_HASH_SECTION"
   echo "static const unsigned char SIG_SALT[SIG_SALT_LEN] = {"
   for ((i = 0; i < 32; i += 16)); do
     row=""
@@ -117,6 +140,7 @@ fi
     echo "    ${row%, },"
   done
   echo "};"
+  echo "SIG_HASH_SECTION"
   echo "static const unsigned char SIG_HASH_STORED[SIG_HASH_LEN] = {"
   for ((i = 0; i < 64; i += 16)); do
     row=""

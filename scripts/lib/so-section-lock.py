@@ -495,11 +495,24 @@ def check_entropy_or_fail(elf: 'Elf', sec_name: str) -> float:
 
 def lock(so_path: str, out_path: str, section: str, cert: bytes,
          package: str, force: bool, dry: bool) -> int:
+    """锁一个或多个段。
+
+    section 支持逗号分隔的多段名（2026-10-19 新增），例如
+    ".ncguard,.ncguard_ro"。多段共用同一把 k_so、同一个 MAC ——这是刻意的：
+    它们逻辑上是同一份受保护资产（代码 + 它要用的常量表），拆成两把钥匙
+    只会让运行期需要多解一次、多存一份 key，收益为零。
+    为什么必须分两个 ELF 段：clang 不允许 const 数据进 AXR 段
+    （'causes a section type conflict'），所以表只能另开一个 AWR 段。
+    """
     with open(so_path, 'rb') as f:
         raw = f.read()
     elf = Elf(raw)
 
-    sec = elf.find(section)
+    sec_names = [s.strip() for s in section.split(',') if s.strip()]
+    if not sec_names:
+        print('❌ --section 为空', file=sys.stderr)
+        return 1
+    sec = elf.find(sec_names[0])
     if sec is None:
         print('❌ 段 %s 不存在。先确认 C 代码用 __attribute__((section("%s"))) 标记了它。'
               % (section, section), file=sys.stderr)
@@ -543,15 +556,35 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     k_so = keys['so']
     k_mac = keys['mac']          # 2026-12 完整性校验专用，与 so 域硬分隔
 
-    plain = bytes(elf.data[sec['offset']: sec['offset'] + sec['size']])
-    cipher = rc4(k_so, plain)
+    # ── 多段加密（2026-10-19：.ncguard 代码 + .ncguard_ro 常量表）──────
+    # 两段共用 k_so：逻辑上是同一份资产。MAC 覆盖【所有密文的拼接】，
+    # 于是任何一段被改都会让整体验签失败（与单段语义完全一致）。
+    segs = []                      # [(name, sec, plain, cipher)]
+    for nm in sec_names:
+        sc = elf.find(nm)
+        if sc is None:
+            print('❌ 段 %s 不存在。先确认 C 代码用 __attribute__((section("%s"))) 标记了它。'
+                  % (nm, nm), file=sys.stderr)
+            print('   现有段: %s' % ', '.join(x['name'] for x in elf.sections),
+                  file=sys.stderr)
+            return 1
+        elf.require_shf_alloc(sc)
+        if sc['size'] == 0:
+            print('❌ 段 %s 长度为 0，没有内容可锁' % nm, file=sys.stderr)
+            return 1
+        pl = bytes(elf.data[sc['offset']: sc['offset'] + sc['size']])
+        segs.append((nm, sc, pl, rc4(k_so, pl)))
+
+    plain = segs[0][2]             # 兼容下方 dry-run 打印与旧日志
+    cipher = segs[0][3]
 
     # 期望 MAC 对【密文】算，不对明文算：密文在解密前就可读，于是可以
     # "先验后解" —— 一旦被改过，根本不会把明文装进 .ncguard（fail-closed）。
     # 若对明文算，就必须先解密再验，篡改的明文已经落盘生效，晚一步。
     # 另一个理由是 RC4 是流密码：改密文 1 位恰好只翻明文 1 位，未必崩溃，
     # 攻击者可以"改一位→跑→看行为"做廉价 oracle；MAC 让这种试探第一次就暴露。
-    expect_mac = hmac_sha256(k_mac, cipher)
+    _mac_input = b''.join(sg[3] for sg in segs)   # 所有段密文按顺序拼接
+    expect_mac = hmac_sha256(k_mac, _mac_input)
 
     if dry:
         print('[dry-run] 段 %s: %d 字节 → %d 字节（size-preserving=%s）'
@@ -562,8 +595,9 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
         print('[dry-run] 未写文件')
         return 0
 
-    # 写回密文（原地，长度不变）
-    elf.data[sec['offset']: sec['offset'] + sec['size']] = cipher
+    # 写回密文（各段原地，长度不变）
+    for nm, sc, pl, ci in segs:
+        elf.data[sc['offset']: sc['offset'] + sc['size']] = ci
 
     # 密钥槽：magic(16) + wrapped_k_so(16) + wrapped_k_mac(16) + expect_mac(32)
     #          + pkg_sha8(8) + reserved(8) = 96 字节
@@ -611,19 +645,21 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     # 若放到写盘之后，fail-fast 时坏包已经落盘，protect.sh 虽然 exit 1 但
     # 文件已在——而它会被后续步骤当成有效产物。所以先验后写。
     if not dry:
-        ent = check_entropy_or_fail(elf, section)
-        if ent > 0:
-            print('   熵值安检: %.3f（下限 %.1f）✅' % (ent, ENTROPY_MIN))
-        else:
-            _sec = elf.find(section)
-            print('   熵值安检: 段仅 %d 字节（< %d），样本不足跳过'
-                  % (_sec['size'] if _sec else 0, ENTROPY_MIN_BYTES))
+        for nm, sc, pl, ci in segs:
+            ent = check_entropy_or_fail(elf, nm)
+            if ent > 0:
+                print('   熵值安检[%s]: %.3f（下限 %.1f）✅' % (nm, ent, ENTROPY_MIN))
+            else:
+                _sec = elf.find(nm)
+                print('   熵值安检[%s]: 段仅 %d 字节（< %d），样本不足跳过'
+                      % (nm, _sec['size'] if _sec else 0, ENTROPY_MIN_BYTES))
 
     with open(out_path, 'wb') as f:
         f.write(bytes(elf.data))
 
     print('✅ 已锁: %s → %s' % (so_path, out_path))
-    print('   段 %s: %d 字节已加密（size-preserving）' % (section, len(plain)))
+    for nm, sc, pl, ci in segs:
+        print('   段 %s: %d 字节已加密（size-preserving，共用 k_so）' % (nm, len(pl)))
     print('   密钥槽 %s: %d 字节' % (SLOT_NAME, len(blob)))
     print('   ⚠️ 运行期需配套"开箱"代码解密；没有它，这段代码不可执行')
     return 0

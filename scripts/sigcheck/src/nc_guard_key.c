@@ -146,6 +146,63 @@ void khmac_sha256(const uint8_t *key,size_t key_len,
     ksha_init(&c);ksha_update(&c,opad,64);ksha_update(&c,inner,32);ksha_final(&c,out);
 }
 
+/* ── 增量 HMAC（2026-10-19）─────────────────────────────────────────
+ * 动机：.ncguard 与 .ncguard_ro 是两段不连续内存，一次性算 HMAC 需要
+ * 先把两段拼接进临时缓冲（最多几十 KB）。增量式零额外内存、零拷贝。
+ *
+ * 完整性：与 khmac_sha256(key, m1||m2) 逐字节等价 —— 由
+ * scripts/lib/tests/test-so-lock.sh 的 HMAC 对拍项钉死。
+ *
+ * 结构（RFC 2104）：
+ *   inner = SHA(ipad || m1 || m2 || ...)
+ *   out   = SHA(opad || inner)
+ * 故 ctx 里保存：内层 SHA 上下文 + 已算好的 opad（32 字节未压缩的 k0^0x5c）
+ * 不能在 final 时再算 opad——feed 阶段 key 已不在手上。
+ * ⚠️ k0 必须先清零再用：key_len<64 时 memcpy 只写前 klen 字节，
+ *    后面 64-klen 必须是 0（哈希块填充语义）。 */
+struct khmac_ctx_s {
+    ksha_ctx inner;          /* 内层 SHA 上下文 */
+    uint8_t  opad[64];       /* 外层 pad（k0 ^ 0x5c），final 时用 */
+};
+
+/* 编译期把关：.h 里声明的 KHMAC_CTX_SIZE 必须 >= 实际结构体大小。
+ * 不一致会在这里直接编译失败，而不是运行期栈溢出（那种 bug 极难查）。 */
+typedef char khmac_size_check_t[
+    (sizeof(struct khmac_ctx_s) <= KHMAC_CTX_SIZE) ? 1 : -1];
+
+void khmac_init(khmac_ctx *ctx,const uint8_t *key,size_t key_len){
+    uint8_t k0[64]; size_t i;
+    memset(k0,0,sizeof k0);
+    if(key_len>64){ksha_init(&ctx->inner);ksha_update(&ctx->inner,key,key_len);
+        ksha_final(&ctx->inner,k0);}
+    else memcpy(k0,key,key_len);
+    for(i=0;i<64;i++) ctx->opad[i]=(uint8_t)(k0[i]^0x5c);
+    {
+        uint8_t ipad[64];
+        for(i=0;i<64;i++) ipad[i]=(uint8_t)(k0[i]^0x36);
+        ksha_init(&ctx->inner);
+        ksha_update(&ctx->inner,ipad,64);
+        memset(ipad,0,sizeof ipad);
+    }
+    memset(k0,0,sizeof k0);
+}
+
+void khmac_update(khmac_ctx *ctx,const uint8_t *data,size_t len){
+    ksha_update(&ctx->inner,data,len);
+}
+
+void khmac_final(khmac_ctx *ctx,uint8_t out[32]){
+    uint8_t inner[32];
+    ksha_ctx outer;
+    ksha_final(&ctx->inner,inner);
+    ksha_init(&outer);
+    ksha_update(&outer,ctx->opad,64);
+    ksha_update(&outer,inner,32);
+    ksha_final(&outer,out);
+    memset(inner,0,sizeof inner);
+    memset(ctx,0,sizeof *ctx);
+}
+
 /* ── HKDF-SHA256（RFC 5869，extract-then-expand）───────────────────
  * 与 so-section-lock.py 的 hkdf_sha256() 逐字节同算法：
  *   prk = HMAC(salt, ikm)
