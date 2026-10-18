@@ -34,7 +34,17 @@ LOCK="$ROOT/scripts/lib/so-section-lock.py"
 # 需要一个【已签名】APK（锁箱要提证书）。默认取仓库内样本，可用 TEST_APK 覆盖。
 # 为什么必须已签名：本轮 P1-a 起 k_so 由证书派生，未签名包会在锁箱阶段
 # fail-fast（"非 APK Signing Block magic"）——这是设计行为，不是 bug。
-APK=${TEST_APK:-/storage/emulated/0/简盒/简盒_signed_23_59_49_sign.apk}
+# APK 定位优先级：TEST_APK 环境变量 > 仓库内样本 > 手机上的简盒签名包（自动探测最新）
+if [ -z "${TEST_APK:-}" ]; then
+    for cand in "$ROOT/docs/so层防御"/*.apk; do
+        [ -f "$cand" ] && TEST_APK="$cand" && break
+    done
+fi
+if [ -z "${TEST_APK:-}" ] && [ -d "/storage/emulated/0/简盒" ]; then
+    # 取最新的一份（文件名含时间，ls -t 按 mtime 更可靠）
+    TEST_APK=$(ls -t /storage/emulated/0/简盒/*_sign.apk 2>/dev/null | head -1)
+fi
+APK=${TEST_APK:-}
 PKG=com.xixin.box
 
 PASS=0; FAIL=0

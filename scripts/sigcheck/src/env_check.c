@@ -794,21 +794,46 @@ static int env_map_path(const char *needle, char *out, size_t outlen) {
 }
 
 /* d3. [addr,addr+len) 是否整体落在可读映射内(maps 解析,避免非法读崩溃) */
+/* 判断 [addr, addr+len) 是否全部位于可读映射内。
+ *
+ * ⚠️ 2026-10-19 修 bug（外部实测报告 §13.1 的直接根因）：
+ *   旧实现要求整个区间落在【同一条】maps 记录里（`end <= e`）。
+ *   但 .text 往往与 .eh_frame / .rodata 尾部【同页】——实测 CI 产物：
+ *     .eh_frame 0x18478..0x200f4 (flags=0x2, 只读不执行)
+ *     .text     0x20100..0x46c18 (flags=0x6, 可执行)   ← 同页 0x20000
+ *   ld.so 会把这一页拆成 `r--p` 与 `r-xp` 两条映射，于是 .text 的
+ *   [start, end) 天然跨两条记录 → `end <= e` 恒假 → 本函数返回 0 →
+ *   self_text_crc_probe 直接放弃校验（"读不到内存"就当没问题）。
+ *   这就是报告实测"改了 3 处 .text 字节，完整性校验仍报 clean"的原因。
+ *
+ * 新实现：允许区间跨多条相邻记录——只要每一条被覆盖的字节都落在
+ * 某条【可读】记录内即可。用「游标推进」扫描：cur 从 target 出发，
+ * 每命中一条记录就把 cur 推到该记录末尾，直到 cur >= end。
+ *
+ * 安全性不变：仍然要求覆盖到的每条映射都是 'r' 权限；遇到空洞
+ * （没有任何记录覆盖）立即返回 0。不会把"不可读"误判为"可读"。
+ * 性能：maps 通常几十行，单次扫描 O(n)，且只在每 5 轮复查时跑一次。 */
 static int env_mem_readable(const void *addr, size_t len) {
     safe_lines_t it;
     char *line;
-    uintptr_t target = (uintptr_t)addr;
-    uintptr_t end = target + len;
+    uintptr_t cur = (uintptr_t)addr;
+    uintptr_t end = cur + len;
+    int progressed = 0;
+    if (len == 0) return 1;
+    if (end < cur) return 0;                      /* 溢出保护 */
     if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
-    while ((line = safe_lines_next(&it)) != NULL) {
+    while (cur < end && (line = safe_lines_next(&it)) != NULL) {
         unsigned long s = 0, e = 0;
         char perms[8] = {0};
         if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) != 3) continue;
-        if (perms[0] != 'r') continue;
-        if (target >= (uintptr_t)s && end <= (uintptr_t)e) { safe_lines_close(&it); return 1; }
+        if ((uintptr_t)e <= cur) continue;         /* 完全在游标之前，跳过 */
+        if ((uintptr_t)s > cur) break;             /* 出现空洞：cur 处无人覆盖 */
+        if (perms[0] != 'r') { safe_lines_close(&it); return 0; }
+        cur = (uintptr_t)e;                        /* 推进到本记录末尾 */
+        progressed = 1;
     }
     safe_lines_close(&it);
-    return 0;
+    return (cur >= end && progressed) ? 1 : 0;
 }
 
 /* d4. 解析 ELF 取 .text 的 文件偏移/虚拟地址/大小(仅小端,32/64 位) */
