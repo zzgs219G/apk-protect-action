@@ -41,7 +41,7 @@
  * .nckey 段的全部内容】—— 长度不一致时 Python 的
  * assert len(blob)==slot['size'] 会当场炸，属好消息；
  * 坏消息是它只在跑过锁箱后才暴露，所以改一侧必须立刻改另一侧。 */
-__attribute__((section(".nckey"), used, aligned(1), retain))
+__attribute__((section(".nck"), used, aligned(1), retain))
 static const volatile unsigned char ncg_key_slot[96] = {0};
 
 /* ── 被锁的业务逻辑：只有解锁后才能调用 ────────────────────────────
@@ -49,7 +49,7 @@ static const volatile unsigned char ncg_key_slot[96] = {0};
  * 对拍契约：ncguard_probe(0) == ((0^0x5A)+0x0F)*3 & 0xFF == 59。
  * 取值刻意不取 42/0/1 这类哨兵值，避免 strings 一眼定位。
  * retain 同密钥槽：防 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), used, retain))
+__attribute__((section(".ncx"), used, retain))
 int ncguard_probe(int token) {
     /* 用 token 派生一个确定性结果；逻辑本身不重要，重要的是"这段代码在
      * 锁箱后不可读、解锁后可正确执行"。Android 验证用的对拍契约：

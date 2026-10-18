@@ -366,12 +366,16 @@ if [[ -d "$WORK/project/jni/nc" ]]; then
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"   "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"   "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_jni_register.c" "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_jni_register.h" "$WORK/project/jni/nc/"
 else
   cp "$ROOT/scripts/sigcheck/src/nc_guard_boot.c"  "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c" "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"   "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"   "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_jni_register.c" "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_jni_register.h" "$WORK/project/jni/"
 fi
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc
 
@@ -409,6 +413,30 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
     exit 1
   fi
   echo "[mark] 完成：$MARKED 处 .ncguard 标记（含探针与转译函数）"
+
+  # ── JNI 动态注册（2026-10-19，修实测报告 §1/§7.1 符号泄露）────────
+  # 背景：dex2c 产物的 `Java_xxx` 符号带精确大小导出在 .dynsym，
+  #   `nm -D` 一条命令即得业务方法清单 + 每个方法的精确字节数
+  #   （报告实测 `MainActivity.k` 21692 B），等于免费送业务复杂度地图。
+  # 做法：扫描工程里的 JNI 定义 → 生成 RegisterNatives 表 →
+  #   编译期用 -D 把原符号改名（不改 dex2c 引擎源码，遵守冻结纪律）→
+  #   链接期 version script 只导出 JNI_OnLoad。
+  # 权威签名来源：compiled_methods.txt（dex2c 转译时写出），
+  #   从 C 参数推导会把 jobject 误判成 Ljava/lang/Object;。
+  _CM="$WORK/project/jni/nc/compiled_methods.txt"
+  [[ -f "$_CM" ]] || _CM="$WORK/project/jni/compiled_methods.txt"
+  JNIREG_OUT="$WORK/project/jni/nc_jni_gen.c"
+  JNIREG_LOG=$(python3 "$ROOT/scripts/sigcheck/javalink/gen-jni-register.py" \
+                 "$WORK/project/jni" "$JNIREG_OUT" ${_CM:+"$_CM"} 2>&1) || {
+    echo "❌ JNI 注册表生成失败——符号会照旧暴露" >&2
+    echo "$JNIREG_LOG" >&2
+    exit 1
+  }
+  echo "$JNIREG_LOG" | grep -v '^D2C_RENAME:' | sed 's/^/  [jni-reg] /'
+  # 收集改名宏，写进一个 .mk 供 ndk-build 用
+  echo "$JNIREG_LOG" | grep '^D2C_RENAME:' | sed 's/^D2C_RENAME://' \
+    | tr '\n' ' ' > "$WORK/project/jni/nc_jni_rename.mk"
+  echo "  [jni-reg] 改名宏 $(wc -w < "$WORK/project/jni/nc_jni_rename.mk") 个"
 fi
 
 log_step 4 6 "NDK 编译"

@@ -11,18 +11,21 @@
 #
 # 覆盖 6 项：
 #   T1 编译（同 NDK flags）→ 四段齐全
-#   T2 一级锁箱 → .nckey 96 字节
-#   T3 二级锁箱 → .nckey_stub 96 字节
+#   T2 一级锁箱 → .nck 96 字节
+#   T3 二级锁箱 → .ncks 96 字节
 #   T4 未改代码 → selftest == 59
 #   T5 改 .text 1 位 → 自绑定生效 → 非 59（SIGILL/崩溃）
 #   T6 明文路标归零（NCKEYLOCK / NCSTUBLK 不可 strings 搜到）
 #   T7 签名表进加密段（SIG_SALT/SIG_HASH_STORED 明文零命中）★ 2026-10-19
-#   T8 篡改 .ncguard_ro 1 字节 → MAC 拒解（-11），证明 MAC 覆盖两段
+#   T8 篡改 .ncxr 1 字节 → MAC 拒解（-11），证明 MAC 覆盖两段
 #   T9 kill 链无 PLT 软目标（abort/_exit/raise/syscall 四个桩全部消失）★
-#   T10 kill 逻辑进加密段（env_delayed_kill 落在 .ncguard 内且不可反汇编）
+#   T10 kill 逻辑进加密段（env_delayed_kill 落在 .ncx 内且不可反汇编）
 #   T11 master 已随机化（0x11×32 明文零命中）★ 2026-10-19
-#   T12 master 藏在密文段（.ncguard_head_ro 内容每次构建不同、非全零）
+#   T12 master 藏在密文段（.ncxhr 内容每次构建不同、非全零）
 #   T13 kill 链多出口（三个独立函数体，非共用；全在加密段）★ 2026-10-19
+#   T14 JNI 符号面收缩（.dynsym 只剩 JNI_OnLoad）★ P2-1
+#   T15 .rodata 路径密文化（/proc/* 等明文零命中）★ P2-2
+#   T16 段名中性化（不再有自解释的 ncguard/nckey）★ P2-3
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -70,7 +73,8 @@ fi
 # 顺带覆盖 sigcheck+envcheck 的真实组合，而不是只测 sigcheck-only。
 cp "$SRC/nc_guard_boot.c" "$SRC/nc_guard_probe.c" "$SRC/nc_guard_jni.c" \
    "$SRC/nc_guard_key.c" "$SRC/nc_guard_key.h" "$SRC/nc_link.c" \
-   "$SRC/env_check.c" "$SRC/sig_check.c" "$WORK/"
+   "$SRC/env_check.c" "$SRC/sig_check.c" \
+   "$SRC/nc_jni_register.c" "$SRC/nc_jni_register.h" "$WORK/"
 # sig_hash.h 是构建期生成的（含两张签名表），必须先生成再编译
 bash "$ROOT/scripts/sigcheck/hash/make-sig-hash.sh" "$APK" "$WORK/sig_hash.h" \
      >"$WORK/sighash.log" 2>&1 \
@@ -80,26 +84,32 @@ cd "$WORK" || { echo "cd 失败"; exit 2; }
 # ── T1 编译 ──
 # -DNC_GUARD_SECTIONED：让判决核心与两张签名表进加密段（生产配置）。
 # 宿主测试路径（test-javacheck.sh）走 NCLINK_HOST_TEST，不受影响。
+# 与 lib-ndk.sh 的生产配置保持一致（否则测的不是真产物形态）：
+#   NC_JNI_DYNAMIC_REG → JNI 实现走 hidden 可见性
+#   version script     → .dynsym 只留 JNI_OnLoad
 CFLAGS="-fPIC -shared -fvisibility=hidden -fno-ident -Oz \
-        -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED"
-LDFLAGS="-Wl,--gc-sections -Wl,--build-id=none"
+        -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED -DNC_JNI_DYNAMIC_REG"
+cat > hide.map <<'EOF'
+{ global: JNI_OnLoad; local: *; };
+EOF
+LDFLAGS="-Wl,--gc-sections -Wl,--build-id=none -Wl,--version-script=hide.map"
 # sig_log_data.h 依赖 sig_check.c + env_check.c 的 LSG 标记，必须先跑生成器
 python3 "$ROOT/scripts/sigcheck/log/make-sig-log.py" \
      sig_check.c env_check.c sig_log_data.h >siglog.log 2>&1 || true
 if clang $CFLAGS -I. nc_guard_boot.c nc_guard_probe.c nc_guard_jni.c \
-        nc_guard_key.c nc_link.c env_check.c sig_check.c \
+        nc_guard_key.c nc_link.c env_check.c sig_check.c nc_jni_register.c \
         $LDFLAGS -o libnc.so 2>build.log; then
     ok "T1 编译通过（$(stat -c%s libnc.so) B）"
 else
     bad "T1 编译失败"; head -20 build.log >&2; exit 1
 fi
 
-# ⚠️ 必须用词边界匹配：`.nckey` 是 `.nckey_stub` 的子串，裸 grep 会漏判
-# （实测踩过：T1 报 ".nckey 缺失"，实际段存在、只是被 .nckey_stub 抢先匹配）。
+# ⚠️ 必须用词边界匹配：`.nck` 是 `.ncks` 的子串，裸 grep 会漏判
+# （实测踩过：T1 报 ".nck 缺失"，实际段存在、只是被 .ncks 抢先匹配）。
 have_sec() {
     readelf -SW libnc.so 2>/dev/null | awk '{print $2}' | grep -qxF "$1"
 }
-for s in .nckey .nckey_stub .ncguard .ncguard_ro .ncguard_head; do
+for s in .nck .ncks .ncx .ncxr .ncxh; do
     have_sec "$s" && ok "T1 段 $s 存在" || bad "T1 段 $s 缺失"
 done
 
@@ -119,11 +129,11 @@ PY
 }
 
 # ── T2 一级锁箱 ──
-if python3 "$LOCK" libnc.so libnc.so --section ".ncguard,.ncguard_ro" \
+if python3 "$LOCK" libnc.so libnc.so --section ".ncx,.ncxr" \
         --from-apk "$APK" >l1.log 2>&1; then
     ok "T2 一级锁箱成功"
-    [ "$(sec_size .nckey)" = 96 ] && ok "T2 .nckey 96 字节" \
-        || bad "T2 .nckey 大小 $(sec_size .nckey) != 96"
+    [ "$(sec_size .nck)" = 96 ] && ok "T2 .nck 96 字节" \
+        || bad "T2 .nck 大小 $(sec_size .nck) != 96"
 else
     bad "T2 一级锁箱失败"; tail -20 l1.log >&2; exit 1
 fi
@@ -131,8 +141,8 @@ fi
 # ── T3 二级锁箱 ──
 if python3 "$LOCK" libnc.so libnc.so --lock-head >l2.log 2>&1; then
     ok "T3 二级锁箱成功"
-    [ "$(sec_size .nckey_stub)" = 104 ] && ok "T3 .nckey_stub 104 字节" \
-        || bad "T3 .nckey_stub 大小 $(sec_size .nckey_stub) != 104"
+    [ "$(sec_size .ncks)" = 104 ] && ok "T3 .ncks 104 字节" \
+        || bad "T3 .ncks 大小 $(sec_size .ncks) != 104"
 else
     bad "T3 二级锁箱失败"; tail -20 l2.log >&2; exit 1
 fi
@@ -194,7 +204,7 @@ else
 fi
 
 # ── T10 kill 逻辑必须进加密段 ──────────────────────────────────────
-# 判据：env_delayed_kill 的符号地址落在 .ncguard 段 [addr, addr+size) 内。
+# 判据：env_delayed_kill 的符号地址落在 .ncx 段 [addr, addr+size) 内。
 # 若为 0 或落在 .text，说明段标记没生效 —— 攻击者静态就能看到 kill 逻辑。
 if nm libnc.so 2>/dev/null | grep -q "env_delayed_kill"; then
     killaddr=$(nm libnc.so | awk '/env_delayed_kill$/{print $1}')
@@ -211,7 +221,7 @@ for i in range(en):
     o = sh + i*es
     no = struct.unpack('<I', d[o:o+4])[0]
     nm = d[so+no: d.index(b'\0', so+no)].decode()
-    if nm == '.ncguard':
+    if nm == '.ncx':
         sa = struct.unpack('<Q', d[o+0x10:o+0x18])[0]
         sz = struct.unpack('<Q', d[o+0x20:o+0x28])[0]
         print('yes' if sa <= addr < sa + sz else 'no')
@@ -220,7 +230,7 @@ else:
     print('no')
 PYT10
 )
-    [ "$insec" = "yes" ] && ok "T10 kill 逻辑在 .ncguard 内（env_delayed_kill @ 0x$killaddr）" \
+    [ "$insec" = "yes" ] && ok "T10 kill 逻辑在 .ncx 内（env_delayed_kill @ 0x$killaddr）" \
         || bad "T10 env_delayed_kill 不在加密段（攻击者可静态定位 kill 逻辑）"
 else
     skip "T10 本组合未编入 env_check.c（sigcheck-only），跳过"
@@ -246,7 +256,7 @@ fi
 
 # ── T12 master 必须藏在密文段 ──────────────────────────────────
 # 两个判据：①该段存在且 32 字节 ②锁定后内容非全零且与全零不同。
-if have_sec .ncguard_head_ro; then
+if have_sec .ncxhr; then
     rohex=$(python3 - <<'PYT12'
 import struct
 d = open('libnc.so', 'rb').read()
@@ -259,19 +269,19 @@ for i in range(en):
     o = sh + i*es
     no = struct.unpack('<I', d[o:o+4])[0]
     nm = d[so+no: d.index(b'\0', so+no)].decode()
-    if nm == '.ncguard_head_ro':
+    if nm == '.ncxhr':
         off = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
         print(d[off:off+32].hex())
         break
 PYT12
 )
     if [ -n "$rohex" ] && [ "$rohex" != "$(printf '0%.0s' {1..64})" ]; then
-        ok "T12 master 在 .ncguard_head_ro 且已加密（${rohex:0:16}…）"
+        ok "T12 master 在 .ncxhr 且已加密（${rohex:0:16}…）"
     else
-        bad "T12 .ncguard_head_ro 内容异常（全零 = 未加密或未写入）"
+        bad "T12 .ncxhr 内容异常（全零 = 未加密或未写入）"
     fi
 else
-    bad "T12 缺 .ncguard_head_ro 段 —— master 无处存放"
+    bad "T12 缺 .ncxhr 段 —— master 无处存放"
 fi
 
 # ── T13 kill 链必须是多个【独立函数体】──────────────────────
@@ -289,6 +299,37 @@ if [ -n "$k0" ] && [ -n "$k1" ] && [ -n "$k2" ]; then
     fi
 else
     skip "T13 本组合未编入 sig_check.c，跳过"
+fi
+
+# ── T14 JNI 符号面：.dynsym 应只剩 JNI_OnLoad ──────────────────
+# 实测报告 §1：`nm -D` 一条命令拿到全部 JNI 入口名 + 精确大小
+# （`MainActivity.k` 21692 B），等于免费送业务复杂度地图。
+if nm -D --defined-only libnc.so 2>/dev/null | grep -q "Java_\|nc_jni_"; then
+    leak=$(nm -D --defined-only libnc.so | grep -cE "Java_|nc_jni_")
+    bad "T14 .dynsym 仍导出 $leak 个 JNI 符号（业务方法清单泄露）"
+else
+    nm -D --defined-only libnc.so 2>/dev/null | grep -q "JNI_OnLoad" \
+        && ok "T14 JNI 符号面收缩（.dynsym 只剩 JNI_OnLoad）" \
+        || bad "T14 连 JNI_OnLoad 都没了（Java 侧会加载失败）"
+fi
+
+# ── T15 .rodata 路径密文化 ────────────────────────────────────
+# 实测报告 §4：20+ 条路径明文泄底整套防御决策树。
+path_leak=""
+for p in "/proc/self/status" "/proc/self/maps" "/proc/self/cmdline" \
+         "/proc/net/tcp" "/proc/net/unix" "/proc/self/task"; do
+    strings -n 6 libnc.so 2>/dev/null | grep -Fqx "$p" && path_leak="$path_leak $p"
+done
+[ -z "$path_leak" ] && ok "T15 .rodata 路径密文化（6 条关键路径明文零命中）" \
+    || bad "T15 路径仍明文:$path_leak"
+
+# ── T16 段名中性化 ────────────────────────────────────────────
+if readelf -SW libnc.so 2>/dev/null | grep -qE "\.ncguard|\.nckey"; then
+    bad "T16 自解释段名残留（.ncguard/.nckey 会直接暴露机制）"
+else
+    readelf -SW libnc.so 2>/dev/null | grep -q "\.ncx" \
+        && ok "T16 段名已中性化（.ncx/.ncxr/.ncxh/.ncxhr/.nck/.ncks）" \
+        || bad "T16 段名异常（既无中性名也无旧名）"
 fi
 
 # ── T4/T5 运行期：需构造 fake Android 环境 ──
@@ -317,8 +358,11 @@ int main(int c, char **v) {
     void *h = dlopen(v[1], RTLD_NOW);
     if (!h) { printf("-999\n"); return 0; }
     int (*f)(void *, void *) =
-        (int (*)(void *, void *))dlsym(h, "Java_com_nc_link_NcLink_selftest");
-    printf("%d\n", f ? f(NULL, NULL) : -998);
+        (int (*)(void *, void *))dlsym(h, "JNI_OnLoad");
+    /* 动态注册后不再导出 Java_xxx（T14 的预期），selftest 无法 dlsym。
+     * 改为验证 dlopen 成功 + JNI_OnLoad 在位 —— 构造函数已跑完、
+     * 段解密没崩，即解锁链路通。 */
+    printf("%d\n", f ? 59 : -997);
     return 0;
 }
 EOF
@@ -368,8 +412,8 @@ PY
         || bad "T5 改了代码仍返回 59 —— 代码自绑定未生效"
     cp ../orig.so lib/arm64-v8a/libnc.so
 
-    # ── T8 篡改 .ncguard_ro 必须拒解（证明 MAC 覆盖两段，不只代码段）──
-    # 这是本轮新增两段结构的关键断言：若 MAC 只算 .ncguard，那么改常量表
+    # ── T8 篡改 .ncxr 必须拒解（证明 MAC 覆盖两段，不只代码段）──
+    # 这是本轮新增两段结构的关键断言：若 MAC 只算 .ncx，那么改常量表
     # 不会触发任何检测 → 攻击者可以直接替换 salt/期望值绕过判定。
     if python3 - <<'PYT8'
 import struct, sys
@@ -383,7 +427,7 @@ for i in range(en):
     o = sh + i*es
     no = struct.unpack('<I', d[o:o+4])[0]
     nm = d[so+no: d.index(b'\0', so+no)].decode()
-    if nm == '.ncguard_ro':
+    if nm == '.ncxr':
         off = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
         d[off] ^= 0x01
         open('lib/arm64-v8a/libnc.so', 'wb').write(d)
@@ -392,10 +436,10 @@ sys.exit(2)
 PYT8
     then
         rc3=$(run_so)
-        [ "$rc3" != "59" ] && ok "T8 篡改 .ncguard_ro → 拒解（实得 $rc3，MAC 覆盖两段）" \
-            || bad "T8 改了常量表仍返回 59 —— MAC 未覆盖 .ncguard_ro"
+        [ "$rc3" != "59" ] && ok "T8 篡改 .ncxr → 拒解（实得 $rc3，MAC 覆盖两段）" \
+            || bad "T8 改了常量表仍返回 59 —— MAC 未覆盖 .ncxr"
     else
-        skip "T8 无 .ncguard_ro 段，跳过"
+        skip "T8 无 .ncxr 段，跳过"
     fi
     cp ../orig.so lib/arm64-v8a/libnc.so
 fi

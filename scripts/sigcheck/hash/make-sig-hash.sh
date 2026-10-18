@@ -123,7 +123,7 @@ fi
   echo "#if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)"
   echo "/* 数据段必须是【不可执行】的独立段：clang 不允许 const 数据进 AXR 段，"
   echo " * 会报 \"causes a section type conflict\"。见 nc_link.c 的注释。 */"
-  echo "#  define SIG_HASH_SECTION __attribute__((section(\".ncguard_ro\"), retain, used))"
+  echo "#  define SIG_HASH_SECTION __attribute__((section(\".ncxr\"), retain, used))"
   echo "#else"
   echo "#  define SIG_HASH_SECTION"
   echo "#endif"

@@ -148,6 +148,12 @@ static void siglog(const char *prio, const char *fmt, ...) {
 /*LSGS:ENV_TESTAPK|SIGCHECK_TEST_APK*/
 /*LSGS:ERR_APK_NOT_FOUND|apk not found (maps+data/app both failed)*/
 /*LSGS:ERR_NO_SIGN_BLOCK|no v2/v3 signing block or parse failed*/
+/* .rodata 路径密文化（2026-10-19，修实测报告 §4）：报告 strings 一遍
+ * 就反推出整套架构（maps→反注入、status→反调试、base.apk→签名校验定位）。
+ * 与上面同表，运行期 lsg_s 解码。标记格式见 make-sig-log.py。 */
+/*LSGS:PATH_CMDLINE2|/proc/self/cmdline*/
+/*LSGS:PATH_MAPS2|/proc/self/maps*/
+
 /* env_check.c 侧(e2e 同哨兵/同日志名,复用上面两条;哨兵路径共用 SIGLOG_SENTINEL) */
 
 /* ─────────────────────────── 中文流程日志(用户 2026-11 需求) ───────────────────────────
@@ -352,7 +358,9 @@ static unsigned long long rd64le(const unsigned char *p) {
 
 /* 从 /proc/self/cmdline 读取当前进程包名 */
 static int get_pkg_name(char *out, size_t outlen) {
-    int fd = open("/proc/self/cmdline", O_RDONLY);
+    char _cb[24];
+    const char *_cp = lsg_s(LSGS_PATH_CMDLINE2, _cb, sizeof(_cb));
+    int fd = _cp ? open(_cp, O_RDONLY) : -1;
     ssize_t n;
     if (fd < 0) return -1;
     n = read(fd, out, outlen - 1);
@@ -391,7 +399,11 @@ static int find_apk_path(char *out, size_t outlen) {
     }
 #endif
 
-    fp = fopen("/proc/self/maps", "r");
+    {
+        char _mb[24];
+        const char *_mp = lsg_s(LSGS_PATH_MAPS2, _mb, sizeof(_mb));
+        fp = _mp ? fopen(_mp, "r") : NULL;
+    }
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
             /* 报错十二修复:p 必须停在 "base.apk" 【之后】,旧代码 *p='\0'
@@ -459,7 +471,10 @@ static int find_apk_path(char *out, size_t outlen) {
         if (dladdr((void *)&find_apk_path, &info) && info.dli_fname) {
             snprintf(root, sizeof(root), "%s", info.dli_fname);
         } else {
-            FILE *mfp = fopen("/proc/self/maps", "r");
+            FILE *mfp;
+            char _mb[24];
+            const char *_mp = lsg_s(LSGS_PATH_MAPS2, _mb, sizeof(_mb));
+            mfp = _mp ? fopen(_mp, "r") : NULL;
             root[0] = '\0';
             if (mfp) {
                 while (fgets(line, sizeof(line), mfp)) {
@@ -724,7 +739,7 @@ static void derive_expected(const unsigned char actual[32], unsigned char out[32
  * ⚠️ 本函数是【被调用方】，调用方 sig_verify/sig_check_entry 不标段
  *    （它们是 unlock 的使用者，标进去会导致"解锁前就要调用密文"）。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(SIGCHECK_HOST_TEST)
-#  define SIG_KILL_SECTION __attribute__((section(".ncguard"), retain, used, noinline))
+#  define SIG_KILL_SECTION __attribute__((section(".ncx"), retain, used, noinline))
 #else
 #  define SIG_KILL_SECTION
 #endif

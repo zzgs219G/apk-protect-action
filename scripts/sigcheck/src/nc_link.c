@@ -33,6 +33,11 @@ void nc_heartbeat_arm_constructor(void);
 #include <stddef.h>
 #include <time.h>
 #include "sig_hash.h"
+/* 宿主判决对拍（NCLINK_HOST_TEST）不需要动态注册头——它只验证
+ * nc_verify_t1 的算法，不碰 JNI。条件包含避免宿主测试缺文件。 */
+#ifndef NCLINK_HOST_TEST
+#include "nc_jni_register.h"
+#endif
 
 /* ── 判决核心进加密段（2026-10-19，修实测报告 §8.1 最致命缺陷）───────
  *
@@ -64,7 +69,7 @@ void nc_heartbeat_arm_constructor(void);
  * 的编译都会踩坑（标了段却没人解锁 → 读到密文 → 假红）。显式开关让
  * "我要标段"成为必须说出口的事，protect.sh 负责定义它。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)
-#  define NC_VERIFY_SECTION __attribute__((section(".ncguard"), retain, used))
+#  define NC_VERIFY_SECTION __attribute__((section(".ncx"), retain, used))
 #else
 #  define NC_VERIFY_SECTION            /* 宿主测试/普通宿主构建：不标段 */
 #endif
@@ -79,7 +84,7 @@ void nc_heartbeat_arm_constructor(void);
  *    这也更合理——代码段解出来是 RX，数据段解出来是 R，权限各自最小。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)
 #  define NC_VERIFY_TABLE_SECTION \
-        __attribute__((section(".ncguard_ro"), retain, used))
+        __attribute__((section(".ncxr"), retain, used))
 #else
 #  define NC_VERIFY_TABLE_SECTION
 #endif
@@ -182,8 +187,13 @@ int nc_verify_t1(const unsigned char *t1, int len)
 /* JNI 入口:Java_com_nc_link_NcLink_ncVerify([B)Z
  * 类名固定 com.nc.link.NcLink(桥接类,与 StrDec 同为工具基础设施命名),
  * JNI 短名绑定构建期即可确定,无需 RegisterNatives。 */
+#if defined(NC_JNI_DYNAMIC_REG)
+__attribute__((visibility("hidden")))
+jboolean nc_jni_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)
+#else
 JNIEXPORT jboolean JNICALL
 Java_com_nc_link_NcLink_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)
+#endif
 {
     jsize len;
     jbyte *buf;
@@ -209,8 +219,13 @@ Java_com_nc_link_NcLink_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)
  * ⚠️ 身份校验防冒充:攻击者 patch 掉 Java 校验后自己喂 ping 即可绕过整个
  * 心跳机制 —— 所以 clazz 必须是 NcLink 本类(IsSameObject 锁死),
  * 这是 Xop shell_heartbeat_ok 的同款纪律。 */
+#if defined(NC_JNI_DYNAMIC_REG)
+__attribute__((visibility("hidden")))
+void nc_jni_heartbeat(JNIEnv *env, jclass clazz)
+#else
 JNIEXPORT void JNICALL
 Java_com_nc_link_NcLink_heartbeat(JNIEnv *env, jclass clazz)
+#endif
 {
     jclass self;
     /* 仅允许 NcLink 本类调用(短名绑定的调用类必然正确,这里是纵深:

@@ -93,7 +93,9 @@ static void envlog_detect(void) {
         if (!sn || access(sn, F_OK) != 0) return;
     }
     {
-        FILE *c = fopen("/proc/self/cmdline", "r");
+        char _pb[24];
+        const char *_p = lsg_s(LSGS_PATH_CMDLINE, _pb, sizeof(_pb));
+        FILE *c = _p ? fopen(_p, "r") : NULL;
         if (!c) return;
         {
             size_t n = fread(pkg, 1, sizeof(pkg) - 1, c);
@@ -174,6 +176,29 @@ static inline long env_raw_syscall(long n, long a0, long a1, long a2,
  *   ③ 保留随机延时:崩溃时机不可预测,攻击者难以把崩溃与"刚触发了什么"关联。
  *
  * 失败兜底:syscall 不可用(被 seccomp 拦等)时回落 abort(),绝不静默放行。 */
+/* ── .rodata 路径字符串密文化（2026-10-19，修实测报告 §4）─────
+ *
+ * 报告实测：`.rodata` 明文躺着 20+ 条路径，一条未加密，
+ * 且不是零散泄漏，而是【完整的防御决策树】：
+ *   /proc/self/status → 反调试    /proc/self/maps → 反注入
+ *   /proc/net/tcp     → 反双开    /proc/self/task → 线程级反调试
+ *   APK Sig Block 42  → 直读签名块
+ * 攻击者 strings 一遍就能反推出整套架构。
+ *
+ * 用既有 LSGS 机制（构建期 XOR 密文 / 运行期解码），与特征串同表。
+ * ⚠️ 标记格式见 make-sig-log.py（此处不写其字面形态——嵌套注释会提前
+ *    终结注释块，编译炸 top level declarator，报错速查已留档两次）。
+ */
+/*LSGS:PATH_CMDLINE|/proc/self/cmdline*/
+/*LSGS:PATH_MAPS|/proc/self/maps*/
+/*LSGS:PATH_NET_TCP|/proc/net/tcp*/
+/*LSGS:PATH_NET_TCP6|/proc/net/tcp6*/
+/*LSGS:PATH_STATUS|/proc/self/status*/
+/*LSGS:PATH_TASK|/proc/self/task*/
+/*LSGS:PATH_TASK_COMM|/proc/self/task/%s/comm*/
+/*LSGS:PATH_NET_UNIX|/proc/net/unix*/
+/*LSGS:PATH_LIBC|libc.so*/
+
 /* ── kill 链进加密段（2026-10-19，方案4：去掉 PLT 单点的可发现性）────
  *
  * 修的是外部实测报告（docs/so层防御/简盒-so层静态防御实测报告.md §12.1）
@@ -204,7 +229,7 @@ static inline long env_raw_syscall(long n, long a0, long a1, long a2,
  * 就又能看到这段代码。真正断绝这条路要靠 master 随机化（P1-1，未做）
  * 与内联 svc 打散出口（方案2，未做）。本方案是纵深的一层，不是终点。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(ENVCHECK_HOST_TEST)
-#  define ENV_KILL_SECTION __attribute__((section(".ncguard"), retain, used, noinline))
+#  define ENV_KILL_SECTION __attribute__((section(".ncx"), retain, used, noinline))
 #else
 #  define ENV_KILL_SECTION
 #endif
@@ -477,7 +502,7 @@ static void safe_lines_close(safe_lines_t *it) {
 /* a1. frida 默认端口 27042 / 27043 是否有监听者(127.0.0.1 回环快扫,50ms 超时) */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int frida_port_probe(void) {
     static const int ports[] = { 27042, 27043 };
     size_t i;
@@ -536,7 +561,7 @@ static int frida_port_probe(void) {
  *    提前终结注释块,编译炸 top level declarator;报错速查已留档)。 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int frida_maps_probe(void) {
     safe_lines_t it;
     char *line;
@@ -547,7 +572,9 @@ static int frida_maps_probe(void) {
     const char *k3 = lsg_s(LSGS_FRIDA_INJECT, s3, sizeof(s3));
     const char *k4 = lsg_s(LSGS_GADGET_FRIDA, s4, sizeof(s4));
     if (!k1 || !k2 || !k3 || !k4) return 0;   /* 解码失败 → 未检出 */
-    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    char _pb[24];
+    const char *_p = lsg_s(LSGS_PATH_MAPS, _pb, sizeof(_pb));
+    if (!_p || safe_lines_open(&it, _p) != 0) return 0;
     /* 只认明显的 frida 命名特征,宁漏勿误伤 */
     while ((line = safe_lines_next(&it)) != NULL) {
         if (strstr(line, k1) || strstr(line, k2) ||
@@ -568,9 +595,12 @@ static int frida_maps_probe(void) {
  * 端口特征串( ":69A2"/":69A3" )同样走 LSGS 密文,不明文进 so。 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int frida_tcp_table_probe(void) {
-    static const char *tables[] = { "/proc/net/tcp", "/proc/net/tcp6" };
+    char _tb[16], _t6[16];
+    const char *_pt = lsg_s(LSGS_PATH_NET_TCP, _tb, sizeof(_tb));
+    const char *_p6 = lsg_s(LSGS_PATH_NET_TCP6, _t6, sizeof(_t6));
+    const char *tables[] = { _pt, _p6 };
     char p1[12], p2[12];
     const char *hexports[2];
     size_t t, p;
@@ -614,7 +644,7 @@ static int frida_tcp_table_probe(void) {
  * 6 个特征串全走 LSGS 密文(不明文进 so),解码失败按"未检出"。 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int xposed_maps_probe(void) {
     safe_lines_t it;
     char *line;
@@ -627,7 +657,9 @@ static int xposed_maps_probe(void) {
     const char *k5 = lsg_s(LSGS_XP_LIBRIRU,   s5, sizeof(s5));
     const char *k6 = lsg_s(LSGS_XP_LIBZYGISK, s6, sizeof(s6));
     if (!k1 || !k2 || !k3 || !k4 || !k5 || !k6) return 0;
-    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    char _pb[24];
+    const char *_p = lsg_s(LSGS_PATH_MAPS, _pb, sizeof(_pb));
+    if (!_p || safe_lines_open(&it, _p) != 0) return 0;
     while ((line = safe_lines_next(&it)) != NULL) {
         if (strstr(line, k1) || strstr(line, k2) ||
             strstr(line, k3) || strstr(line, k4) ||
@@ -645,7 +677,7 @@ static int xposed_maps_probe(void) {
  * 5 个路径全走 LSGS 密文(路径本身也是检测特征,不明文进 so)。 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int xposed_file_probe(void) {
     char p1[48], p2[48], p3[48], p4[48], p5[48];
     const char *paths[5];
@@ -683,7 +715,7 @@ static int xposed_file_probe(void) {
  * "TracerPid:" 前缀走 LSGS 密文(它是调试检测的最直接路标词)。 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int tracer_probe(void) {
     safe_lines_t it;
     char *line;
@@ -691,7 +723,9 @@ static int tracer_probe(void) {
     int hit = 0;
     const char *key = lsg_s(LSGS_TRACERPID, tp, sizeof(tp));
     if (!key) return 0;
-    if (safe_lines_open(&it, "/proc/self/status") != 0) return 0;
+    char _pb[24];
+    const char *_p = lsg_s(LSGS_PATH_STATUS, _pb, sizeof(_pb));
+    if (!_p || safe_lines_open(&it, _p) != 0) return 0;
     while ((line = safe_lines_next(&it)) != NULL) {
         if (strncmp(line, key, 10) == 0) {
             int pid = atoi(line + 10);
@@ -751,7 +785,7 @@ static uint32_t env_crc32_hw(const uint8_t *buf, size_t len) {
 /* 探测只做一次:硬件能力在进程生命周期内恒定 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int env_hw_crc_ok(void) {
     static int cached = -1;
     if (cached < 0) cached = (getauxval(AT_HWCAP) & HWCAP_CRC32) ? 1 : 0;
@@ -775,7 +809,9 @@ static uint32_t env_crc32(const uint8_t *buf, size_t len) {
 static int env_map_path(const char *needle, char *out, size_t outlen) {
     safe_lines_t it;
     char *line;
-    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    char _pb[24];
+    const char *_p = lsg_s(LSGS_PATH_MAPS, _pb, sizeof(_pb));
+    if (!_p || safe_lines_open(&it, _p) != 0) return 0;
     while ((line = safe_lines_next(&it)) != NULL) {
         char *slash;
         size_t n;
@@ -821,7 +857,9 @@ static int env_mem_readable(const void *addr, size_t len) {
     int progressed = 0;
     if (len == 0) return 1;
     if (end < cur) return 0;                      /* 溢出保护 */
-    if (safe_lines_open(&it, "/proc/self/maps") != 0) return 0;
+    char _pb[24];
+    const char *_p = lsg_s(LSGS_PATH_MAPS, _pb, sizeof(_pb));
+    if (!_p || safe_lines_open(&it, _p) != 0) return 0;
     while (cur < end && (line = safe_lines_next(&it)) != NULL) {
         unsigned long s = 0, e = 0;
         char perms[8] = {0};
@@ -936,7 +974,7 @@ static int env_pvm_read_u32(const void *addr, uint32_t *out) {
 
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int libc_hook_probe(void) {
     char n1[8], n2[8], n3[12], n4[8];
     const char *names[4];
@@ -966,7 +1004,7 @@ static int libc_hook_probe(void) {
 /* d5. libc .text 内存 vs 磁盘 CRC 比对;不等=内存被改写。任一步异常→放行(未检出) */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int libc_text_crc_probe(void) {
     Dl_info info;
     char path[512];
@@ -983,7 +1021,11 @@ static int libc_text_crc_probe(void) {
         else
             env_map_path(info.dli_fname, path, sizeof(path));
     }
-    if (path[0] == '\0') env_map_path("libc.so", path, sizeof(path));
+    if (path[0] == '\0') {
+        char _lb[16];
+        const char *_l = lsg_s(LSGS_PATH_LIBC, _lb, sizeof(_lb));
+        if (_l) env_map_path(_l, path, sizeof(path));
+    }
     if (path[0] == '\0') return 0;
 
     if (!env_elf_text(path, &ts)) return 0;
@@ -1028,7 +1070,7 @@ static int libc_text_crc_probe(void) {
  *   直接放行而不是误判。 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int self_text_crc_probe(void) {
     Dl_info info;
     char path[512];
@@ -1079,12 +1121,14 @@ static int self_text_crc_probe(void) {
  * 注意:gum 判定改为比对解码后的 k1,不再硬编码字面量。 */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int frida_thread_probe(void) {
     char n1[16], n2[8], n3[8], n4[16], n5[8];
     const char *names[5];
     size_t i;
-    DIR *d = opendir("/proc/self/task");
+    char _pb[24];
+    const char *_p = lsg_s(LSGS_PATH_TASK, _pb, sizeof(_pb));
+    DIR *d = _p ? opendir(_p) : NULL;
     struct dirent *de;
     int hits = 0, gum = 0;
     names[0] = lsg_s(LSGS_THR_GUMJS,  n1, sizeof(n1));   /* gum-js-loop */
@@ -1124,7 +1168,7 @@ static int frida_thread_probe(void) {
 /* f. Frida unix socket 检测(读 /proc/net/unix 的路径字段) */
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
-__attribute__((section(".ncguard"), retain))
+__attribute__((section(".ncx"), retain))
 static int frida_unix_probe(void) {
     char s1[12], s2[16], s3[12];
     const char *sigs[3];
@@ -1135,7 +1179,9 @@ static int frida_unix_probe(void) {
     sigs[1] = lsg_s(LSGS_UNX_LINJECTOR, s2, sizeof(s2));   /* "linjector" */
     sigs[2] = lsg_s(LSGS_UNX_GUMJS,     s3, sizeof(s3));   /* "gum-js" */
     if (!sigs[0] || !sigs[1] || !sigs[2]) return 0;
-    if (safe_lines_open(&it, "/proc/net/unix") != 0) return 0;
+    char _ub[16];
+    const char *_u = lsg_s(LSGS_PATH_NET_UNIX, _ub, sizeof(_ub));
+    if (!_u || safe_lines_open(&it, _u) != 0) return 0;
     while ((line = safe_lines_next(&it)) != NULL) {
         for (i = 0; i < 3; i++) {
             if (strstr(line, sigs[i])) { safe_lines_close(&it); return 1; }
@@ -1292,7 +1338,7 @@ static void env_check_run(void) {
 /* dlopen 后最先执行的入口(与 sig_check_entry 并存,顺序不定,互不依赖) */
 __attribute__((constructor)) static void env_check_entry(void) {
     /* .ncguard 解锁(2026-12)：必须排在【所有探针之前】——本文件的 12 个探针
-     * 已用 __attribute__((section(".ncguard"))) 标进加密段，未解锁时它们是密文，
+     * 已用 __attribute__((section(".ncx"))) 标进加密段，未解锁时它们是密文，
      * 提前调用会执行密文 → SIGILL。
      * 幂等：ncguard_unlock() 内部以 .nckey 槽的 magic 判重，未锁/已解锁都返回 0；
      * 失败(负数)不阻断——解密失败时下面调探针会崩，但那正是要暴露的问题，

@@ -2,7 +2,7 @@
 """so_section_mark.py — 通用"段标记器"：按函数头规则给 C/C++ 源码打加密段标记
 
 这是什么（第2层设施）：
-    把"哪些代码要进 .ncguard 加密段"这件事，从"每个模块自己在源码里手写
+    把"哪些代码要进 .ncx 加密段"这件事，从"每个模块自己在源码里手写
     __attribute__((section(...)))"变成"一条可配置规则"。
 
     使用者（第3层）只管声明"我要保护长这样的函数"，不用管段名、不用管
@@ -32,7 +32,7 @@
 
     --rule dex2c-jni     内置规则名（可多次指定）
     --pattern REGEX      自定义匹配（与 --rule 等价，二选一）
-    --section .ncguard   目标段名（默认 .ncguard）
+    --section .ncx       目标段名（默认 .ncx）
     --check             只报告不写
     --dry-run           同 --check
     -v                  列出每个命中位置
@@ -47,7 +47,7 @@ import os
 import re
 import sys
 
-SECTION = '.ncguard'
+SECTION = '.ncx'
 ATTR = '__attribute__((section("%s"), used, retain))' % SECTION
 
 

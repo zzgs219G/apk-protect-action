@@ -44,8 +44,8 @@ import sys
 import zlib
 
 # ── 常量契约（与运行期 C 代码共享，改这里必须同步改 C 侧）────────────
-SECTION_NAME = '.ncguard'           # 加密代码段（Xop 用 .bitcode，改名避开指纹）
-SLOT_NAME = '.nckey'                # 密钥槽段（Xop 用 .protwrap）
+SECTION_NAME = '.ncx'           # 加密代码段（Xop 用 .bitcode，改名避开指纹）
+SLOT_NAME = '.nck'                # 密钥槽段（Xop 用 .protwrap）
 # ⚠️ 2026-10-19：magic 不再以明文字面量落进 .nckey/.nckey_stub。
 # 原实现直接写 b'NCKEYLOCK' / b'NCSTUBLK'，攻击者 `strings -n 6` 就能扫出
 # 两条明确路标（实测旧产物可见 3 条）。现在改成 seed ^ XOR_KEY 的形式，
@@ -91,9 +91,9 @@ SLOT_MAGIC = SLOT_MAGIC_SEED + b'\x00' * 8   # 16 字节，后 8 保留
 # fail-fast）。也不能靠"让 CI 不 strip"绕过——那会把 frida_port_probe /
 # xposed_maps_probe 等探针名暴露进符号表，等于泄露检测意图。
 # 改用 section header table：strip 只删 .symtab/.strtab，段表始终完整。
-HEAD_NAME = '.ncguard_head'
-HEAD_RO_NAME = '.ncguard_head_ro'   # 存 master（2026-10-19 随机化）
-STUB_SLOT = '.nckey_stub'
+HEAD_NAME = '.ncxh'
+HEAD_RO_NAME = '.ncxhr'   # 存 master（2026-10-19 随机化）
+STUB_SLOT = '.ncks'
 STUB_MAGIC = STUB_MAGIC_SEED
 
 

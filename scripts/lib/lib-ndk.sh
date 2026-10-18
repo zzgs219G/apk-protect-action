@@ -57,6 +57,49 @@ EOF
 # so 加固(lib-ndk.sh 2026-10):丢弃未引用段 + 去符号表
 LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none
 EOF
+
+  # ── JNI 符号隐藏（2026-10-19，修实测报告 §1/§7.1）────────────────
+  # 实测报告用 `nm -D` 一条命令拿到 7 个 JNI 入口名 + 精确大小
+  # （`MainActivity.k` 21692 B），等于免费送业务复杂度地图。
+  #
+  # 做法：version script 只导出 JNI_OnLoad，其余（含 dex2c 的 Java_xxx）
+  # 全部 local。配合 protect.sh 生成的 RegisterNatives 表 + 编译期改名宏，
+  # Java 侧仍能正常调用（走运行期注册，不靠符号名）。
+  #
+  # ⚠️ 只在有注册表时才启用：没有 nc_jni_gen.c 就没有运行期注册，
+  #    隐藏符号会让 Java 侧 UnsatisfiedLinkError。
+  if [ -f "$jni/nc_jni_gen.c" ]; then
+    cat > "$jni/nc_hide.map" <<'MAPEOF'
+{
+  global:
+    JNI_OnLoad;
+  local:
+    *;
+};
+MAPEOF
+    cat >> "$jni/Android.mk" <<EOF
+LOCAL_LDFLAGS += -Wl,--version-script=\$(LOCAL_PATH)/nc_hide.map
+EOF
+    # 改名宏：把 Java_xxx 在编译期映射成 ncg_d2c_N（符号不出 .dynsym）
+    if [ -s "$jni/nc_jni_rename.mk" ]; then
+      cat >> "$jni/Android.mk" <<EOF
+LOCAL_CFLAGS += \$(shell cat \$(LOCAL_PATH)/nc_jni_rename.mk)
+LOCAL_CPPFLAGS += \$(shell cat \$(LOCAL_PATH)/nc_jni_rename.mk)
+EOF
+    fi
+    # NC_JNI_DYNAMIC_REG：让 nc_guard_jni/nc_link 的实现函数走 hidden 可见性
+    # NC_HAS_D2C_REG：有 dex2c 注册表时启用（JNI_OnLoad 里调用它）
+    cat >> "$jni/Android.mk" <<'EOF'
+LOCAL_CFLAGS += -DNC_JNI_DYNAMIC_REG
+LOCAL_CPPFLAGS += -DNC_JNI_DYNAMIC_REG
+EOF
+    if grep -q 'nc_jni_gen_register' "$jni/nc_jni_gen.c" 2>/dev/null; then
+      cat >> "$jni/Android.mk" <<'EOF'
+LOCAL_CFLAGS += -DNC_HAS_D2C_REG
+LOCAL_CPPFLAGS += -DNC_HAS_D2C_REG
+EOF
+    fi
+  fi
 }
 
 # ndk_build <工程根目录> — 执行 ndk-build，产物在 <工程根>/libs/<abi>/

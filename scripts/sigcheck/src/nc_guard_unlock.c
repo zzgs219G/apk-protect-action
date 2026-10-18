@@ -55,8 +55,8 @@
 #include "nc_guard_key.h"   /* khmac_sha256：完整性校验用，见下方 -11 分支 */
 
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一处 ── */
-#define NCG_SECTION   ".ncguard"
-#define NCG_SLOT      ".nckey"
+#define NCG_SECTION   ".ncx"
+#define NCG_SLOT      ".nck"
 #define NCG_SLOT_MAGIC "NCKEYLOCK"
 #define NCG_SLOT_SIZE  80    /* magic(16)+wrapped_k_so(16)+wrapped_k_mac(16)+expect_mac(32) */
 

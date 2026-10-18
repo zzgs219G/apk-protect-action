@@ -31,6 +31,7 @@
  * 未注入对应类，本导出函数只是不被调用，不影响其它任何东西。
  */
 #include <jni.h>
+#include "nc_jni_register.h"
 #include <stdatomic.h>
 
 /* 来自 nc_guard_unlock.c / nc_guard_probe.c（同一 NDK 工程，非 static） */
@@ -50,11 +51,23 @@ extern int ncguard_probe(int token);
 static atomic_int ncg_selftest_done = 0;
 
 /* 解锁 + 执行密文段代码，返回可判读的回执。
- * 显式 visibility("default")：库是 -fvisibility=hidden 编的，
- * 不加这个 JNI 符号不会被导出，Java 侧照旧找不到。 */
-__attribute__((visibility("default")))
-JNIEXPORT jint JNICALL
-Java_com_nc_link_NcLink_selftest(JNIEnv *env, jobject thiz) {
+ *
+ * ⚠️ 2026-10-19 改为 static + 动态注册（见 nc_jni_register.c）：
+ *   原来用 `JNIEXPORT ... Java_com_nc_link_NcLink_selftest` 导出，
+ *   `nm -D` 一条命令就能拿到符号名与大小。JNIEXPORT 自带 default 可见性，
+ *   -fvisibility=hidden 对它无效——只有动态注册能把名字从 .dynsym 摘掉。
+ *   `#ifndef NC_JNI_DYNAMIC_REG` 分支保留旧的短名绑定，仅供宿主测试
+ *   （宿主没有 JavaVM，跑不了 RegisterNatives）。 */
+#if defined(NC_JNI_DYNAMIC_REG)
+#define NC_SELFTEST_DECL \
+    __attribute__((visibility("hidden"))) \
+    jint nc_jni_selftest(JNIEnv *env, jobject thiz)
+#else
+#define NC_SELFTEST_DECL \
+    __attribute__((visibility("default"))) JNIEXPORT jint JNICALL \
+    Java_com_nc_link_NcLink_selftest(JNIEnv *env, jobject thiz)
+#endif
+NC_SELFTEST_DECL {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&ncg_selftest_done, &expected, 1)) {
         return (jint) -100;      /* 已自检过，拒绝重入 */

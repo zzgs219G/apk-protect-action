@@ -48,16 +48,28 @@
 
 #include "nc_guard_key.h"   /* khmac_sha256 */
 
+/* LSGS 密文表（路径字面量用）。
+ *
+ * ⚠️ 本文件的路径【复用 env_check.c 定义的宏】（LSGS_PATH_CMDLINE /
+ *    LSGS_PATH_MAPS），不另立标记 —— make-sig-log.py 只扫描
+ *    sig_check.c 与 env_check.c，扫不到本文件。同内容复用同一条密文，
+ *    既省体积也避免两条标记内容漂移。
+ *
+ * ⚠️ 为什么必须加密：这两个字面量所在函数虽标进 .ncguard_head，
+ *    但 **C 的字符串字面量永远进 .rodata，不会跟着函数进自定义段**。
+ *    实测确认：锁箱后 /proc/self/cmdline 仍在 .rodata 明文可搜。 */
+#include "sig_log_data.h"
+
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一侧 ── */
-#define NCG_SECTION      ".ncguard"
+#define NCG_SECTION      ".ncx"
 /* 常量表专用段（2026-10-19）：签名表的 salt/期望值放这里。
  * 为什么不能放 .ncguard：那是 AXR（可执行）段，clang 拒绝让 const 数据
  * 进去（'causes a section type conflict'）。本段是 AWR，不可执行。
  * 与 .ncguard 共用同一把 k_so 和同一个 MAC —— 逻辑上是同一份资产。 */
-#define NCG_SECTION_RO   ".ncguard_ro"
-#define NCG_SLOT         ".nckey"
-#define NCG_HEAD         ".ncguard_head"
-#define NCG_STUB_SLOT    ".nckey_stub"
+#define NCG_SECTION_RO   ".ncxr"
+#define NCG_SLOT         ".nck"
+#define NCG_HEAD         ".ncxh"
+#define NCG_STUB_SLOT    ".ncks"
 /* ⚠️ 2026-10-19：magic 不再以明文字面量出现在 .rodata。
  *
  * 原实现是字符串常量 "NCKEYLOCK"/"NCSTUBLK"，`strings -n 6` 直接扫出——
@@ -233,7 +245,7 @@ static void ncg_xor_key(uint8_t out[8]) {
  * 东西"——循环依赖。用 k_stub 则链路是单向的：
  *   碎片 → XOR_KEY → k_stub → {解 head, 解 head_ro → master} → k_so
  * 且 stub 只需碎片、零 I/O，能独立完成这一步。 */
-#define NCG_HEAD_RO      ".ncguard_head_ro"
+#define NCG_HEAD_RO      ".ncxhr"
 __attribute__((section(NCG_HEAD_RO), used, retain, aligned(16)))
 static uint8_t ncg_master[32] = {0};
 
@@ -327,7 +339,9 @@ static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
  * 这里统一截到第一个 ':' 之前，与 AndroidManifest 的 package 对齐。 */
 __attribute__((section(NCG_HEAD), used, retain, noinline))
 static int ncg_self_pkg(char *out, size_t cap) {
-    int fd = open("/proc/self/cmdline", O_RDONLY);
+    char _cb[24];
+    const char *_cp = lsg_s(LSGS_PATH_CMDLINE, _cb, sizeof(_cb));
+    int fd = _cp ? open(_cp, O_RDONLY) : -1;
     if (fd < 0) return -1;
     char buf[256];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -366,7 +380,9 @@ static int ncg_pkg_matches(const uint8_t *slotdata, const char *pkg) {
  * 且这里在密文段里，必须自包含。 */
 __attribute__((section(NCG_HEAD), used, retain, noinline))
 static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
-    int fd = open("/proc/self/maps", O_RDONLY);
+    char _mb[24];
+    const char *_mp = lsg_s(LSGS_PATH_MAPS, _mb, sizeof(_mb));
+    int fd = _mp ? open(_mp, O_RDONLY) : -1;
     if (fd >= 0) {
         /* maps 可能上百 KB，按块读，逐行拼装 */
         static char buf[8192];
