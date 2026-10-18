@@ -37,6 +37,7 @@
 """
 import argparse
 import hashlib
+import math
 import struct
 import sys
 
@@ -375,6 +376,68 @@ def _first_cert_der(scheme: bytes):
     return None
 
 
+def shannon_entropy(data: bytes) -> float:
+    """香农熵（bits/byte）。用于验证"加密真的生效了"。
+
+    RC4 输出是伪随机流，熵必然接近 8.0（实测 .ncguard_head 约 7.4、
+    .ncguard 视内容在 7.9 以上）。普通代码段只有 6.6~6.9。
+    所以熵掉了只能说明一件事：那一段不是密文，是明文。
+    """
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    n = len(data)
+    ent = 0.0
+    for c in counts:
+        if c:
+            p = c / n
+            ent -= p * math.log2(p)
+    return ent
+
+
+# 密文段熵的下限。RC4 伪随机流的熵通常在 7.9 以上，普通代码段只有 6.6~6.9，
+# 两者之间有明显空隙，7.0 是安全阈值。
+#
+# ⚠️ 但熵值统计需要足够样本才有效：N 字节的段最多只有 N 种不同取值，
+# 熵的理论上限是 min(8, log2(N))。24 字节的上限仅 log2(24)≈4.59 ——
+# 2026-10-18 实测踩过：拿 24 字节的 .ncguard 跑安检，熵 4.502 被判失败，
+# 但那其实是接近满值的随机数据（假阳性）。
+# 因此段长低于 ENTROPY_MIN_BYTES 时直接跳过安检，不做判断。
+ENTROPY_MIN = 7.0
+ENTROPY_MIN_BYTES = 256
+
+
+def check_entropy_or_fail(elf: 'Elf', sec_name: str) -> float:
+    """校验某段加密后的熵值，异常则抛 ElfError（调用方按 fail-fast 处理）。
+
+    为什么需要这道安检：so 加密是【自动捆绑】的层（用户没有勾选框可取消），
+    一旦锁箱静默失效——比如段缺失时返回成功码、或某次改动把明文写回——
+    流水线全绿、app 正常，用户完全感知不到。这类"静默失效"比漏洞本身更危险。
+    熵值检查把它变成构建期炸响。
+
+    ⚠️ 样本量门槛：N 字节的段最多只有 N 种不同取值，熵的理论上限是
+    min(8, log2(N))。段长低于 ENTROPY_MIN_BYTES（256）时统计不具区分度
+    （24 字节的上限仅 log2(24)≈4.59，再随机也过不了 7.0），直接跳过。
+    """
+    sec = elf.find(sec_name)
+    if sec is None:
+        raise ElfError('熵值安检失败：段 %s 不存在（加密未生效）' % sec_name)
+    if sec['size'] < ENTROPY_MIN_BYTES:
+        # 段太短，熵值统计不具区分度——跳过而非误判
+        return 0.0
+    seg = bytes(elf.data[sec['offset']: sec['offset'] + sec['size']])
+    ent = shannon_entropy(seg)
+    if ent < ENTROPY_MIN:
+        raise ElfError(
+            '熵值安检失败：段 %s 熵仅 %.3f（下限 %.1f）——'
+            '这一段不是密文而是明文，加密未生效。'
+            '排查方向：① 锁箱是否真的跑了 ② 段内容是否被后续步骤覆盖回明文'
+            % (sec_name, ent, ENTROPY_MIN))
+    return ent
+
+
 def lock(so_path: str, out_path: str, section: str, cert: bytes,
          package: str, force: bool, dry: bool) -> int:
     with open(so_path, 'rb') as f:
@@ -461,6 +524,18 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
         'blob %d != slot size %d（.nckey 段需扩到 80；改了一侧必须同步另一侧）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
+
+    # 熵值安检（2026-10-18）：必须在【写盘之前】。
+    # 若放到写盘之后，fail-fast 时坏包已经落盘，protect.sh 虽然 exit 1 但
+    # 文件已在——而它会被后续步骤当成有效产物。所以先验后写。
+    if not dry:
+        ent = check_entropy_or_fail(elf, section)
+        if ent > 0:
+            print('   熵值安检: %.3f（下限 %.1f）✅' % (ent, ENTROPY_MIN))
+        else:
+            _sec = elf.find(section)
+            print('   熵值安检: 段仅 %d 字节（< %d），样本不足跳过'
+                  % (_sec['size'] if _sec else 0, ENTROPY_MIN_BYTES))
 
     with open(out_path, 'wb') as f:
         f.write(bytes(elf.data))
@@ -588,6 +663,14 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
         '改 nc_guard_boot.c 的 NCG_STUB_SIZE 必须同步这里）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
+
+    # 熵值安检（2026-10-18）：必须在【写盘之前】，理由同 lock()——
+    # fail-fast 时坏包不能已经落盘，否则会被后续步骤当成有效产物。
+    # head 段通常 1-2KB（CI 实测 arm64 1588B / v7a 1112B），RC4 输出熵在
+    # 7.4 左右，远高于普通代码段的 6.6~6.9。低于 256 字节时自动跳过
+    # （采样不足，见 check_entropy_or_fail 的说明）。
+    ent = check_entropy_or_fail(elf, HEAD_NAME)
+    print('   熵值安检: %.3f（下限 %.1f）✅' % (ent, ENTROPY_MIN))
 
     with open(out_path, 'wb') as f:
         f.write(bytes(elf.data))
