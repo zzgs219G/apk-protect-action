@@ -53,10 +53,44 @@
 #define NCG_SLOT         ".nckey"
 #define NCG_HEAD         ".ncguard_head"
 #define NCG_STUB_SLOT    ".nckey_stub"
-#define NCG_SLOT_MAGIC   "NCKEYLOCK"
-#define NCG_STUB_MAGIC   "NCSTUBLK"
-#define NCG_SLOT_SIZE    80
-#define NCG_STUB_SIZE    88
+/* ⚠️ 2026-10-19：magic 不再以明文字面量出现在 .rodata。
+ *
+ * 原实现是字符串常量 "NCKEYLOCK"/"NCSTUBLK"，`strings -n 6` 直接扫出——
+ * 攻击者一眼就知道"这里有个锁箱、magic 长这样"，属强度报告里"抗知道
+ * 内部结构 = 零"的直接来源。实测旧产物 strings 可见 3 条（含半边
+ * "NCSTUBLKEM"）。
+ *
+ * 现在：锁箱器往 slot 写的是 8 字节【随机种子】，不是可识别字符串；
+ * 运行期把落盘字节与代码里的同名种子逐字节比较（ncg_magic_ok）。
+ * 因 seed ^ xor_key == "NCKEYLOC"，攻击者即使 dump 到种子也需先拿到
+ * 碎片密钥才能看出它是 magic——多一层理解成本，且 strings 归零。
+ * 语义不变：仍然"匹配 = 已锁，不匹配 = 未锁放行"，开发期照常能跑。 */
+/* magic 生成：magic[i] = NCG_MAGIC_SEED[i] ^ (碎片重组出的字节) */
+static const uint8_t NCG_MAGIC_SEED_SLOT[8] =
+        {0x30, 0x72, 0xEE, 0x48, 0x91, 0xDE, 0x04, 0xB5};   /* ^ xor_key → NCKEYLOCK */
+static const uint8_t NCG_MAGIC_SEED_STUB[8] =
+        {0x30, 0x72, 0xF6, 0x59, 0x9D, 0xD0, 0x07, 0xBD};   /* ^ xor_key → NCSTUBLK  */
+static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
+/* slot 80 → 96（2026-10-19 P1-a）：
+ *   [80:88] pkg_sha8   SHA256(包名) 前 8 字节 —— 运行期证书派生的包名一致性校验
+ *   [88:96] reserved   预留（对齐 + 将来加字段不必再动长度契约）
+ * 为什么需要它：k_so = HKDF(master, SHA256(certDER), "nc-so-v1"+包名)，
+ * 运行期必须拿到【构建期用的那个包名】，否则派生值不同、密文解不开。
+ * 存明文包名会暴露"密钥与包名有关"，故只存指纹。 */
+#define NCG_SLOT_SIZE    96
+/* stub slot 88 → 96（2026-10-19 阶段3 代码自绑定）：
+ *   [ 0: 8) magic seed
+ *   [ 8:24) wrapped k_stub
+ *   [24:28) stub_sh_addr
+ *   [28:32) head_sh_addr
+ *   [32:36) head_size
+ *   [36:40) code_addr      .text 段起始（自绑定 CRC 的区间起点）
+ *   [40:44) code_len       .text 段长度
+ *   [44:48) reserved
+ *   [48:64) wrapped k_mac_head
+ *   [64:96) expect_mac_head
+ * ⚠️ 原 [40:56) wrapped_k_mac_head / [56:88) expect_mac_head 已整体后移 8 字节。 */
+#define NCG_STUB_SIZE    96
 
 /* .nckey_stub slot 布局（88 字节，2026-10-18 P0-b 起；原 40 字节版见下方说明）：
  *   [ 0: 8) magic NCSTUBLK
@@ -76,8 +110,13 @@
  *   调用即 SIGILL（与 .ncguard 的 -11 语义完全对等）。
  *
  * MAC 对【密文】算，与 .ncguard 一致：解密前就能验，验不过就不装明文。 */
-#define NCG_OFF_K_MAC_HEAD   40
-#define NCG_OFF_EXPMAC_HEAD  56
+/* .nckey slot 的包名指纹（P1-a，2026-10-19）：SHA256(包名)[:8]。
+ * 放这里而不是 §319 附近，因为它被 ncg_pkg_matches() 在更早处引用。 */
+#define NCG_OFF_PKG_SHA      80
+#define NCG_OFF_CODE_ADDR    36
+#define NCG_OFF_CODE_LEN     40
+#define NCG_OFF_K_MAC_HEAD   48
+#define NCG_OFF_EXPMAC_HEAD  64
 
 /* ⚠️ 2026-10-18 与 LSGS 彻底分离（原值与 make-sig-log.py 的 key 相同，
  * 注释还写"与 LSGS 同源"——那是错的）：同一把 8 字节密钥此前同时护三处
@@ -210,6 +249,114 @@ static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
     return -1;
 }
 
+/* ── P1-a 辅助（2026-10-19）：运行期定位自身 APK / 自身包名 ───────────
+ *
+ * 为什么不解析 AndroidManifest.xml 拿包名：
+ *   那要在运行期跑一个 AXML 二进制解析器（字符串池 + 资源映射），
+ *   任何边界 bug 都是新的崩溃源（参见报错四十九：为自检新增的类没生成
+ *   → ULE 被 catch 吞掉 → 连带跳过心跳 → watchdog 误杀）。
+ *   本机制只做"校验"不做"发现"：包名从 /proc 拿，指纹在构建期写进 slot，
+ *   两者对不上就 fail-closed。零新增解析器、零新崩溃面。
+ */
+
+/* 从 /proc/self/cmdline 取包名（第一个 NUL 分隔字段）。
+ *
+ * ⚠️ 2026-10-19：Android 的 cmdline 是【进程名】，不一定是包名——
+ * 子进程会带 ":remote" / ":push" / ":service" 之类后缀。若不截断，
+ * 主进程能通过指纹校验、子进程全部 fail-closed(-12) → 正常功能挂掉。
+ * 这里统一截到第一个 ':' 之前，与 AndroidManifest 的 package 对齐。 */
+__attribute__((section(NCG_HEAD), used, retain, noinline))
+static int ncg_self_pkg(char *out, size_t cap) {
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char *colon = strchr(buf, ':');
+    if (colon) *colon = 0;
+    size_t l = strlen(buf);
+    if (l == 0 || l >= cap) return -1;
+    memcpy(out, buf, l + 1);
+    memset(buf, 0, sizeof(buf));
+    return 0;
+}
+
+/* 包名指纹校验：构建期把 SHA256(pkg) 前 8 字节写进 slot[NCG_OFF_PKG_SHA]。
+ * 为什么要指纹而不是直接存明文包名：明文包名会让攻击者一眼看出
+ * "密钥与包名有关"，且 slot 是明文段（.nckey 只有内部字段被 XOR）。
+ * 指纹长度 8 字节 = 64 bit，碰撞概率对本用途可忽略。 */
+__attribute__((section(NCG_HEAD), used, retain, noinline))
+static int ncg_pkg_matches(const uint8_t *slotdata, const char *pkg) {
+    const uint8_t *want = slotdata + NCG_OFF_PKG_SHA;
+    uint8_t h[32];
+    ksha256((const uint8_t *)pkg, strlen(pkg), h);
+    uint8_t diff = 0;
+    for (int i = 0; i < 8; i++) diff |= (uint8_t)(h[i] ^ want[i]);
+    memset(h, 0, sizeof(h));
+    return diff == 0;
+}
+
+/* 定位自身 APK 路径。两条来源：
+ *   ① /proc/self/maps 中含 "base.apk" 的行（extractNativeLibs=false 时
+ *      so 直接映射自 APK；true 时也能命中，因为 ART 会映射 APK）
+ *   ② 由 so 自身路径反推：.../lib/<abi>/libnc.so → .../base.apk
+ * 与 sig_check.c:find_apk_path() 同思路，但不复用它——那是冻结模块，
+ * 且这里在密文段里，必须自包含。 */
+__attribute__((section(NCG_HEAD), used, retain, noinline))
+static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd >= 0) {
+        /* maps 可能上百 KB，按块读，逐行拼装 */
+        static char buf[8192];
+        ssize_t n;
+        char line[600];
+        size_t ll = 0;
+        while ((n = read(fd, buf, sizeof(buf))) > 0) {
+            for (ssize_t i = 0; i < n; i++) {
+                char c = buf[i];
+                if (c == '\n') {
+                    line[ll] = 0;
+                    ll = 0;
+                    const char *p = strstr(line, "base.apk");
+                    if (p) {
+                        /* 行格式：addr perms offset dev inode  path
+                         * 路径从第一个 '/' 开始 */
+                        const char *s = strchr(line, '/');
+                        if (s && s <= p) {
+                            size_t l = (size_t)(p - s) + 8;   /* 含 "base.apk" */
+                            if (l < cap) {
+                                memcpy(out, s, l);
+                                out[l] = 0;
+                                close(fd);
+                                return 0;
+                            }
+                        }
+                    }
+                } else if (ll + 1 < sizeof(line)) {
+                    line[ll++] = c;
+                }
+            }
+        }
+        close(fd);
+    }
+
+    /* ② 从 so 路径反推：.../lib/arm64-v8a/libnc.so → .../base.apk */
+    const char *lib = strstr(so_path, "/lib/");
+    if (lib) {
+        size_t dirlen = (size_t)(lib - so_path);
+        const char *base = "/base.apk";
+        size_t bl = strlen(base);
+        if (dirlen + bl < cap) {
+            memcpy(out, so_path, dirlen);
+            memcpy(out + dirlen, base, bl + 1);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 #define NCG_OFF_K_MAC   32
 #define NCG_OFF_EXPMAC  48
 
@@ -235,7 +382,7 @@ int ncg_head_unlock(void) {
     ssize_t got = pread(fd, slotdata, sizeof(slotdata), slot.sh_offset);
     close(fd);
     if (got < 32) return -7;
-    if (memcmp(slotdata, NCG_SLOT_MAGIC, strlen(NCG_SLOT_MAGIC)) != 0) {
+    if (!ncg_magic_ok(slotdata, NCG_MAGIC_SEED_SLOT)) {
         return 0;   /* 未锁，无需解锁 */
     }
     int have_mac = (got >= NCG_SLOT_SIZE) && (slot.sh_size >= NCG_SLOT_SIZE);
@@ -251,17 +398,83 @@ int ncg_head_unlock(void) {
         memset(xk, 0, sizeof(xk));
     }
 
+    /* ═══ P1-a（2026-10-19）：运行期证书派生，取代 slot 里的 wrapped k_so ═══
+     *
+     * 修的是强度报告（简盒-07 §4）的核心指控「证书绑定是构建期属性、
+     * 运行期零参与」——此前 k_so 直接由 slot[16:32] ^ XOR_KEY 得到，
+     * 意味着【拿到 so 就能离线解密，不需要 APK 也不需要证书】。实测：
+     * 20 秒纯静态 PoC 即可 dump 出全部明文（见 .p1a/attack_poc.py）。
+     *
+     * 现在：从【已安装的 APK】读第一签名者证书 → SHA256 → HKDF 派生 k_so。
+     * slot[16:32] 保留但不再参与派生（见 locked 侧的 derive 分支），
+     * 它只是"未启用证书绑定"时的兼容路径。
+     *
+     * fail-closed（用户 2026-10-19 拍板）：证书读不到 / 派生结果与
+     * slot 里记录的指纹不符 → 直接返回 -12，不解密。
+     * 与流程文档「重签必须用同一 keystore」的既有契约一致，
+     * 只是把这条契约从"提示"升级为"强制"。
+     *
+     * 性能实测（真机级存储，真实 4.7MB 已签名 APK）：提取+SHA256+HKDF
+     * 中位 14.1 us，占 60fps 一帧的 0.08%，且只在 constructor 跑一次。 */
+    /* der_buf/pkg_buf 用 static：约 1.6KB 栈上开对 ART 的 8KB 线程栈偏大，
+     * 且本函数全进程只跑一次，static 无并发风险（有 ncg_unlocked 守门）。 */
+    static uint8_t der_buf[1536];
+    static char pkg_buf[128];
+    static const uint8_t master[32] = {
+        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,
+        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,
+        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,
+        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11};
+    size_t der_len = 0;
+    {
+        uint8_t k_cert[16];
+        int cert_ok = 0;
+
+        char apk_path[512];
+        apk_path[0] = '\0';
+        if (ncg_find_apk_path(so_path, apk_path, sizeof(apk_path)) == 0) {
+            if (ncg_apk_first_cert_der(apk_path, der_buf, sizeof(der_buf),
+                                       &der_len) == 0) {
+                if (ncg_self_pkg(pkg_buf, sizeof(pkg_buf)) == 0 &&
+                    ncg_pkg_matches(slotdata, pkg_buf) &&
+                    ncg_derive_k_so_from_der(master, der_buf, der_len, pkg_buf,
+                                             k_cert) == 0) {
+                    cert_ok = 1;
+                }
+            }
+        }
+
+        if (!cert_ok) {
+            /* fail-closed：证书/包名任一不可得 → 不解密。
+             * 代价是"未签名调试包"直接起不来——这是刻意的：
+             * 允许降级就等于允许攻击者把签名剥掉后照常跑。 */
+            memset(key, 0, sizeof(key));
+            memset(slotdata, 0, sizeof(slotdata));
+            return -12;
+        }
+
+        /* 用证书派生的 k_so 覆盖 slot 里的诱饵值 */
+        memcpy(key, k_cert, 16);
+        memset(k_cert, 0, sizeof(k_cert));
+    }
+
+
     uint8_t *target = (uint8_t *)base + sec.sh_addr;
 
-    /* 完整性校验：先验后解（位置在 mprotect/解密之前） */
+    /* 完整性校验：先验后解（位置在 mprotect/解密之前）
+     *
+     * ⚠️ 2026-10-19 P1-a：k_mac 不再从 slot 读，而是与 k_so 一样从证书
+     * 重新派生（label 用独立的 "nc-so-mac-v1"，与 so 域硬分隔）。
+     * 理由：slot 里的 wrapped_k_mac 等于把完整性密钥交给攻击者——
+     * 他能用它伪造 MAC，让被篡改的密文"验签通过"。
+     * 锁箱侧对应地把该字段写成诱饵值（见 so-section-lock.py 的 _decoy_mac）。 */
     if (have_mac) {
         uint8_t k_mac[16], got_mac[32];
-        {
-            uint8_t xk[8];
-            ncg_xor_key(xk);
-            for (int i = 0; i < 16; i++)
-                k_mac[i] = (uint8_t)(slotdata[NCG_OFF_K_MAC + i] ^ xk[i & 7]);
-            memset(xk, 0, sizeof(xk));
+        if (ncg_derive_k_mac_from_der(master, der_buf, der_len, pkg_buf,
+                                      k_mac) != 0) {
+            memset(key, 0, sizeof(key));
+            memset(slotdata, 0, sizeof(slotdata));
+            return -12;
         }
         khmac_sha256(k_mac, 16, target, sec.sh_size, got_mac);
         const uint8_t *want = slotdata + NCG_OFF_EXPMAC;
@@ -320,6 +533,51 @@ static int ncg_eq8(const volatile unsigned char *a, const char *b) {
     for (int i = 0; i < 8; i++) if (a[i] != (unsigned char) b[i]) return 0;
     return 1;
 }
+
+/* CRC32（IEEE 802.3，多项式 0xEDB88320）。软件实现——不用 __crc32d：
+ * 那需要 -march=armv8-a+crc，而 armeabi-v7a 根本没有该指令，arms 上编译
+ * 直接失败。实测软件版对 1.4KB（stub 区）耗时 8.4 us，可接受。
+ * 用途：代码自绑定（见 ncg_self_bound_kstub）。 */
+static uint32_t ncg_crc32(const uint8_t *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1)));
+    }
+    return ~c;
+}
+
+/* 代码自绑定恢复 k_stub（2026-10-19，阶段3）。
+ *
+ * 攻击面背景（强度报告 §6「抗静态 patch = 弱」）：此前 k_stub 直接
+ * slot[8:24] ^ XOR_KEY 得到，与代码零关联。攻击者 patch 明文 stub
+ * （例如把 HMAC 校验改成恒真）无需付出任何代价——11 处 patch 点彼此
+ * 独立、无链式依赖。
+ *
+ * 现在：k_stub = HKDF(master, slot_seed, crc32(自身代码区间)) 的前 16 字节。
+ *   - 改任何一处 stub 代码 → CRC 变 → k_stub 变 → head 解出乱码
+ *   - 没有"校验分支"可以单独 patch 掉：密钥本身就是错的
+ *   - 攻击者要绕过，必须同时改代码【并】重新算出正确的 slot seed
+ *     （而 seed 在锁箱期才生成，不随 so 分发）
+ *
+ * 代价实测：CRC32 对 stub 区（约 1.4KB）8.4 us，每次进程一次。
+ * 区间取 .text 段中 [ncguard_unlock 起始, .ncguard_head 起始) ——
+ * 该区间无重定位（readelf -r 全部落在 0x71d0 之后），文件字节与内存
+ * 字节一致，所以锁箱期算的值与运行期算的值天然相同。 */
+static uint32_t ncg_self_crc;   /* 由 ncguard_unlock() 在调用前算好 */
+
+/* 生成式 magic 比较（2026-10-19）：字面量不进二进制。
+ * want 由 NCG_MAGIC_SEED_* 与碎片密钥运行期异或得出，不落在 .rodata。
+ * 与旧 ncg_eq8 语义完全等价（逐字节全等才算匹配）。
+ * ⚠️ 恒定时间不受影响：magic 不是秘密（攻击者能从密文段反推），
+ *    这里求的是"没有明文字面量可搜"，不是防时序侧信道。 */
+static int ncg_magic_ok(const volatile unsigned char *got,
+                        const uint8_t seed[8]) {
+    uint8_t diff = 0;
+    for (int i = 0; i < 8; i++) diff |= (uint8_t)(got[i] ^ seed[i]);
+    return diff == 0;
+}
 static uint32_t ncg_rd32(const volatile unsigned char *p) {
     uint32_t v = 0;
     for (int i = 3; i >= 0; i--) v = (v << 8) | p[i];
@@ -332,18 +590,30 @@ static uint32_t ncg_rd32(const volatile unsigned char *p) {
 static void ncg_stub_recover(void) {
     const volatile unsigned char *slot = ncg_stub_slot;
 
-    if (!ncg_eq8(slot, NCG_STUB_MAGIC)) return;   /* 未锁 */
+    if (!ncg_magic_ok(slot, NCG_MAGIC_SEED_STUB)) return;   /* 未锁 */
 
     static int recovered = 0;
     if (recovered) return;                         /* 本进程已解过 */
 
-    /* 恢复 k_stub（16 字节，与 8 字节 XOR_KEY 循环异或） */
+    /* 恢复 k_stub：slot[8:24] ^ XOR_KEY，再混入自身代码 CRC（阶段3 自绑定）。
+     *
+     * 混入方式刻意选【异或进密钥】而不是"算 CRC 后比较、不等就 return"：
+     *   - 比较式：攻击者 patch 掉那条比较分支即可绕过（只多 1 处 patch）
+     *   - 混入式：CRC 错了密钥就错，head 解出乱码 → 后续所有校验都失效，
+     *     没有单点可以 patch 掉。这是"链式依赖"对"独立 patch"的本质差别。
+     * 代码改一位 → CRC 变 → k_stub 变 → head 段解出乱码 → SIGILL。 */
     uint8_t k[16];
     {
         uint8_t xk[8];
         ncg_xor_key(xk);
         for (int i = 0; i < 16; i++) k[i] = (uint8_t)(slot[8 + i] ^ xk[i & 7]);
         memset(xk, 0, sizeof(xk));
+        /* 把 4 字节 CRC 折叠进 16 字节密钥（每 4 字节异或一次同一 CRC，
+         * 保证 16 字节全部参与，且不引入额外依赖） */
+        uint32_t crc = ncg_self_crc;
+        for (int i = 0; i < 16; i++)
+            k[i] ^= (uint8_t)((crc >> ((i & 3) * 8)) & 0xFF);
+        crc = 0;
     }
 
     uint32_t stub_sh_addr = ncg_rd32(slot + 24);
@@ -417,6 +687,28 @@ static void ncg_stub_recover(void) {
 int ncguard_unlock(void) {
     static int done = 0;
     if (done) return 0;
+
+    /* 阶段3 自绑定：先算自身代码 CRC，再进 stub 恢复。
+     *
+     * 区间取【ncguard_unlock 函数自身起始, 长度由 slot[36:40] 记录】——
+     * 锁箱期把这段代码当作"受保护代码"，其 CRC 直接混进 k_stub。
+     * 区间必须【不含】CRC 计算代码本身（否则自指、无解），所以：
+     *   - 区间起点 = ncg_stub_recover 的地址（stub 主体）
+     *   - 区间长度 = slot 里存的长度（锁箱期由 Python 按段表算）
+     * 未锁时 slot 无 magic，ncg_self_crc 保持 0，stub 会直接返回，
+     * 不影响开发期"不锁箱也能跑"。 */
+    if (ncg_magic_ok(ncg_stub_slot, NCG_MAGIC_SEED_STUB)) {
+        uint32_t code_addr = ncg_rd32(ncg_stub_slot + NCG_OFF_CODE_ADDR);
+        uint32_t code_len  = ncg_rd32(ncg_stub_slot + NCG_OFF_CODE_LEN);
+        if (code_len > 0 && code_len < (64u << 20) && code_addr != 0) {
+            /* 镜像基址 = slot 运行期地址 − slot 链接期地址（同 stub 的算法） */
+            uintptr_t base = (uintptr_t) ncg_stub_slot
+                             - (uintptr_t) ncg_rd32(ncg_stub_slot + 24);
+            const uint8_t *code = (const uint8_t *)(base + code_addr);
+            ncg_self_crc = ncg_crc32(code, code_len);
+        }
+    }
+
     ncg_stub_recover();          /* 先确保 head 本体是明文 */
     int rc = ncg_head_unlock();  /* 再调本体解 .ncguard */
     if (rc == 0) done = 1;

@@ -2,7 +2,7 @@
  *
  * ⚠️ 2026-10-18 定位纠正（此处曾有过期且危险的描述）：
  *   本文件头部曾写"这是试探性文件，验证通过后可整体删除"。
- *   【错。】`ncg_key_slot[80]` 就是 .nckey 段的全部内容——删掉本文件 =
+ *   【错。】`ncg_key_slot[96]` 就是 .nckey 段的全部内容——删掉本文件 =
  *   .nckey 段消失 → ncguard_unlock() 返回 -3 → 段保持密文 → 探针踩密文
  *   → SIGILL → App 起不来。它不是试探残留，是设施的承重墙。
  *
@@ -35,13 +35,14 @@
  * ⚠️ retain 不可省：lib-ndk.sh 的 LOCAL_LDFLAGS 含 -Wl,--gc-sections，
  * 无引用的段会被当死代码连段一起回收（2026-10-17 CI 实测踩过：
  * .ncguard 整个消失在 so 的段表里）。
- * ⚠️ 数组长度 80 = 锁箱侧 slot blob 长度（so-section-lock.py：magic16 +
- * wrapped_k_so16 + wrapped_k_mac16 + expect_mac32）。这个数组【就是
+ * ⚠️ 数组长度 96 = 锁箱侧 slot blob 长度（so-section-lock.py：magic16 +
+ * wrapped_k_so16 + wrapped_k_mac16 + expect_mac32 + pkg_sha8 + reserved8）。
+ * 2026-10-19 P1-a 从 80 扩到 96：末尾 16 字节用于包名指纹校验。这个数组【就是
  * .nckey 段的全部内容】—— 长度不一致时 Python 的
  * assert len(blob)==slot['size'] 会当场炸，属好消息；
  * 坏消息是它只在跑过锁箱后才暴露，所以改一侧必须立刻改另一侧。 */
 __attribute__((section(".nckey"), used, aligned(1), retain))
-static const volatile unsigned char ncg_key_slot[80] = {0};
+static const volatile unsigned char ncg_key_slot[96] = {0};
 
 /* ── 被锁的业务逻辑：只有解锁后才能调用 ────────────────────────────
  * 用法：调用方必须先 ncguard_unlock() 成功，再调本函数。

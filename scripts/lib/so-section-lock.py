@@ -40,12 +40,31 @@ import hashlib
 import math
 import struct
 import sys
+import zlib
 
 # ── 常量契约（与运行期 C 代码共享，改这里必须同步改 C 侧）────────────
 SECTION_NAME = '.ncguard'           # 加密代码段（Xop 用 .bitcode，改名避开指纹）
 SLOT_NAME = '.nckey'                # 密钥槽段（Xop 用 .protwrap）
-SLOT_MAGIC = b'NCKEYLOCK' + b'\x00' * 7      # 16 字节，打包器扫这个定位
+# ⚠️ 2026-10-19：magic 不再以明文字面量落进 .nckey/.nckey_stub。
+# 原实现直接写 b'NCKEYLOCK' / b'NCSTUBLK'，攻击者 `strings -n 6` 就能扫出
+# 两条明确路标（实测旧产物可见 3 条）。现在改成 seed ^ XOR_KEY 的形式，
+# 二进制里不再有该字面量；运行期 C 侧由 ncg_magic_ok() 用同样的
+# seed ^ 碎片密钥 生成后比对，语义（匹配=已锁，不匹配=未锁放行）不变。
+# 改这四个常量必须同步 nc_guard_boot.c 的 NCG_MAGIC_SEED_SLOT/STUB。
+SLOT_MAGIC_SEED = bytes([0x30, 0x72, 0xEE, 0x48, 0x91, 0xDE, 0x04, 0xB5])
+STUB_MAGIC_SEED = bytes([0x30, 0x72, 0xF6, 0x59, 0x9D, 0xD0, 0x07, 0xBD])
 XOR_KEY = bytes([0x7E, 0x31, 0xA5, 0x0D, 0xC8, 0x92, 0x4B, 0xF6])
+# 注意：'NCKEYLOCK' 是 9 字节，seed 只覆盖前 8 字节（第 9 字节 'K' 由
+# 运行期 C 侧的 8 字节比较不涉及——C 侧比的是前 8 字节 'NCKEYLOC'）。
+assert bytes(a ^ b for a, b in zip(SLOT_MAGIC_SEED, XOR_KEY)) == b'NCKEYLOC'
+assert bytes(a ^ b for a, b in zip(STUB_MAGIC_SEED, XOR_KEY)) == b'NCSTUBLK'
+# ⚠️ 落盘的是【seed 本身】，不是 seed^key。这是本机制的关键：
+#   - 落盘 seed（看起来是随机字节）→ strings 搜不到任何路标
+#   - 运行期 C 侧算 seed ^ 碎片密钥 = "NCKEYLOC" 再与... 不需要再比了：
+#     C 侧直接把落盘的 8 字节当作 seed，与自己算出的期望值比对即可。
+#   语义："slot 前 8 字节 == SLOT_MAGIC_SEED" ⇒ 已锁。
+# 旧的 SLOT_MAGIC/SLOT_MAGIC_SEED 双轨容易搞混，这里只保留 seed 一个真相源。
+SLOT_MAGIC = SLOT_MAGIC_SEED + b'\x00' * 8   # 16 字节，后 8 保留
 # ⚠️ 2026-10-18 与 LSGS 彻底分离（原注释写"与 LSGS 同源"，是错的）：
 # 同一把 8 字节密钥此前同时护三处 —— .ncguard 的 wrapped_k_so /
 # wrapped_k_mac、.ncguard_head 的 wrapped_k_stub、以及 make-sig-log.py 的
@@ -73,7 +92,7 @@ XOR_KEY = bytes([0x7E, 0x31, 0xA5, 0x0D, 0xC8, 0x92, 0x4B, 0xF6])
 # 改用 section header table：strip 只删 .symtab/.strtab，段表始终完整。
 HEAD_NAME = '.ncguard_head'
 STUB_SLOT = '.nckey_stub'
-STUB_MAGIC = b'NCSTUBLK'
+STUB_MAGIC = STUB_MAGIC_SEED
 
 
 class ElfError(Exception):
@@ -352,27 +371,63 @@ def manifest_package(apk_path: str) -> str:
 
 
 def _first_cert_der(scheme: bytes):
-    """v2/v3 scheme block 里第一个 certificate 的 DER。
+    """v2/v3 scheme 块里第一个 signer 的第一张证书 DER。
 
-    scheme 布局：signer 列表长度(4字节,值=1居多) + [ signedData长度(4) + signedData
-    + signedData长度(4,再写一次) + 证书数(4) + 各证书(长度(4)+DER) ]。
-    这里从 signedData 尾部反推：signedData 的最后 4 字节是证书数，
-    其后紧跟第一张证书的长度 + DER。"""
+    ⚠️ 2026-10-19 重写。旧实现（"从 signedData 尾部反推证书数"）是错的：
+    APK Sig Scheme v2/v3 的 certificates 段是【长度前缀序列】，没有"证书数"。
+    旧代码在真 APK 上碰巧从一个错误偏移取到 294 字节、头 `30820122` 的块并
+    当作证书返回——那是 **public key**，不是证书。真证书是 712 字节、头
+    `308202c4`。后果：k_so 实际绑定的是"公钥"而非"证书"，换了签名密钥但
+    证书链相同时绑定形同未变。
+
+    规范布局（source.android.com/docs/security/features/apksigning/v2）：
+      signers     = signers_len(4) + [signer_len(4) + signer]...
+      signer      = signed_data_len(4) + signed_data
+                    + signatures_len(4) + signatures
+                    + public_key_len(4) + public_key
+      signed_data = digests_len(4) + digests
+                    + certificates_len(4) + [cert_len(4) + cert_der]...
+                    + additional_attrs_len(4) + ...
+    """
     if not scheme or len(scheme) < 12:
         return None
-    i = 8
-    while i + 12 <= len(scheme):
-        sl = int.from_bytes(scheme[i:i + 4], 'little')
-        i += 4
-        if i + sl > len(scheme):
-            break
-        if sl >= 4:
-            certs = int.from_bytes(scheme[i + sl - 4:i + sl], 'little')
-            if certs > 0 and i + sl + 4 <= len(scheme):
-                cl = int.from_bytes(scheme[i + sl:i + sl + 4], 'little')
-                if 0 < cl <= len(scheme) - i - sl - 4:
-                    return scheme[i + sl + 4:i + sl + 4 + cl]
-        i += sl
+
+    def _from_signer(signer, n):
+        if n < 12:
+            return None
+        sd_len = int.from_bytes(signer[0:4], 'little')
+        if sd_len < 8 or sd_len + 4 > n:
+            return None
+        sd = signer[4:4 + sd_len]
+        q = 0
+        dg = int.from_bytes(sd[q:q + 4], 'little')  # digests_len
+        if dg < 4 or dg + 8 > sd_len:
+            return None
+        q += 4 + dg
+        certs_len = int.from_bytes(sd[q:q + 4], 'little')
+        q += 4
+        if certs_len < 4 or q + certs_len > sd_len:
+            return None
+        cl = int.from_bytes(sd[q:q + 4], 'little')
+        q += 4
+        if cl == 0 or cl > certs_len - 4 or q + cl > sd_len:
+            return None
+        return sd[q:q + cl]
+
+    # 规范路径：跳 signers_len，再跳 signer_len
+    off = 4
+    if off + 4 <= len(scheme):
+        sl = int.from_bytes(scheme[off:off + 4], 'little')
+        if sl >= 12 and off + 4 + sl <= len(scheme):
+            r = _from_signer(scheme[off + 4:off + 4 + sl], sl)
+            if r:
+                return r
+    # 回退路径：signers_len 被写成"个数"（=1）
+    cnt = int.from_bytes(scheme[0:4], 'little')
+    if 1 <= cnt <= 8 and off + 4 <= len(scheme):
+        sl = int.from_bytes(scheme[off:off + 4], 'little')
+        if sl >= 12 and off + 4 + sl <= len(scheme):
+            return _from_signer(scheme[off + 4:off + 4 + sl], sl)
     return None
 
 
@@ -511,17 +566,44 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     elf.data[sec['offset']: sec['offset'] + sec['size']] = cipher
 
     # 密钥槽：magic(16) + wrapped_k_so(16) + wrapped_k_mac(16) + expect_mac(32)
-    #          = 80 字节，.nckey 段必须同步扩到 80（否则 assert 炸）
+    #          + pkg_sha8(8) + reserved(8) = 96 字节
+    #          .nckey 段必须同步扩到 96（否则 assert 炸）
     # ⚠️ 切片窗口必须与 blob 等长：elf.data[a:b] = blob 若 len(blob) > b-a，
     # Python 会【插入】而非覆盖，把后续字节（段表/相邻段）顶坏。本人踩过。
-    # 布局保持 magic+wrapped_k_so 在前 32 字节【不变】——2026-12 之前的 C 侧
-    # ncg_recover_key() 正是从 offset 16 读 k_so 的，向前兼容。
-    wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_so))
-    wrapped_mac = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_mac))
-    blob = SLOT_MAGIC + wrapped + wrapped_mac + expect_mac
-    assert len(blob) == 80, 'blob %d != 80' % len(blob)
+    # 布局保持 magic+wrapped_k_so 在前 32 字节【不变】——旧 C 侧开箱代码
+    # 从 offset 16 读 k_so，向前兼容。
+    #
+    # 2026-10-19 P1-a 扩容 80→96：
+    #   [80:88] pkg_sha8 —— SHA256(包名) 前 8 字节。运行期用 /proc/self/cmdline
+    #           取到的进程名算同样指纹做一致性校验，不一致即 fail-closed(-12)。
+    #           存指纹而非明文包名：明文会暴露"密钥与包名有关"这条线索。
+    #   [88:96] reserved —— 对齐预留，将来加字段不必再动长度契约。
+    # ⚠️⚠️ 2026-10-19 P1-a 关键：slot[16:32] 不再存真实 k_so 的 wrapped 版本！
+    #
+    # 原实现 `wrapped = k_so ^ XOR_KEY` 会让 P1-a 完全失去意义：
+    # 证书派生的目的就是"密钥不在文件里"，可 slot 里又躺了一份 packaged
+    # 真密钥 → 攻击者 `slot[16:32] ^ XOR_KEY` 照样拿到 k_so，
+    # 20 行 Python 解完，运行期派生再多也是白做。
+    #
+    # 现在这里写【诱饵】：确定性随机值，与真 k_so 无关。
+    # 运行期 ncg_head_unlock() 从证书重新派生 k_so，根本不读这段。
+    # 保留 16 字节是为了维持 slot 布局与"存在一个 k_so 字段"的假象，
+    # 让攻击者以为自己找到了密钥（然后解出乱码）。
+    #
+    # 同理 k_mac 也不该落盘 —— 它是 HMAC 密钥，落盘等于把完整性校验
+    # 交给攻击者。运行期同样从证书重新派生。
+    _decoy_seed = hashlib.sha256(b'nc-decoy-v1' + (package or '').encode()).digest()
+    wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)]
+                    for i, b in enumerate(_decoy_seed[:16]))
+    _decoy_mac = hashlib.sha256(b'nc-decoy-mac' + (package or '').encode()).digest()
+    wrapped_mac = bytes(b ^ XOR_KEY[i % len(XOR_KEY)]
+                        for i, b in enumerate(_decoy_mac[:16]))
+    pkg_sha8 = hashlib.sha256((package or '').encode('utf-8')).digest()[:8]
+    blob = (SLOT_MAGIC + wrapped + wrapped_mac + expect_mac
+            + pkg_sha8 + b'\x00' * 8)
+    assert len(blob) == 96, 'blob %d != 96' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nckey 段需扩到 80；改了一侧必须同步另一侧）' \
+        'blob %d != slot size %d（.nckey 段需扩到 96；改了一侧必须同步另一侧）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
 
@@ -618,6 +700,32 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # 真正的盐是证书指纹，占位值公开不影响"换 key 重打包即失效"）
     k_stub = bytes([0x3B, 0x7C, 0x19, 0x5E, 0xA2, 0xDF, 0x48, 0x31,
                     0x6C, 0x85, 0xEA, 0x27, 0x54, 0x9B, 0x0F, 0xD6])
+
+    # ── 阶段3 代码自绑定（2026-10-19）────────────────────────────────
+    # 修强度报告 §6「抗静态 patch = 弱」：此前 k_stub 与代码零关联，
+    # 攻击者 patch 明文 stub（如把 HMAC 校验改恒真）无需代价。
+    #
+    # 现在把 .text 段的 CRC32 混进实际用于加密的密钥：
+    #   cipher_key = k_stub ^ fold(crc32(.text))
+    # 运行期 stub 先对 .text 算同样的 CRC，异或回去，才能得到正确密钥。
+    # 改任何一处明文代码 → CRC 变 → 密钥错 → head 解出乱码 → SIGILL。
+    #
+    # 为什么能自洽：.text 段 addr==offset 且整体无重定位
+    # （实测 readelf -r 的重定位全部落在 0x71d0 之后，.text 结束于 0x2714），
+    # 所以锁箱期按文件算的 CRC == 运行期按内存算的 CRC。
+    # 注意：CRC 覆盖 .text【锁箱前】的字节；二级锁箱只改 .ncguard_head，
+    # 不动 .text，所以运行期看到的 .text 与锁箱期完全一致。
+    text_sec = elf.find('.text')
+    if text_sec is None:
+        raise ElfError('.text 段不存在，无法做代码自绑定（阶段3）')
+    _text_bytes = bytes(elf.data[text_sec['offset']:
+                                 text_sec['offset'] + text_sec['size']])
+    code_crc = zlib.crc32(_text_bytes) & 0xFFFFFFFF
+    # 折叠进 16 字节密钥：与 C 侧 `k[i] ^= (crc >> ((i&3)*8)) & 0xFF` 同规则
+    k_stub_eff = bytes(
+        k_stub[i] ^ ((code_crc >> ((i & 3) * 8)) & 0xFF) for i in range(16)
+    )
+    print('   代码自绑定: CRC32(.text)=0x%08x → 已混入 k_stub' % code_crc)
     # k_mac_head：第三把钥匙，只用于 head 段的完整性校验（P0-b）。
     # 与 k_stub / k_so 都必须不同——复用任何一把都意味着"解开 head 就等于
     # 拿到业务段的钥匙"或"知道解密钥匙即可伪造 MAC"，分级失去意义。
@@ -632,7 +740,7 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # 刻意不用 RC4 的理由：明文 stub 里不能出现 256 字节 S 盒初始化循环
     # —— 那本身就是"这是 RC4"的活招牌，且会显著撑大 stub。简单 XOR 的
     # 代价由 HMAC 兜底（head 段的 MAC 见下方 P0-b，2026-10-18 补上）。
-    cipher = bytes(b ^ k_stub[i % len(k_stub)] for i, b in enumerate(plain))
+    cipher = bytes(b ^ k_stub_eff[i % len(k_stub_eff)] for i, b in enumerate(plain))
 
     elf.data[head['offset']: head['offset'] + head['size']] = cipher
 
@@ -642,11 +750,23 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # MAC 校验函数"那几位，把 .ncguard 的 HMAC 保护改成恒真从而绕过。
     expect_mac_head = hmac_sha256(k_mac_head, cipher)
 
-    # stub 槽（88 字节，P0-b 起）：magic(8) + wrapped_k_stub(16)
-    #   + stub_sh_addr(4) + head_sh_addr(4) + head_size(4) + reserved(4)
+    # stub 槽（96 字节，2026-10-19 阶段3）：magic(8) + wrapped_k_stub(16)
+    #   + stub_sh_addr(4) + head_sh_addr(4) + head_size(4)
+    #   + code_addr(4) + code_len(4) + reserved(4)          ← 阶段3 新增 8+4
     #   + wrapped_k_mac_head(16) + expect_mac_head(32)
     # ⚠️ 全程用 section header table 的 sh_addr/size，不碰 .symtab（见上方注释）
+    #
+    # 阶段3 代码自绑定（修强度报告「抗静态 patch = 弱」）：
+    #   code_addr/code_len 指向 .text 段。运行期 stub 对这段算 CRC32 并
+    #   异或进 k_stub —— 改任何一处明文代码 → CRC 变 → k_stub 变 →
+    #   head 解出乱码。没有"校验分支"可以单独 patch 掉，形成链式依赖。
+    #   为什么能自洽：.text 段 addr==offset 且【整体无重定位】
+    #   （readelf -r 的重定位全部落在 0x71d0 之后，而 .text 结束于 0x2714），
+    #   所以锁箱期按文件算的 CRC 与运行期按内存算的完全相同。
     import struct as _s
+    text = elf.find('.text')
+    if text is None:
+        raise ElfError('.text 段不存在，无法做代码自绑定（阶段3）')
     wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_stub))
     wrapped_mac = bytes(b ^ XOR_KEY[i % len(XOR_KEY)]
                         for i, b in enumerate(k_mac_head))
@@ -654,12 +774,14 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
             + _s.pack('<I', slot['addr'])
             + _s.pack('<I', head['addr'])
             + _s.pack('<I', head['size'])
+            + _s.pack('<I', text['addr'])
+            + _s.pack('<I', text['size'])
             + _s.pack('<I', 0)
             + wrapped_mac
             + expect_mac_head)
-    assert len(blob) == 88, 'stub blob %d != 88' % len(blob)
+    assert len(blob) == 96, 'stub blob %d != 96' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nckey_stub 段需扩到 88 字节；' \
+        'blob %d != slot size %d（.nckey_stub 段需扩到 96 字节；' \
         '改 nc_guard_boot.c 的 NCG_STUB_SIZE 必须同步这里）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob

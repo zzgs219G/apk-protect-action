@@ -5,6 +5,18 @@
  * 实际它是【全项目共用的 so 段加密设施】：任何模块的代码只要被标进
  * .ncguard 段，就由本文件负责在运行期还原。
  *
+ * ⛔⛔ 2026-10-19 补充警告：本文件是【历史存档，不要再改也不要再参考】。
+ *   自 2026-10-19 三阶段加固后，现行契约已全部变化，本文件**逐条过期**：
+ *     · slot 长度 80 → 96（新增 pkg_sha8 包名指纹）
+ *     · k_so / k_mac 不再从 slot 读，改为运行期从 APK 证书派生
+ *       （本文件的 ncg_recover_key 直接 `slot ^ XOR_KEY` 取钥，是错的）
+ *     · XOR_KEY 已碎片化为 4 个 volatile uint16（本文件仍是一整串常量，
+ *       且是 P0-a 之前的旧值 5AC3119E...，与现行 7E31A50D... 不符）
+ *     · 新增代码自绑定（crc32(.text) 混入 k_stub）
+ *     · magic 已改为种子形式，不再有明文 "NCKEYLOCK"/"NCSTUBLK"
+ *   现行实现见 nc_guard_boot.c + docs/流程文档.md §3.12.2~§3.12.6。
+ *   保留本文件的唯一理由是 AGENTS.md 冻结清单要求"历史存档不删"。
+ *
  * 设施分层（详见 docs/流程文档.md §3.12）：
  *   第1层 本文件 + so-section-lock.py + nc_guard_key.c = 段加密服务
  *         （RC4 / HMAC / 密钥槽 / mprotect / clear_cache）

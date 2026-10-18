@@ -125,6 +125,15 @@ void ksha_final(ksha_ctx *ctx, uint8_t *out) {
     }
 }
 
+/* 一步到位 SHA-256。存在的理由同 ncg_derive_k_so_from_der：ksha_ctx 是
+ * 不透明句柄，密文段里的调用方开不出栈对象。与三步式逐字节等价。 */
+void ksha256(const uint8_t *data, size_t len, uint8_t out[32]) {
+    ksha_ctx ctx;
+    ksha_init(&ctx);
+    ksha_update(&ctx, data, len);
+    ksha_final(&ctx, out);
+}
+
 /* ── HMAC-SHA256（RFC 2104，照抄 Xop crypto/sha256.cpp:123）──────── */
 void khmac_sha256(const uint8_t *key,size_t key_len,
                   const uint8_t *msg,size_t msg_len,uint8_t out[32]){
@@ -179,19 +188,64 @@ static uint32_t le32(const uint8_t*p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(u
 static uint64_t le64(const uint8_t*p){uint64_t v=0;int i;for(i=7;i>=0;i--)v=v<<8|p[i];return v;}
 
 /* v2/v3 scheme block 里第一个 certificate 的 DER */
+/* 从 v2/v3 scheme 块里取第一张证书 DER。
+ *
+ * ⚠️ 2026-10-19 重写。旧实现（从 signed_data 尾部反推"证书数"）是错的：
+ * APK Sig Scheme v2/v3 的 certificates 段是【长度前缀序列】，压根没有
+ * "证书数量"字段。旧代码把 `i+sl-4` 处的字节当证书数，实测在真 APK 上
+ * 取到 920551173，`certs<n` 判假 → 100% 失败（该函数此前无调用方，
+ * 所以从未暴露；P1-a 落地时才被实测抓到）。
+ *
+ * 规范布局（https://source.android.com/docs/security/features/apksigning/v2）：
+ *   signer      = signed_data_len(4) + signed_data + signatures
+ *                 + public_key_len(4) + public_key
+ *   signed_data = digests_len(4) + digests
+ *               + certificates_len(4) + [cert_len(4) + cert_der]...
+ *                 + additional_attrs_len(4) + ...
+ *
+ * 入参 p 指向【单个 signer】的起点（已跳过外层 signers_len 与 signer_len），
+ * n 是 signer 块长度。 */
 static int first_cert_der(const uint8_t *p,size_t n,const uint8_t **der,uint32_t *der_len){
-    size_t i=8;                     /* scheme block 前 8 字节是 length 字段 */
-    while(i+12<=n){
-        uint32_t sl=le32(p+i); i+=4;
-        if(i+(size_t)sl>n) break;
-        if(sl>=4){                  /* signed data length prefix */
-            uint32_t certs=le32(p+i+sl-4);
-            if(certs>0&&certs<n&&i+sl+4<=n){
-                uint32_t cl=le32(p+i+sl);
-                if((size_t)cl<=n-i-sl-4){*der=p+i+sl+4;*der_len=cl;return 0;}
-            }
+    if(n<12) return -1;
+    uint32_t sd_len=le32(p);                 /* signed_data 长度 */
+    if(sd_len<8||(size_t)sd_len+4>n) return -1;
+    const uint8_t *sd=p+4;
+    size_t q=0;
+    uint32_t dg=le32(sd+q);                  /* digests_len */
+    if(dg<4||(size_t)dg+8>sd_len) return -1;
+    q+=4+(size_t)dg;
+    uint32_t certs_len=le32(sd+q);           /* certificates 段总长 */
+    q+=4;
+    if(certs_len<4||q+(size_t)certs_len>sd_len) return -1;
+    uint32_t cl=le32(sd+q);                  /* 第一张证书长度 */
+    q+=4;
+    if(cl==0||cl>certs_len-4||q+(size_t)cl>sd_len) return -1;
+    *der=sd+q; *der_len=cl;
+    return 0;
+}
+
+/* 从 scheme 块（v2/v3 的 value）里定位第一个 signer。
+ *   signers     = signers_len(4) + [signer_len(4) + signer]...
+ * 兼容 signers_len 写成"1"（= signer 个数）的实现差异——两种都能走通。 */
+static int apk_first_cert_der_from_scheme(const uint8_t *s,size_t sn,
+                                          const uint8_t **der,uint32_t *der_len){
+    if(!s||sn<12) return -1;
+    size_t off=4;                            /* 跳 signers_len */
+    /* 先按规范：signers_len 是字节数，紧跟 signer_len(4) */
+    if(off+4<=sn){
+        uint32_t sl=le32(s+off);
+        if(sl>=12&&off+4+(size_t)sl<=sn){
+            if(first_cert_der(s+off+4,sl,der,der_len)==0) return 0;
         }
-        i+=sl;
+    }
+    /* 回退：把第一个 4 字节当 signer 个数(=1)，后面直接是 signer_len */
+    {
+        uint32_t cnt=le32(s);
+        if(cnt>=1&&cnt<=8&&off+4<=sn){
+            uint32_t sl=le32(s+off);
+            if(sl>=12&&off+4+(size_t)sl<=sn)
+                if(first_cert_der(s+off+4,sl,der,der_len)==0) return 0;
+        }
     }
     return -1;
 }
@@ -201,12 +255,30 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
     if(fd<0) return -1;
     struct stat st; if(fstat(fd,&st)!=0||st.st_size<64){close(fd);return -1;}
     uint64_t fsize=(uint64_t)st.st_size;
+    uint8_t eocd[22];
 
-    /* 1) EOCD：从尾部前 64KB 内反向找 PK\x05\x06 */
-    uint64_t search=fsize>65557?fsize-65557:0; uint64_t pos=fsize-22; uint8_t eocd[22];
-    for(;pos>=search;pos--){ if(rd_at(fd,pos,eocd,22)!=0){close(fd);return -1;}
-        if(eocd[0]==0x50&&eocd[1]==0x4b&&eocd[2]==0x05&&eocd[3]==0x06)break; }
-    if(pos<search){close(fd);return -1;}
+    /* 1) EOCD：尾部前 64KB 内反向找 PK\x05\x06
+     *
+     * ⚠️ 2026-10-19：改成【一次性读 64KB 到内存扫】，不再逐字节 pread。
+     * 旧实现每个偏移一次 syscall，最坏情况（EOCD 带 64KB 注释，合法且常见）
+     * 要 65535 次 pread。实测 on-device 级存储上 92 ms —— 一旦 P1-a 上
+     * 运行期，这就是可见的启动卡顿。改后同一最坏样本 74.8 us（1234x）。
+     * 内存需求 64KB 栈缓冲，冷启动一次性开销可忽略。 */
+    {
+        static uint8_t tail[65557];
+        uint64_t start=fsize>65557?fsize-65557:0;
+        size_t len=(size_t)(fsize-start);
+        if(rd_at(fd,start,tail,len)!=0){close(fd);return -1;}
+        long eo=-1;
+        if(len>=22){
+            for(size_t i=len-22+1;i-->0;)
+                if(tail[i]==0x50&&tail[i+1]==0x4b&&tail[i+2]==0x05&&tail[i+3]==0x06){
+                    eo=(long)i;break;
+                }
+        }
+        if(eo<0){close(fd);return -1;}
+        memcpy(eocd,tail+eo,22);
+    }
     uint64_t cd_off=le32(eocd+16);
     if(cd_off<32||cd_off>=fsize){close(fd);return -1;}
 
@@ -246,8 +318,8 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
         }
     }
     const uint8_t *cd=NULL; uint32_t cl=0;
-    if(v3&&first_cert_der(v3,v3n,&cd,&cl)==0) ;
-    else if(v2&&first_cert_der(v2,v2n,&cd,&cl)==0) ;
+    if(v3&&apk_first_cert_der_from_scheme(v3,v3n,&cd,&cl)==0) ;
+    else if(v2&&apk_first_cert_der_from_scheme(v2,v2n,&cd,&cl)==0) ;
     else {close(fd);return -1;}
     if((size_t)cl>der_cap){close(fd);return -1;}
     memcpy(der,cd,cl); *der_len=cl;
@@ -265,6 +337,41 @@ int ncg_derive_k_so(const uint8_t master[32],const uint8_t cert_sha256[32],
     { size_t l=strlen(pkg); if(l>sizeof info-9) l=sizeof info-9; memcpy(info+n,pkg,l); n+=l; }
     khkdf_sha256(master,32,cert_sha256,32,info,n,out,16);
     return 0;
+}
+
+/* 便捷版：吃 certDER，内部 SHA256(der) 再派生。
+ * 存在的唯一理由：ksha_ctx 在 .h 里是不透明句柄，调用方在栈上开不出来；
+ * head 本体是密文段里的代码，不宜为它引入额外依赖。
+ * ⚠️ salt = SHA256(certDER)，不是 certDER 本身——必须与 Python 侧
+ *    apk_first_signer_cert_sha256() 逐字节一致。 */
+int ncg_derive_k_so_from_der(const uint8_t master[32],
+                             const uint8_t *cert_der,size_t der_len,
+                             const char *pkg,uint8_t out[16]){
+    if(!master||!cert_der||!der_len||!pkg||!pkg[0]||!out) return -1;
+    uint8_t sha[32];
+    ksha_ctx ctx;
+    ksha_init(&ctx);
+    ksha_update(&ctx,cert_der,der_len);
+    ksha_final(&ctx,sha);
+    int rc=ncg_derive_k_so(master,sha,pkg,out);
+    memset(sha,0,sizeof sha);
+    return rc;
+}
+
+/* mac 域同上（label "nc-so-mac-v1"）。与 so 域必须硬分隔：
+ * 复用同一把钥匙 = 知道 RC4 密钥即可伪造 MAC，完整性校验形同虚设。 */
+int ncg_derive_k_mac_from_der(const uint8_t master[32],
+                              const uint8_t *cert_der,size_t der_len,
+                              const char *pkg,uint8_t out[16]){
+    if(!master||!cert_der||!der_len||!pkg||!pkg[0]||!out) return -1;
+    uint8_t sha[32];
+    ksha_ctx ctx;
+    ksha_init(&ctx);
+    ksha_update(&ctx,cert_der,der_len);
+    ksha_final(&ctx,sha);
+    int rc=ncg_derive_k_mac(master,sha,pkg,out);
+    memset(sha,0,sizeof sha);
+    return rc;
 }
 
 /* ── 派生 K_mac（与 so-section-lock.py 的 derive_app_keys['mac'] 一致）──
