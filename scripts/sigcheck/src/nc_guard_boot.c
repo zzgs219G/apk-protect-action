@@ -94,8 +94,15 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  *   [44:48) reserved
  *   [48:64) wrapped k_mac_head
  *   [64:96) expect_mac_head
+ *   [96:100) head_ro_addr   .ncguard_head_ro 段链接期虚拟地址（master 所在）
+ *   [100:104) head_ro_size  该段字节数
  * ⚠️ 原 [40:56) wrapped_k_mac_head / [56:88) expect_mac_head 已整体后移 8 字节。 */
-#define NCG_STUB_SIZE    96
+/* stub slot 96 → 104（2026-10-19 master 随机化）：
+ *   新增 [96:104) 两个 u32，定位 .ncguard_head_ro（存 master）。
+ *   为什么不复用 [44:48) 的原 reserved：[64:96) 已被 expect_mac_head 占满，
+ *   4 字节装不下 addr+size 两个值；硬塞会与 MAC 字段重叠（静默破坏校验）。
+ *   扩到 104 是最小改动，且 .nckey_stub 段同步 +8 字节即可。 */
+#define NCG_STUB_SIZE    104
 
 /* .nckey_stub slot 布局（88 字节，2026-10-18 P0-b 起；原 40 字节版见下方说明）：
  *   [ 0: 8) magic NCSTUBLK
@@ -122,6 +129,15 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
 #define NCG_OFF_CODE_LEN     40
 #define NCG_OFF_K_MAC_HEAD   48
 #define NCG_OFF_EXPMAC_HEAD  64
+/* master 数据段（.ncguard_head_ro）的定位（2026-10-19）：
+ * 复用原 reserved 区与其后的 4 字节，slot 仍 96 字节。
+ * [44:48) 原 reserved → head_ro_addr
+ * [88:92) 原 reserved 尾 → head_ro_size（避开 expect_mac_head 的 [64:96)？）
+ * ⚠️ [64:96) 已被 expect_mac_head 占用，故 head_ro_size 只能放在 [44:48)
+ *    之后的空位。实际：[40:44) 是 code_len，[44:48) 是原 reserved。
+ *    两个 u32 需要 8 字节，而 [44:48) 只有 4 字节 —— 见下方 slot 扩容说明。 */
+#define NCG_OFF_HEADRO_ADDR  96
+#define NCG_OFF_HEADRO_SIZE  100
 
 /* ⚠️ 2026-10-18 与 LSGS 彻底分离（原值与 make-sig-log.py 的 key 相同，
  * 注释还写"与 LSGS 同源"——那是错的）：同一把 8 字节密钥此前同时护三处
@@ -181,6 +197,45 @@ static void ncg_xor_key(uint8_t out[8]) {
 /* ═══════════════════════════════════════════════════════════════════
  * 第一部分：密文 unlock 本体（进 .ncguard_head，构建期被锁）
  * ═══════════════════════════════════════════════════════════════════ */
+
+/* ── master：HKDF 的 ikm，构建期随机化后藏进 head 密文段（2026-10-19）──
+ *
+ * 修的是实测报告静态部分 P1-1（报告排第二优先，本轮提前做，理由见下）：
+ *   master[32] 原来是 `static const` 全 0x11 的占位符，躺在 .rodata。
+ *   攻击者 `od` 一条命令读出，配合 APK 里的证书就能离线算出 k_so，
+ *   8 分钟解开 .ncguard —— 这条链【完全不需要运行、不需要真机、不需要证书私钥】。
+ *
+ * 为什么"只换成随机数"不够（这是本轮最关键的设计判断）：
+ *   随机数若仍是 .rodata 里的裸常量，攻击者 `od` 一样读出来，成本不变。
+ *   必须【同时】解决"值随机"和"藏到读不到的地方"。
+ *
+ * 现在的位置与链路：
+ *   本变量在 .ncguard_head 段内 → 构建期被整段 XOR 锁成密文
+ *   运行期必须【先解开 head】才能读到 master：
+ *     碎片(4×uint16) → XOR_KEY → wrapped_k_stub → k_stub → 解 head → master → k_so
+ *   攻击链从 2 步变 5 步，且中间任一步的产物都不是明文常量。
+ *
+ * ⚠️ 为什么 master 不用于解 head（避免循环依赖）：
+ *   head 段用 k_stub 解（stub 只需碎片，零 I/O）；master 只用于派生
+ *   k_so / k_mac 去解 .ncguard 业务段。若让 master 参与解 head，
+ *   就变成"要用 head 里的东西解 head 自己"——死循环。
+ *   这也符合 Xop 的分层：引导密钥（stub）与业务密钥（master→k_so）分离。
+ *
+ * ⚠️ 未锁箱时（开发期）：master 保持全零，运行期检测到全零即视为未锁，
+ *    不参与派生（与 magic 判"未锁"同语义）。全零不可能是合法 master，
+ *    因为锁箱器强制写入随机值并断言非全零。 */
+/* ⚠️ 段名用 .ncguard_head_ro 而不是 .ncguard_head：后者是 AXR（可执行），
+ * clang 拒绝让数据进去（'ncg_rc4' causes a section type conflict with
+ * 'ncg_master'）——本文件上一轮给签名表用 .ncguard_ro 也是同一原因。
+ *
+ * 为什么它必须和 head 用【同一把 k_stub】加密、且在【同一次 lock_head】
+ * 里一起锁：如果改用 k_so 加密，就成"k_so 的派生需要先解开 k_so 加密的
+ * 东西"——循环依赖。用 k_stub 则链路是单向的：
+ *   碎片 → XOR_KEY → k_stub → {解 head, 解 head_ro → master} → k_so
+ * 且 stub 只需碎片、零 I/O，能独立完成这一步。 */
+#define NCG_HEAD_RO      ".ncguard_head_ro"
+__attribute__((section(NCG_HEAD_RO), used, retain, aligned(16)))
+static uint8_t ncg_master[32] = {0};
 
 /* RC4 —— 与 so-section-lock.py 的 rc4() 逐字节同算法 */
 __attribute__((section(NCG_HEAD), used, retain, noinline))
@@ -425,12 +480,29 @@ int ncg_head_unlock(void) {
      * 且本函数全进程只跑一次，static 无并发风险（有 ncg_unlocked 守门）。 */
     static uint8_t der_buf[1536];
     static char pkg_buf[128];
-    static const uint8_t master[32] = {
-        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,
-        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,
-        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,
-        0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11};
     size_t der_len = 0;
+
+    /* master 来自 head 段内的 ncg_master（2026-10-19 随机化 + 藏进密文）。
+     *
+     * 本函数【自身就在 head 段内】，所以执行到这里时 ncg_master 已经是
+     * 明文（stub 已把整段解开）。这是关键前提：master 的可见性完全
+     * 依附于"head 是否已解开"。
+     *
+     * 全零 = 未锁箱（开发期）：此时不应派生任何真密钥。用全零 master 走
+     * 一遍 HKDF 也能算出结果，但那种产物本就未加密（.ncguard 明文），
+     * 所以行为等价于"没加锁"，不构成安全降级。
+     * 锁箱器强制：master 必须非全零，否则 fail-fast。 */
+    const uint8_t *master = ncg_master;
+    {
+        uint8_t acc = 0;
+        for (int i = 0; i < 32; i++) acc |= master[i];
+        if (acc == 0) {
+            /* 未锁箱：走原来的路径（.ncguard 本就是明文，不需要解密密钥），
+             * 但也不应把全零 master 当成"有效派生源"去算 —— 直接返回 0
+             * 让上层走"未锁"分支（magic 不匹配时本就返回 0）。 */
+            return 0;
+        }
+    }
     {
         uint8_t k_cert[16];
         int cert_ok = 0;
@@ -737,6 +809,49 @@ static void ncg_stub_recover(void) {
     mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC);
 
     for (uint32_t i = 0; i < head_size; i++) start[i] ^= k[i & 15];
+
+    /* ── 顺带解开 master 数据段（2026-10-19）──────────────────────
+     * 与 head 用同一把 k_stub、同一次遍历：master 只有解开这段才能读到，
+     * 而这段的定位信息在 slot[44:48)（head_ro_size）与 slot[48:52)
+     * （head_ro_addr）。两个额外 u32 塞进原 reserved 区，slot 仍 96 字节。
+     *
+     * 为什么必须在这里解、而不是在 ncg_head_unlock 里：
+     *   ncg_master 是 head 段【外面】的另一个段，head 本体解完之后才能
+     *   拿到 k_so；而取得 master 是派生 k_so 的前置。所以必须由 stub
+     *   （唯一持有 k_stub 的地方）在解完 head 后立刻解它。
+     *
+     * 失败处理：段缺失或大小异常 → 不解，master 保持全零 →
+     *   ncg_head_unlock 检测到全零即判定"未锁"直接返回 0。
+     *   这是 fail-safe 而非 fail-open：未锁状态下 .ncguard 本就是明文。 */
+    {
+        uint32_t ro_addr = ncg_rd32(slot + NCG_OFF_HEADRO_ADDR);
+        uint32_t ro_size = ncg_rd32(slot + NCG_OFF_HEADRO_SIZE);
+        if (ro_addr != 0 && ro_size > 0 && ro_size <= (1u << 16)) {
+            uint8_t *ro = (uint8_t *)(base + ro_addr);
+            uintptr_t ps2 = getpagesize();
+            uintptr_t rs = (uintptr_t) ro & ~(ps2 - 1);
+            uintptr_t re = ((uintptr_t) ro + ro_size - 1 & ~(ps2 - 1)) + ps2;
+            if (mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE) == 0) {
+                /* ⚠️ 必须用【简单循环 XOR】，不能调 ncg_rc4 ——
+                 * ncg_rc4 本身就在 .ncguard_head 段里，此刻还是密文，
+                 * 调用它会踩密文（实测卡死/SIGILL）。这是本文件第二次
+                 * 踩同一个坑（head 段锁箱也不能用 rc4，见 lock_head 注释）
+                 * ——规矩是：**stub 能碰到的函数只能是 .text 里的**。
+                 * 循环 XOR 就地内联，无任何跨段函数调用。 */
+                for (uint32_t i = 0; i < ro_size; i++)
+                    ro[i] ^= k[i & 15];
+                /* ⚠️ 恢复成 RW 而不是 R —— 实测踩过：
+                 * .ncguard_head_ro 与 .data / .bss 【同页】
+                 * （实测 arm64：.data 0x13ca8、head_ro 0x13cd0、
+                 *   .bss 0x13cf0，全在页 0x13000 内）。
+                 * mprotect 粒度是页，设成 READ 会把 .bss 也变只读 →
+                 * 后续任何 .bss 写入即 SIGSEGV。
+                 * 这个页本来就是 RW（.data/.bss 所在），恢复 RW 才是
+                 * 还原原状；密文段保护不靠页权限，靠"内容是密文"。 */
+                (void) mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE);
+            }
+        }
+    }
 
     __builtin___clear_cache((char *) start, (char *)(start + head_size));
     memset(k, 0, sizeof(k));

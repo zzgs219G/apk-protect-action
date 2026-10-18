@@ -38,6 +38,7 @@
 import argparse
 import hashlib
 import math
+import os
 import struct
 import sys
 import zlib
@@ -91,6 +92,7 @@ SLOT_MAGIC = SLOT_MAGIC_SEED + b'\x00' * 8   # 16 字节，后 8 保留
 # xposed_maps_probe 等探针名暴露进符号表，等于泄露检测意图。
 # 改用 section header table：strip 只删 .symtab/.strtab，段表始终完整。
 HEAD_NAME = '.ncguard_head'
+HEAD_RO_NAME = '.ncguard_head_ro'   # 存 master（2026-10-19 随机化）
 STUB_SLOT = '.nckey_stub'
 STUB_MAGIC = STUB_MAGIC_SEED
 
@@ -552,7 +554,29 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
         # 那 4012 字节密文秒变明文。fail-fast，逼调用方提供真证书。
         raise ElfError('cert 全零：必须提供 --cert-hex（证书绑定；全零 salt 会使'
                        '密文可被公开脚本解开）')
-    keys = derive_app_keys(b'\x11' * 32, cert, package or '')
+    # ── master 随机化（2026-10-19）────────────────────────────────
+    # 修实测报告静态 P1-1：master 原是全 0x11 占位符躺在 .rodata，
+    # `od` 一条命令读出 → 配合 APK 证书离线算 k_so → 8 分钟解开 .ncguard。
+    #
+    # 这里生成随机 master，并用它派生 k_so / k_mac。
+    # master 本身【以明文写进 .ncguard_head_ro 段】——注意：这一步写的是
+    # 明文，真正的保护来自随后的 --lock-head（用 k_stub 把它 XOR 成密文）。
+    # 所以必须严格按「先一级锁箱、再二级锁箱」的顺序跑，中间产物不含明文
+    # master 的窗口仅存在于构建机临时目录里。
+    head_ro = elf.find(HEAD_RO_NAME)
+    if head_ro is None:
+        raise ElfError('段 %s 不存在 —— master 无处存放（nc_guard_boot.c 的 '
+                       'ncg_master 需标段，且编译时要有 NC_GUARD_SECTIONED）'
+                       % HEAD_RO_NAME)
+    if head_ro['size'] < 32:
+        raise ElfError('%s 仅 %d 字节，容不下 32 字节 master'
+                       % (HEAD_RO_NAME, head_ro['size']))
+    master = os.urandom(32)
+    assert any(master), 'master 不能全零（全零会被运行期判为"未锁"）'
+    elf.data[head_ro['offset']: head_ro['offset'] + 32] = master
+    print('   master: 32 字节随机生成（将随二级锁箱藏入 %s）' % HEAD_RO_NAME)
+
+    keys = derive_app_keys(master, cert, package or '')
     k_so = keys['so']
     k_mac = keys['mac']          # 2026-12 完整性校验专用，与 so 域硬分隔
 
@@ -768,6 +792,46 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     k_mac_head = bytes([0x91, 0x4A, 0xD2, 0x08, 0x7B, 0xE3, 0x5F, 0xC6,
                         0x2D, 0xB8, 0x64, 0x17, 0xAF, 0x39, 0x8E, 0x51])
 
+    # ── master 随机化 + 藏进 .ncguard_head_ro（2026-10-19）──────────
+    #
+    # 修实测报告静态 P1-1：master[32] 原是 static const 全 0x11 的占位符，
+    # 躺在 .rodata，`od` 一条命令读出 → 配合 APK 证书离线算 k_so →
+    # 8 分钟解开 .ncguard。全程不需要运行、不需要真机、不需要私钥。
+    #
+    # 只换成随机数不够：随机值若仍是 .rodata 裸常量，`od` 一样读，成本不变。
+    # 必须【同时】做到：值随机 + 藏在读不到的地方。
+    #
+    # 现在：master 写进 .ncguard_head_ro 段，用【k_stub】加密（不是 k_so！）。
+    #   · 用 k_stub：链路单向 —— 碎片 → XOR_KEY → k_stub → {解 head,
+    #     解 head_ro → master} → k_so。没有循环依赖。
+    #   · 用 k_so 会死循环：k_so 的派生正需要 master。
+    #
+    # 攻击链从 2 步变 5 步，且中间产物全不是明文常量。
+    head_ro = elf.find(HEAD_RO_NAME)
+    if head_ro is None:
+        raise ElfError('段 %s 不存在 —— master 无处存放（nc_guard_boot.c 的 '
+                       'ncg_master 是否被标段？需 NC_GUARD_SECTIONED）'
+                       % HEAD_RO_NAME)
+    if head_ro['size'] < 32:
+        raise ElfError('%s 只有 %d 字节，容不下 32 字节 master'
+                       % (HEAD_RO_NAME, head_ro['size']))
+    # master 已由一级锁箱（lock()）写入明文，这里只负责加密它。
+    # ⚠️ 顺序不可颠倒：lock() 要用 master 派 k_so，所以它必须先存在；
+    #    lock_head() 用 k_stub 把它锁起来。反过来做就没有 master 可用。
+    ro_plain = bytes(elf.data[head_ro['offset']:
+                             head_ro['offset'] + 32])
+    if not any(ro_plain):
+        raise ElfError('%s 里的 master 全零 —— 一级锁箱没跑过？'
+                       '必须严格按「先 --section 再 --lock-head」的顺序'
+                       % HEAD_RO_NAME)
+    master = ro_plain
+    ro_cipher = bytes(master[i] ^ k_stub_eff[i % 16] for i in range(32))
+    # ⚠️ 等长覆盖：切片赋值长度不等会"插入"而非"覆盖"，顶坏后续字节
+    assert len(ro_cipher) == 32
+    elf.data[head_ro['offset']: head_ro['offset'] + 32] = ro_cipher
+    print('   master: 已锁入 %s（用 k_stub，非 k_so；攻击链 +3 步）'
+          % HEAD_RO_NAME)
+
     plain = bytes(elf.data[head['offset']: head['offset'] + head['size']])
     # ⚠️ 必须是【简单循环 XOR】，不能用 rc4()！
     # 2026-10-18 实测踩过：这里抄了 rc4()，而 stub 侧是
@@ -814,10 +878,12 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
             + _s.pack('<I', text['size'])
             + _s.pack('<I', 0)
             + wrapped_mac
-            + expect_mac_head)
-    assert len(blob) == 96, 'stub blob %d != 96' % len(blob)
+            + expect_mac_head
+            + _s.pack('<I', head_ro['addr'])
+            + _s.pack('<I', 32))
+    assert len(blob) == 104, 'stub blob %d != 104' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nckey_stub 段需扩到 96 字节；' \
+        'blob %d != slot size %d（.nckey_stub 段需扩到 104 字节；' \
         '改 nc_guard_boot.c 的 NCG_STUB_SIZE 必须同步这里）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob

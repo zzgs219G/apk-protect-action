@@ -20,6 +20,8 @@
 #   T8 篡改 .ncguard_ro 1 字节 → MAC 拒解（-11），证明 MAC 覆盖两段
 #   T9 kill 链无 PLT 软目标（abort/_exit/raise/syscall 四个桩全部消失）★
 #   T10 kill 逻辑进加密段（env_delayed_kill 落在 .ncguard 内且不可反汇编）
+#   T11 master 已随机化（0x11×32 明文零命中）★ 2026-10-19
+#   T12 master 藏在密文段（.ncguard_head_ro 内容每次构建不同、非全零）
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -118,8 +120,8 @@ fi
 # ── T3 二级锁箱 ──
 if python3 "$LOCK" libnc.so libnc.so --lock-head >l2.log 2>&1; then
     ok "T3 二级锁箱成功"
-    [ "$(sec_size .nckey_stub)" = 96 ] && ok "T3 .nckey_stub 96 字节" \
-        || bad "T3 .nckey_stub 大小 $(sec_size .nckey_stub) != 96"
+    [ "$(sec_size .nckey_stub)" = 104 ] && ok "T3 .nckey_stub 104 字节" \
+        || bad "T3 .nckey_stub 大小 $(sec_size .nckey_stub) != 104"
 else
     bad "T3 二级锁箱失败"; tail -20 l2.log >&2; exit 1
 fi
@@ -211,6 +213,54 @@ PYT10
         || bad "T10 env_delayed_kill 不在加密段（攻击者可静态定位 kill 逻辑）"
 else
     skip "T10 本组合未编入 env_check.c（sigcheck-only），跳过"
+fi
+
+# ── T11 master 必须已随机化（修实测报告 P1-1）────────────────────
+# 判据：产物里不能再出现 `0x11` 重复 32 次或 16 次。
+# 修复前 master 是 static const 全 0x11，`od` 一条命令读出即用。
+if python3 - <<'PYT11'
+import sys
+d = open('libnc.so', 'rb').read()
+bad = []
+if d.count(b'\x11' * 32): bad.append('0x11 x32')
+if d.count(b'\x11' * 16): bad.append('0x11 x16')
+if bad:
+    print('明文占位符残留: ' + ', '.join(bad), file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PYT11
+then ok "T11 master 已随机化（0x11 占位符零命中）"
+else bad "T11 master 仍是 0x11 占位符（报告实测 8 分钟可离线解）"
+fi
+
+# ── T12 master 必须藏在密文段 ──────────────────────────────────
+# 两个判据：①该段存在且 32 字节 ②锁定后内容非全零且与全零不同。
+if have_sec .ncguard_head_ro; then
+    rohex=$(python3 - <<'PYT12'
+import struct
+d = open('libnc.so', 'rb').read()
+sh = struct.unpack('<Q', d[0x28:0x30])[0]
+es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]
+si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+for i in range(en):
+    o = sh + i*es
+    no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    if nm == '.ncguard_head_ro':
+        off = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
+        print(d[off:off+32].hex())
+        break
+PYT12
+)
+    if [ -n "$rohex" ] && [ "$rohex" != "$(printf '0%.0s' {1..64})" ]; then
+        ok "T12 master 在 .ncguard_head_ro 且已加密（${rohex:0:16}…）"
+    else
+        bad "T12 .ncguard_head_ro 内容异常（全零 = 未加密或未写入）"
+    fi
+else
+    bad "T12 缺 .ncguard_head_ro 段 —— master 无处存放"
 fi
 
 # ── T4/T5 运行期：需构造 fake Android 环境 ──
