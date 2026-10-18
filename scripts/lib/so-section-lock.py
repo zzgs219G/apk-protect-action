@@ -44,7 +44,13 @@ import sys
 SECTION_NAME = '.ncguard'           # 加密代码段（Xop 用 .bitcode，改名避开指纹）
 SLOT_NAME = '.nckey'                # 密钥槽段（Xop 用 .protwrap）
 SLOT_MAGIC = b'NCKEYLOCK' + b'\x00' * 7      # 16 字节，打包器扫这个定位
-XOR_KEY = bytes([0x5A, 0xC3, 0x11, 0x9E, 0xF0, 0x37, 0xB2, 0x6D])  # 与 LSGS 同源
+XOR_KEY = bytes([0x7E, 0x31, 0xA5, 0x0D, 0xC8, 0x92, 0x4B, 0xF6])
+# ⚠️ 2026-10-18 与 LSGS 彻底分离（原注释写"与 LSGS 同源"，是错的）：
+# 同一把 8 字节密钥此前同时护三处 —— .ncguard 的 wrapped_k_so /
+# wrapped_k_mac、.ncguard_head 的 wrapped_k_stub、以及 make-sig-log.py 的
+# 中文日志 XOR 密文。而 LSGS 侧自己的注释就写着"不抗人工逆向"（它只是
+# 打散 strings 扫描的纯 XOR）。共用的后果：破掉最脆的那套，强的一起破。
+# 现在 nc_guard 侧用本常量，LSGS 侧保持原值不动，两把钥匙互不相关。
 
 # ── 自解谜二级锁箱（2026-10-18，nc_guard_boot.c）──────────────────
 # 把"开锁器本身"也锁进密文段，让静态攻击者不能直接读解锁逻辑。
@@ -537,6 +543,11 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # 真正的盐是证书指纹，占位值公开不影响"换 key 重打包即失效"）
     k_stub = bytes([0x3B, 0x7C, 0x19, 0x5E, 0xA2, 0xDF, 0x48, 0x31,
                     0x6C, 0x85, 0xEA, 0x27, 0x54, 0x9B, 0x0F, 0xD6])
+    # k_mac_head：第三把钥匙，只用于 head 段的完整性校验（P0-b）。
+    # 与 k_stub / k_so 都必须不同——复用任何一把都意味着"解开 head 就等于
+    # 拿到业务段的钥匙"或"知道解密钥匙即可伪造 MAC"，分级失去意义。
+    k_mac_head = bytes([0x91, 0x4A, 0xD2, 0x08, 0x7B, 0xE3, 0x5F, 0xC6,
+                        0x2D, 0xB8, 0x64, 0x17, 0xAF, 0x39, 0x8E, 0x51])
 
     plain = bytes(elf.data[head['offset']: head['offset'] + head['size']])
     # ⚠️ 必须是【简单循环 XOR】，不能用 rc4()！
@@ -545,24 +556,35 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # 两边算法不同 → 解出来是乱 C → dlopen 即 SIGILL（exit 132）。
     # 刻意不用 RC4 的理由：明文 stub 里不能出现 256 字节 S 盒初始化循环
     # —— 那本身就是"这是 RC4"的活招牌，且会显著撑大 stub。简单 XOR 的
-    # 代价由 HMAC 兜底（见 .ncguard 业务段的 MAC，head 段同理可加）。
+    # 代价由 HMAC 兜底（head 段的 MAC 见下方 P0-b，2026-10-18 补上）。
     cipher = bytes(b ^ k_stub[i % len(k_stub)] for i, b in enumerate(plain))
 
     elf.data[head['offset']: head['offset'] + head['size']] = cipher
 
-    # stub 槽（40 字节）：magic(8) + wrapped_k_stub(16) + stub_sh_addr(4)
-    #                       + head_sh_addr(4) + head_size(4) + 预留(4)
+    # P0-b：对【密文】算 HMAC-SHA256(k_mac_head, head 密文)。
+    # 与 .ncguard 的 expect_mac 完全同构——解密前就能验，验不过就不装明文。
+    # 在此之前 head 段只有 XOR，攻击者可改 head 密文中对应"unlock 本体的
+    # MAC 校验函数"那几位，把 .ncguard 的 HMAC 保护改成恒真从而绕过。
+    expect_mac_head = hmac_sha256(k_mac_head, cipher)
+
+    # stub 槽（88 字节，P0-b 起）：magic(8) + wrapped_k_stub(16)
+    #   + stub_sh_addr(4) + head_sh_addr(4) + head_size(4) + reserved(4)
+    #   + wrapped_k_mac_head(16) + expect_mac_head(32)
     # ⚠️ 全程用 section header table 的 sh_addr/size，不碰 .symtab（见上方注释）
     import struct as _s
     wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_stub))
+    wrapped_mac = bytes(b ^ XOR_KEY[i % len(XOR_KEY)]
+                        for i, b in enumerate(k_mac_head))
     blob = (STUB_MAGIC + wrapped
             + _s.pack('<I', slot['addr'])
             + _s.pack('<I', head['addr'])
             + _s.pack('<I', head['size'])
-            + _s.pack('<I', 0))
-    assert len(blob) == 40, 'stub blob %d != 40' % len(blob)
+            + _s.pack('<I', 0)
+            + wrapped_mac
+            + expect_mac_head)
+    assert len(blob) == 88, 'stub blob %d != 88' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nckey_stub 段需扩到 40 字节；' \
+        'blob %d != slot size %d（.nckey_stub 段需扩到 88 字节；' \
         '改 nc_guard_boot.c 的 NCG_STUB_SIZE 必须同步这里）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob

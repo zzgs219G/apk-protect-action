@@ -56,10 +56,38 @@
 #define NCG_SLOT_MAGIC   "NCKEYLOCK"
 #define NCG_STUB_MAGIC   "NCSTUBLK"
 #define NCG_SLOT_SIZE    80
-#define NCG_STUB_SIZE    40
+#define NCG_STUB_SIZE    88
 
+/* .nckey_stub slot 布局（88 字节，2026-10-18 P0-b 起；原 40 字节版见下方说明）：
+ *   [ 0: 8) magic NCSTUBLK
+ *   [ 8:24) wrapped k_stub      = k_stub ^ XOR_KEY
+ *   [24:28) stub_sh_addr        .nckey_stub 自身链接期虚拟地址
+ *   [28:32) head_sh_addr        .ncguard_head 链接期虚拟地址
+ *   [32:36) head_size           .ncguard_head 字节数
+ *   [36:40) reserved
+ *   [40:56) wrapped k_mac_head  = k_mac_head ^ XOR_KEY   ← P0-b 新增
+ *   [56:88) expect_mac_head     HMAC-SHA256(k_mac_head, head 密文) ← P0-b 新增
+ *
+ * 为什么 head 段也要 MAC（P0-b，补齐与 .ncguard 不对等的保护）：
+ *   在此之前 head 段只有简单 XOR。攻击者可以改 head 密文中对应"unlock 本体的
+ *   MAC 校验函数"的那几位 → 解密后 unlock 本体还在，但它对 .ncguard 的校验
+ *   被改成恒真 → .ncguard 的 HMAC 保护被绕过。这是具体路径，不是理论风险。
+ *   加 MAC 后：改任何一位 → HMAC 不符 → 不解密 → head 保持密文 →
+ *   调用即 SIGILL（与 .ncguard 的 -11 语义完全对等）。
+ *
+ * MAC 对【密文】算，与 .ncguard 一致：解密前就能验，验不过就不装明文。 */
+#define NCG_OFF_K_MAC_HEAD   40
+#define NCG_OFF_EXPMAC_HEAD  56
+
+/* ⚠️ 2026-10-18 与 LSGS 彻底分离（原值与 make-sig-log.py 的 key 相同，
+ * 注释还写"与 LSGS 同源"——那是错的）：同一把 8 字节密钥此前同时护三处
+ * （.ncguard 的 wrapped_k_so/wrapped_k_mac、.ncguard_head 的 wrapped_k_stub、
+ * 以及 make-sig-log.py 的中文日志 XOR 密文）。而 LSGS 侧自己的注释就写着
+ * "不抗人工逆向"——共用的后果是破掉最脆的那套，强的一起破。
+ * 本常量只服务 nc_guard；LSGS 侧保持原值不动。两把钥匙互不相关。
+ * 改这里必须同步 so-section-lock.py 的 XOR_KEY（锁箱/开箱两侧契约）。 */
 static const uint8_t NCG_XOR_KEY[8] =
-        {0x5A, 0xC3, 0x11, 0x9E, 0xF0, 0x37, 0xB2, 0x6D};
+        {0x7E, 0x31, 0xA5, 0x0D, 0xC8, 0x92, 0x4B, 0xF6};
 
 /* ═══════════════════════════════════════════════════════════════════
  * 第一部分：密文 unlock 本体（进 .ncguard_head，构建期被锁）
@@ -217,13 +245,7 @@ int ncg_head_unlock(void) {
  * 第二部分：明文 stub（.text，攻击者唯一能直接读到的部分）
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* stub 的密钥槽：由 so-section-lock.py 在锁箱时写入
- *   [ 0: 8) magic "NCSTUBLK"
- *   [ 8:24) wrapped k_stub = k_stub ^ XOR_KEY（16 字节）
- *   [24:28) stub_slot_sh_addr —— .nckey_stub 自身的链接期虚拟地址
- *   [28:32) head_sh_addr      —— .ncguard_head 段的链接期虚拟地址
- *   [32:36) head_size         —— .ncguard_head 段字节数
- *   [36:40) 预留（对齐与将来扩展）
+/* stub 的密钥槽：由 so-section-lock.py 在锁箱时写入（88 字节，见上方布局图）
  *
  * ⚠️ 2026-10-18 为什么不存 entry_delta（入口符号 − 段起始偏移）：
  *   那需要从 .symtab 读符号地址，而 NDK ndk-build 默认 strip 符号表
@@ -280,6 +302,35 @@ static void ncg_stub_recover(void) {
 
     /* head 段起始 = 基址 + head 段链接期虚拟地址 */
     uint8_t *start = (uint8_t *)(base + head_sh_addr);
+
+    /* ── P0-b：先验 MAC 再解密（2026-10-18）──────────────────────
+     * 对【密文】算 HMAC-SHA256，与 slot 里的期望值恒定时间比较。
+     * 位置刻意在 mprotect/解密【之前】：一旦不符，head 一个字都不改 → 段保持
+     * 密文 → 后续调用踩密文 = SIGILL（fail-closed，与 .ncguard 的 -11 语义
+     * 完全对等）。此前 head 只有 XOR，攻击者可改"unlock 本体里的 MAC 校验
+     * 函数"那几位，把 .ncguard 的 HMAC 保护改成恒真从而绕过。
+     *
+     * k_mac_head 的恢复与 k_stub 同源：都是 wrapped ^ NCG_XOR_KEY。
+     * 调用 khmac_sha256 不破坏"stub 无智力"约束——它只是复用 .text 里
+     * 现成的密码学原语（nc_guard_key.c 的函数全在明文段），stub 本身仍没有
+     * ELF 解析、没有 RC4 S 盒、没有密钥派生、没有 slot 布局解释。 */
+    uint8_t k_mac[16], got_mac[32];
+    for (int i = 0; i < 16; i++)
+        k_mac[i] = (uint8_t)(slot[NCG_OFF_K_MAC_HEAD + i] ^ NCG_XOR_KEY[i & 7]);
+    khmac_sha256(k_mac, 16, start, head_size, got_mac);
+    {
+        const volatile unsigned char *want = slot + NCG_OFF_EXPMAC_HEAD;
+        uint8_t diff = 0;
+        for (int i = 0; i < 32; i++)
+            diff |= (uint8_t)(got_mac[i] ^ want[i]);
+        memset(k_mac, 0, sizeof(k_mac));
+        memset(got_mac, 0, sizeof(got_mac));
+        if (diff != 0) {
+            /* 密文段被改过（或密钥与密文不匹配）→ 不解密、不动 mprotect */
+            memset(k, 0, sizeof(k));
+            return;
+        }
+    }
 
     uintptr_t ps = getpagesize();
     uintptr_t s = (uintptr_t) start & ~(ps - 1);
