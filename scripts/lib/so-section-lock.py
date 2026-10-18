@@ -488,8 +488,25 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
 
     head = elf.find(HEAD_NAME)
     if head is None:
-        print('⚠️ 段 %s 不存在（未接入 nc_guard_boot.c），跳过二级锁箱' % HEAD_NAME)
-        return 0
+        # ⚠️ 2026-10-18 从 return 0 改为 return 1（fail-fast）。
+        # 此前这里"跳过二级锁箱"并返回 0（exit code 0 = 成功），而
+        # protect.sh 的判据是 exit != 0 才失败 → 段缺失时静默放行：
+        # unlock 本体保持明文、自解谜没发生，但流水线显示成功。
+        # 这正是"以为防了其实没防"的静默降级，最该避免。
+        #
+        # 为什么可以安全地 fail-fast：走到这里说明 protect.sh 已经进了
+        # `if [[ -d "$WORK/project/libs" ]]` 分支，即本就要编译 libnc.so；
+        # 而只要编译了，nc_guard_boot.c 就在工程里、.ncguard_head 段就该在。
+        # 段不在 = 拷贝漏了 / boot.c 没编入 / 段被 gc-sections 回收，
+        # 三种都是真实配置错误，没有一种应该放行。
+        # （纯 dex 组合如只勾 stringenc 时根本不调 lock_head，不受影响。）
+        print('❌ 段 %s 不存在 —— 二级锁箱无法进行。'
+              % HEAD_NAME, file=sys.stderr)
+        print('   排查方向：① nc_guard_boot.c 是否拷进 NDK 工程'
+              '（protect.sh 的拷贝清单）② 段是否被 --gc-sections 回收'
+              '（检查 ncg_key_slot/ncg_stub_slot 的 retain）'
+              '③ nc_guard_key.h 是否一并拷入', file=sys.stderr)
+        return 1
 
     slot = elf.find(STUB_SLOT)
     if slot is None:
