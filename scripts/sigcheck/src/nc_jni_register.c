@@ -37,6 +37,21 @@
 
 #include "nc_jni_register.h"
 
+/* ⚠️ 编译期断言（2026-10-19，CI 39174771703 三次链接失败后加的）：
+ * nc_jni_register.c 引用 nc_jni_selftest/ncVerify/heartbeat，而这三个
+ * 函数只在 nc_link.c / nc_guard_jni.c 定义——且【只在 NC_JNI_DYNAMIC_REG
+ * 生效时】才叫这个名字（否则走 JNIEXPORT Java_xxx 短名绑定）。
+ *
+ * 所以宏没传到时就必然链接失败：
+ *   ld.lld: error: undefined symbol: nc_jni_ncVerify ...
+ * 这个错误的真正原因（构建系统 flags 没生效）被链接错误掩盖了，
+ * 在 CI 上排查了三轮。加这条断言，让它在【编译阶段】就炸，
+ * 并直接指出是哪个宏的问题。 */
+#if !defined(NC_JNI_DYNAMIC_REG)
+#  error "NC_JNI_DYNAMIC_REG 未定义：lib-ndk.sh 的 LOCAL_CFLAGS 没生效" \
+         "（检查 Android.mk 里 include $(BUILD_SHARED_LIBRARY) 是否在所有 LOCAL_* 之后）"
+#endif
+
 /* 由各 .c 提供的实现（visibility("hidden")，不出 .dynsym） */
 extern jint  nc_jni_selftest(JNIEnv *env, jobject thiz);
 extern jboolean nc_jni_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured);
