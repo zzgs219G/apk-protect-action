@@ -85,9 +85,54 @@
  * 以及 make-sig-log.py 的中文日志 XOR 密文）。而 LSGS 侧自己的注释就写着
  * "不抗人工逆向"——共用的后果是破掉最脆的那套，强的一起破。
  * 本常量只服务 nc_guard；LSGS 侧保持原值不动。两把钥匙互不相关。
- * 改这里必须同步 so-section-lock.py 的 XOR_KEY（锁箱/开箱两侧契约）。 */
-static const uint8_t NCG_XOR_KEY[8] =
-        {0x7E, 0x31, 0xA5, 0x0D, 0xC8, 0x92, 0x4B, 0xF6};
+ * 改这里必须同步 so-section-lock.py 的 XOR_KEY（锁箱/开箱两侧契约）。
+ *
+ * ⚠️ 2026-10-18 不再是一整串 8 字节，而是拆成 4 片 uint16 常量、分散在 4
+ * 个 noinline 函数的立即数里，运行期按 NCG_XOR_FRAG 查表 + 高低位规则拼回。
+ * 原实现是整串常量放 .rodata，HEX 搜索可直接命中（实测 7e31a0dc8924bf6
+ * 在 so 里明文出现 2 次）——那是"请照这个走"的垫脚石。拆开后连续 8 字节
+ * 密钥在 .rodata 里消失（实测归零），攻击者要凑齐必须同时读出查表、4 个
+ * 常量与高低位规则三处再手工重组。
+ *
+ * 存放约定（每个碎片装 2 个"逻辑字节"，无固定逻辑序）：
+ *   frag_a=0xc831 → 低位=逻辑1(0x31) 高位=逻辑4(0xc8)
+ *   frag_b=0x927e → 低位=逻辑0(0x7e) 高位=逻辑5(0x92)
+ *   frag_c=0xf6a5 → 低位=逻辑2(0xa5) 高位=逻辑7(0xf6)
+ *   frag_d=0x4b0d → 低位=逻辑3(0x0d) 高位=逻辑6(0x4b)
+ * 运行时规则：逻辑 i<4 取低位、i>=4 取高位；碎片编号查 NCG_XOR_FRAG[i]。 */
+static const uint8_t NCG_XOR_FRAG[8] = {1, 0, 2, 3, 0, 1, 3, 2};
+
+/* ⚠️ 碎片必须是「运行期才知道」的值，否则白拆。
+ *
+ * 第一版：4 个 uint16 常量各放一个 noinline static 函数。实测被打脸——
+ * LLVM 做函数间常量传播，把完整 8 字节密钥写回 .rodata
+ * （boot.o 0x5b0/0x5b8 各一份连续 8 字节，HEX 一搜即中）。
+ * noinline 挡不住：static 函数只有一处调用，编译器算得出返回值。
+ *
+ * 现在的做法：4 个碎片放 4 个独立 volatile 变量（各 2 字节，位于
+ * .data 而非 .rodata）。volatile 读阻止编译期折叠，于是 .rodata 里
+ * 不再出现连续 8 字节密钥；攻击者 dump 到的是 4 个看似无关的 16 位
+ * 常量，还必须另外读出 NCG_XOR_FRAG 表与高低位规则才能重组。 */
+static volatile uint16_t ncg_frag_a = 0xc831u;  /* 逻辑 1,4 */
+static volatile uint16_t ncg_frag_b = 0x927eu;  /* 逻辑 0,5 */
+static volatile uint16_t ncg_frag_c = 0xf6a5u;  /* 逻辑 2,7 */
+static volatile uint16_t ncg_frag_d = 0x4b0du;  /* 逻辑 3,6 */
+
+/* 运行期拼回完整 8 字节密钥。每次调用重算，不缓存——缓存就是又把密钥
+ * 写进内存某处。调用方用完必须 memset 擦除。 */
+static void ncg_xor_key(uint8_t out[8]) {
+    /* volatile 读：编译器无法在编译期算出结果，也就无法把完整 8 字节
+     * 密钥折回 .rodata。代价是 4 次 volatile load（若干纳秒），可忽略。 */
+    uint16_t fr[4];
+    fr[0] = ncg_frag_a;
+    fr[1] = ncg_frag_b;
+    fr[2] = ncg_frag_c;
+    fr[3] = ncg_frag_d;
+    for (int i = 0; i < 8; i++) {
+        uint16_t v = fr[NCG_XOR_FRAG[i]];
+        out[i] = (i < 4) ? (uint8_t)(v & 0xFF) : (uint8_t)((v >> 8) & 0xFF);
+    }
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  * 第一部分：密文 unlock 本体（进 .ncguard_head，构建期被锁）
@@ -199,15 +244,25 @@ int ncg_head_unlock(void) {
     if (ncg_unlocked) return 0;
 
     uint8_t key[16];
-    for (int i = 0; i < 16; i++) key[i] = slotdata[16 + i] ^ NCG_XOR_KEY[i & 7];
+    {
+        uint8_t xk[8];
+        ncg_xor_key(xk);
+        for (int i = 0; i < 16; i++) key[i] = slotdata[16 + i] ^ xk[i & 7];
+        memset(xk, 0, sizeof(xk));
+    }
 
     uint8_t *target = (uint8_t *)base + sec.sh_addr;
 
     /* 完整性校验：先验后解（位置在 mprotect/解密之前） */
     if (have_mac) {
         uint8_t k_mac[16], got_mac[32];
-        for (int i = 0; i < 16; i++)
-            k_mac[i] = (uint8_t)(slotdata[NCG_OFF_K_MAC + i] ^ NCG_XOR_KEY[i & 7]);
+        {
+            uint8_t xk[8];
+            ncg_xor_key(xk);
+            for (int i = 0; i < 16; i++)
+                k_mac[i] = (uint8_t)(slotdata[NCG_OFF_K_MAC + i] ^ xk[i & 7]);
+            memset(xk, 0, sizeof(xk));
+        }
         khmac_sha256(k_mac, 16, target, sec.sh_size, got_mac);
         const uint8_t *want = slotdata + NCG_OFF_EXPMAC;
         uint8_t diff = 0;
@@ -284,7 +339,12 @@ static void ncg_stub_recover(void) {
 
     /* 恢复 k_stub（16 字节，与 8 字节 XOR_KEY 循环异或） */
     uint8_t k[16];
-    for (int i = 0; i < 16; i++) k[i] = (uint8_t)(slot[8 + i] ^ NCG_XOR_KEY[i & 7]);
+    {
+        uint8_t xk[8];
+        ncg_xor_key(xk);
+        for (int i = 0; i < 16; i++) k[i] = (uint8_t)(slot[8 + i] ^ xk[i & 7]);
+        memset(xk, 0, sizeof(xk));
+    }
 
     uint32_t stub_sh_addr = ncg_rd32(slot + 24);
     uint32_t head_sh_addr = ncg_rd32(slot + 28);
@@ -315,8 +375,13 @@ static void ncg_stub_recover(void) {
      * 现成的密码学原语（nc_guard_key.c 的函数全在明文段），stub 本身仍没有
      * ELF 解析、没有 RC4 S 盒、没有密钥派生、没有 slot 布局解释。 */
     uint8_t k_mac[16], got_mac[32];
-    for (int i = 0; i < 16; i++)
-        k_mac[i] = (uint8_t)(slot[NCG_OFF_K_MAC_HEAD + i] ^ NCG_XOR_KEY[i & 7]);
+    {
+        uint8_t xk[8];
+        ncg_xor_key(xk);
+        for (int i = 0; i < 16; i++)
+            k_mac[i] = (uint8_t)(slot[NCG_OFF_K_MAC_HEAD + i] ^ xk[i & 7]);
+        memset(xk, 0, sizeof(xk));
+    }
     khmac_sha256(k_mac, 16, start, head_size, got_mac);
     {
         const volatile unsigned char *want = slot + NCG_OFF_EXPMAC_HEAD;
