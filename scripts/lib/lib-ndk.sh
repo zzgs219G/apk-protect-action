@@ -48,8 +48,6 @@ SOURCES := \$(wildcard \$(LOCAL_PATH)/*.cpp) \$(wildcard \$(LOCAL_PATH)/*.c) \
 LOCAL_C_INCLUDES := \$(LOCAL_PATH) \$(LOCAL_PATH)/nc
 
 LOCAL_SRC_FILES := \$(SOURCES:\$(LOCAL_PATH)/%=%)
-
-include \$(BUILD_SHARED_LIBRARY)
 EOF
   # so 加固:链接期丢弃未引用段(-ffunction/data-sections 配套),并 strip 符号表
   cat >> "$jni/Android.mk" <<EOF
@@ -100,6 +98,18 @@ LOCAL_CPPFLAGS += -DNC_HAS_D2C_REG
 EOF
     fi
   fi
+
+  # ⚠️ include $(BUILD_SHARED_LIBRARY) 必须放在【所有 LOCAL_* 赋值之后】。
+  # 2026-10-19 CI 实证：此前 include 写在中间，后面追加的
+  # LOCAL_CFLAGS/LOCAL_CPPFLAGS 全部无效 —— 因为 ndk-build 在 include
+  # 那一刻就把 LOCAL_* 读走了，之后再改不回写。
+  # 症状极具迷惑性：编译正常、链接报 `undefined symbol: nc_jni_*`
+  # （因为 -DNC_JNI_DYNAMIC_REG 没生效，走的是旧的短名分支）。
+  cat >> "$jni/Android.mk" <<'EOF'
+
+# 必须最后 include：ndk-build 在此刻快照 LOCAL_* 变量
+include $(BUILD_SHARED_LIBRARY)
+EOF
 }
 
 # ndk_build <工程根目录> — 执行 ndk-build，产物在 <工程根>/libs/<abi>/
