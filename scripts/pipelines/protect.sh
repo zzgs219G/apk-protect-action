@@ -395,7 +395,14 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
              "$WORK/project/jni" --include='*.cpp' --include='*.cc' --include='*.c' 2>/dev/null | wc -l)
 
   python3 "$ROOT/scripts/lib/so_section_mark.py" "$WORK/project/jni" \
-    --rule dex2c-jni --exclude nc_guard_jni.c -v 2>&1 | sed 's/^/  [mark] /' || {
+    --rule dex2c-jni \
+    --exclude nc_guard_jni.c \
+    --exclude nc_jni_register.c \
+    --exclude-func ncVerify \
+    --exclude-func heartbeat \
+    --exclude-func JNI_OnLoad \
+    --exclude-func selftest \
+    -v 2>&1 | sed 's/^/  [mark] /' || {
     echo "❌ 段标记失败——dex2c 转译产物未吃上加密（用户明确要求）" >&2
     exit 1
   }
@@ -403,7 +410,11 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
   # 静默失防检测：有 JNI 头却没标上任何一个 → 规则与产物形态脱节
   # （例如 writer.py 改了函数头格式）。此时不能放行——那等于"以为防了
   # 其实没防"，正是本机制最该避免的假绿。
-  MARKED=$(grep -rc 'section(".ncguard")' "$WORK/project/jni" \
+  # ⚠️ 段名必须与 so_section_mark.py 的 SECTION 常量一致（2026-10-19 已改 .ncx）。
+  #    这里曾经写死 .ncguard，段名中性化后漏改 → MARKED=0 → 下面的
+  #    "静默失防"守卫 fail-fast（CI 39171457222 实证）。守卫本身是对的，
+  #    但漏改段名等于把自己的守卫变成误报源。
+  MARKED=$(grep -rc 'section(".ncx")' "$WORK/project/jni" \
            --include='*.cpp' --include='*.cc' --include='*.c' 2>/dev/null \
            | awk -F: '{s+=$2} END {print s+0}')
   if [[ $JNI_HDRS -gt 0 && $MARKED -eq 0 ]]; then
@@ -412,7 +423,7 @@ if [[ $WANT_TRANSPILE -eq 1 ]]; then
     echo "   → 修 scripts/lib/so_section_mark.py 的 dex2c-jni 规则，不许静默放行" >&2
     exit 1
   fi
-  echo "[mark] 完成：$MARKED 处 .ncguard 标记（含探针与转译函数）"
+  echo "[mark] 完成：$MARKED 处 .ncx 标记（含探针与转译函数）"
 
   # ── JNI 动态注册（2026-10-19，修实测报告 §1/§7.1 符号泄露）────────
   # 背景：dex2c 产物的 `Java_xxx` 符号带精确大小导出在 .dynsym，

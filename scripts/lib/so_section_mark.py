@@ -140,13 +140,20 @@ def _is_definition(lines, i):
             return False          # 声明（原型）
         if code.endswith('{'):
             return True           # 定义
+        # ⚠️ 2026-10-19 修：一行内写完的紧凑定义（`...JNICALL name(...){}`
+        #    或 `...{ return 0; }`）行尾不是 `{` 而是 `}`/`}` 等，旧实现
+        #    判为「不是定义」→ 漏标。dex2c 产物是多行形态所以此前没暴露，
+        #    但手写/短函数会中招（本地测试文件就是这么写的）。
+        #    判据：本行含 `{` 即视为定义（`;` 已在上一步排除）。
+        if '{' in code:
+            return True
         # 参数跨行时中间行既不是 ; 也不是 {，继续向后看
     # 12 行内没定论：保守判否（宁可漏标也不错标——错标=给不该加密的代码加密）
     return False
 
 
 def mark_text(text: str, pattern: re.Pattern, verbose: bool = False,
-              src: str = '<str>'):
+              src: str = '<str>', skip_names=None):
     """对一段源码注入标记。返回 (新文本, 命中数)。"""
     lines = text.split('\n')
     out = []
@@ -180,7 +187,8 @@ def mark_text(text: str, pattern: re.Pattern, verbose: bool = False,
         # （本脚本插入的形态）。只查当前行会导致二次跑重复注入。
         if pattern.match(line) and not _already_marked(line) \
                 and not _marked_above(out, line) \
-                and _is_definition(lines, i):
+                and _is_definition(lines, i) \
+                and not _name_skipped(lines, i, skip_names):
             indent = re.match(r'^[ \t]*', line).group(0)
             out.append('%s%s\n%s%s' % (indent, ATTR, indent, line.lstrip()))
             hits += 1
@@ -190,6 +198,32 @@ def mark_text(text: str, pattern: re.Pattern, verbose: bool = False,
             out.append(line)
         i += 1
     return '\n'.join(out), hits
+
+
+def _name_skipped(lines, idx, skip_names):
+    """判断 idx 起始的函数定义是否在【函数名】黑名单里。
+
+    为什么需要按函数名排除（2026-10-19）：`nc_link.c` 里既有必须上锁的
+    判决核心 `nc_verify_t1`，又有绝不能被锁的 JNI 入口 `ncVerify`/
+    `heartbeat`（它们是 unlock 的调用方，锁进去 = 死锁）。
+    按文件排除会把整份文件放掉，等于放弃了判决核心的加密。
+
+    实现：对命中行及其后最多 3 行找 `JNICALL <name>` 或 `<name>(`，
+    取函数名比对黑名单（子串匹配，兼容 C++ 名称修饰前后缀）。"""
+    if not skip_names:
+        return False
+    blob = '\n'.join(lines[idx:idx + 4])
+    for nm in skip_names:
+        esc = re.escape(nm)
+        # ① `JNICALL <nm>(` —— 形参紧跟的普通 C 函数（JNI_OnLoad 等）
+        if re.search(r'JNICALL[ \t]+' + esc + r'[ \t]*\(', blob):
+            return True
+        # ② `Java_<pkg>_<Class>_<nm>(` —— JNI 短名绑定。
+        #    ⚠️ 不能用 \b 边界：`Java_..._ncVerify` 里 nm 前面是 `_`，
+        #    那是单词字符，\b 不成立（实测漏判）。改用「前面是 _ 或行首」。
+        if re.search(r'(?:^|[\s_])' + esc + r'[ \t]*\(', blob, re.M):
+            return True
+    return False
 
 
 def iter_sources(paths):
@@ -228,6 +262,9 @@ def main(argv=None):
     ap.add_argument('--pattern', default='',
                     help='自定义正则（须含返回类型/函数名捕获组）；与 --rule 等价')
     ap.add_argument('--section', default=SECTION, help='目标段名（默认 %s）' % SECTION)
+    ap.add_argument('--exclude-func', action='append', default=[],
+                    help='按【函数名】排除（不标段）。用于同文件内既有要上锁的、'
+                         '又有绝不能上锁的（如 nc_link.c 的判决核心 vs JNI 入口）')
     ap.add_argument('--exclude', action='append', default=[],
                     help='排除的文件名（可多次）。用于排除\"不能被锁\"的文件 —— '
                          '典型：nc_guard_jni.c（它调 unlock，锁它=死锁）')
@@ -268,7 +305,8 @@ def main(argv=None):
             new_text = text
             file_hits = 0
             for name, pat in pats:
-                new_text, h = mark_text(new_text, pat, args.verbose, src)
+                new_text, h = mark_text(new_text, pat, args.verbose, src,
+                                        args.exclude_func)
                 file_hits += h
             if file_hits:
                 total_files += 1
