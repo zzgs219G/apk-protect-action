@@ -33,11 +33,6 @@ void nc_heartbeat_arm_constructor(void);
 #include <stddef.h>
 #include <time.h>
 #include "sig_hash.h"
-/* 宿主判决对拍（NCLINK_HOST_TEST）不需要动态注册头——它只验证
- * nc_verify_t1 的算法，不碰 JNI。条件包含避免宿主测试缺文件。 */
-#ifndef NCLINK_HOST_TEST
-#include "nc_jni_register.h"
-#endif
 
 /* ── 判决核心进加密段（2026-10-19，修实测报告 §8.1 最致命缺陷）───────
  *
@@ -187,13 +182,17 @@ int nc_verify_t1(const unsigned char *t1, int len)
 /* JNI 入口:Java_com_nc_link_NcLink_ncVerify([B)Z
  * 类名固定 com.nc.link.NcLink(桥接类,与 StrDec 同为工具基础设施命名),
  * JNI 短名绑定构建期即可确定,无需 RegisterNatives。 */
-#if defined(NC_JNI_DYNAMIC_REG)
-__attribute__((visibility("hidden")))
-jboolean nc_jni_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)
-#else
+/* ⚠️ 2026-10-19 真机实证：动态注册方案会导致启动崩溃（sig_check 通过后
+ * 进程立即消失，selftest 从未被调用）。根因是 constructor 里调
+ * FindClass("com/nc/link/NcLink") —— so 由 Application.onCreate 触发加载，
+ * 此时 Application 类正在初始化，该时机 FindClass 不安全。
+ *
+ * 回退为 JNI 短名绑定（ART 原生机制，不涉时机问题）。
+ * 代价：符号名仍在 .dynsym —— 这是 JNI 短名绑定的硬要求，
+ * 想隐藏就必须动态注册，而动态注册在此时机不安全。
+ * 取舍：宁可保留符号名，也不能让 App 起不来。 */
 JNIEXPORT jboolean JNICALL
 Java_com_nc_link_NcLink_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)
-#endif
 {
     jsize len;
     jbyte *buf;
@@ -219,13 +218,8 @@ Java_com_nc_link_NcLink_ncVerify(JNIEnv *env, jclass clazz, jbyteArray measured)
  * ⚠️ 身份校验防冒充:攻击者 patch 掉 Java 校验后自己喂 ping 即可绕过整个
  * 心跳机制 —— 所以 clazz 必须是 NcLink 本类(IsSameObject 锁死),
  * 这是 Xop shell_heartbeat_ok 的同款纪律。 */
-#if defined(NC_JNI_DYNAMIC_REG)
-__attribute__((visibility("hidden")))
-void nc_jni_heartbeat(JNIEnv *env, jclass clazz)
-#else
 JNIEXPORT void JNICALL
 Java_com_nc_link_NcLink_heartbeat(JNIEnv *env, jclass clazz)
-#endif
 {
     jclass self;
     /* 仅允许 NcLink 本类调用(短名绑定的调用类必然正确,这里是纵深:

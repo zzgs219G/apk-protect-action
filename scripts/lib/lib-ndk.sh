@@ -74,10 +74,16 @@ EOF
     # "[jni-reg] 生成注册表" 在 "Compile nc_jni_gen.c" 之前，
     # 看不出 mk 其实更早写完。现在把决策打出来，顺序问题一眼可见。
     echo "  [mk] JNI 符号隐藏已启用（version-script + 动态注册）"
+    # ⚠️ 2026-10-19 真机实证后的关键修正：
+    #   `local: *` 会把 Java_xxx 也隐藏 → ART 的 dlsym 找不到 → ULE。
+    #   JNI 短名绑定【要求】符号导出，这是硬约束。
+    #   所以只隐藏【非 JNI】符号（dex2c 的辅助函数等），
+    #   Java_* 与 JNI_OnLoad 必须 global。
     cat > "$jni/nc_hide.map" <<'MAPEOF'
 {
   global:
     JNI_OnLoad;
+    Java_*;
   local:
     *;
 };
@@ -90,19 +96,6 @@ EOF
       cat >> "$jni/Android.mk" <<EOF
 LOCAL_CFLAGS += \$(shell cat \$(LOCAL_PATH)/nc_jni_rename.mk)
 LOCAL_CPPFLAGS += \$(shell cat \$(LOCAL_PATH)/nc_jni_rename.mk)
-EOF
-    fi
-    # NC_JNI_DYNAMIC_REG：让 nc_guard_jni/nc_link 的实现函数走 hidden 可见性
-    # NC_HAS_D2C_REG：有 dex2c 注册表时启用（JNI_OnLoad 里调用它）
-    cat >> "$jni/Android.mk" <<'EOF'
-LOCAL_CFLAGS += -DNC_JNI_DYNAMIC_REG
-LOCAL_CPPFLAGS += -DNC_JNI_DYNAMIC_REG
-EOF
-    if grep -q 'nc_jni_gen_register' "$jni/nc_jni_gen.c" 2>/dev/null; then
-      echo "  [mk] dex2c 注册表已接入（-DNC_HAS_D2C_REG）"
-      cat >> "$jni/Android.mk" <<'EOF'
-LOCAL_CFLAGS += -DNC_HAS_D2C_REG
-LOCAL_CPPFLAGS += -DNC_HAS_D2C_REG
 EOF
     fi
   else

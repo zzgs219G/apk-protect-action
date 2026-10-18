@@ -73,8 +73,8 @@ fi
 # 顺带覆盖 sigcheck+envcheck 的真实组合，而不是只测 sigcheck-only。
 cp "$SRC/nc_guard_boot.c" "$SRC/nc_guard_probe.c" "$SRC/nc_guard_jni.c" \
    "$SRC/nc_guard_key.c" "$SRC/nc_guard_key.h" "$SRC/nc_link.c" \
-   "$SRC/env_check.c" "$SRC/sig_check.c" \
-   "$SRC/nc_jni_register.c" "$SRC/nc_jni_register.h" "$WORK/"
+   "$SRC/env_check.c" "$SRC/sig_check.c" "$WORK/"
+
 # sig_hash.h 是构建期生成的（含两张签名表），必须先生成再编译
 bash "$ROOT/scripts/sigcheck/hash/make-sig-hash.sh" "$APK" "$WORK/sig_hash.h" \
      >"$WORK/sighash.log" 2>&1 \
@@ -88,20 +88,22 @@ cd "$WORK" || { echo "cd 失败"; exit 2; }
 #   NC_JNI_DYNAMIC_REG → JNI 实现走 hidden 可见性
 #   version script     → .dynsym 只留 JNI_OnLoad
 CFLAGS="-fPIC -shared -fvisibility=hidden -fno-ident -Oz \
-        -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED -DNC_JNI_DYNAMIC_REG"
+        -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED"
 # version script：有 JNI_OnLoad（真实产物）才写 global 项；
 # 测试工程没有 dex2c 的 Dex2C.cpp，故全 local。
-if nm -g --defined-only libnc.so 2>/dev/null | grep -qw JNI_OnLoad; then
-    printf '{ global: JNI_OnLoad; local: *; };\n' > hide.map
-else
-    printf '{ local: *; };\n' > hide.map
-fi
+# JNI 短名绑定要求 Java_* 与 JNI_OnLoad 必须导出（否则 ART dlsym 不到），
+# 所以 version script 只隐藏非 JNI 符号。
+# ⚠️ JNI_OnLoad 只在有 dex2c 产物时存在；测试工程没有它，
+#    写成 global 会让 lld 报 "symbol not defined" → 按存在性生成。
+{ echo "{"; echo "  global:";   nm -g --defined-only libnc.so 2>/dev/null | grep -qw JNI_OnLoad \
+      && echo "    JNI_OnLoad;"; \
+  echo "    Java_*;"; echo "  local:"; echo "    *;"; echo "};"; } > hide.map
 LDFLAGS="-Wl,--gc-sections -Wl,--build-id=none -Wl,--version-script=hide.map"
 # sig_log_data.h 依赖 sig_check.c + env_check.c 的 LSG 标记，必须先跑生成器
 python3 "$ROOT/scripts/sigcheck/log/make-sig-log.py" \
      sig_check.c env_check.c sig_log_data.h >siglog.log 2>&1 || true
 if clang $CFLAGS -I. nc_guard_boot.c nc_guard_probe.c nc_guard_jni.c \
-        nc_guard_key.c nc_link.c env_check.c sig_check.c nc_jni_register.c \
+        nc_guard_key.c nc_link.c env_check.c sig_check.c \
         $LDFLAGS -o libnc.so 2>build.log; then
     ok "T1 编译通过（$(stat -c%s libnc.so) B）"
 else
@@ -308,9 +310,12 @@ fi
 # ── T14 JNI 符号面：.dynsym 应只剩 JNI_OnLoad ──────────────────
 # 实测报告 §1：`nm -D` 一条命令拿到全部 JNI 入口名 + 精确大小
 # （`MainActivity.k` 21692 B），等于免费送业务复杂度地图。
-if nm -D --defined-only libnc.so 2>/dev/null | grep -q "Java_\|nc_jni_"; then
-    leak=$(nm -D --defined-only libnc.so | grep -cE "Java_|nc_jni_")
-    bad "T14 .dynsym 仍导出 $leak 个 JNI 符号（业务方法清单泄露）"
+# ⚠️ 2026-10-19 真机实证后调整：Java_* 必须导出（JNI 短名绑定的硬要求），
+# 想隐藏只能动态注册，而动态注册在 so 加载时机会崩。所以本项只断言
+# 「非 JNI 的内部符号不外泄」（如 nc_jni_* / ncg_* 辅助函数）。
+if nm -D --defined-only libnc.so 2>/dev/null | grep -qE "nc_jni_|^[0-9a-f]+ T ncg_"; then
+    leak=$(nm -D --defined-only libnc.so | grep -cE "nc_jni_|ncg_")
+    bad "T14 .dynsym 泄露 $leak 个内部符号（非 JNI 的不该导出）"
 else
     # 测试工程不含 dex2c 的 Dex2C.cpp，故没有 JNI_OnLoad（全 local）。
     # 真实产物必须有它——那是 ART 的入口。区分这两种情况。
