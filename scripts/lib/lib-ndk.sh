@@ -67,6 +67,13 @@ EOF
   # ⚠️ 只在有注册表时才启用：没有 nc_jni_gen.c 就没有运行期注册，
   #    隐藏符号会让 Java 侧 UnsatisfiedLinkError。
   if [ -f "$jni/nc_jni_gen.c" ]; then
+    # 2026-10-19：这几行 echo 是加来防"静默跳过"的。
+    # CI 39174771703 的四个失败里，根因是 ndk_write_mk 在注册表生成之前
+    # 就跑完了，导致 `if [ -f nc_jni_gen.c ]` 恒假、flags 全没写。
+    # 而 ndk_write_mk 当时【一行日志都不打】—— 日志里只能看到
+    # "[jni-reg] 生成注册表" 在 "Compile nc_jni_gen.c" 之前，
+    # 看不出 mk 其实更早写完。现在把决策打出来，顺序问题一眼可见。
+    echo "  [mk] JNI 符号隐藏已启用（version-script + 动态注册）"
     cat > "$jni/nc_hide.map" <<'MAPEOF'
 {
   global:
@@ -92,11 +99,17 @@ LOCAL_CFLAGS += -DNC_JNI_DYNAMIC_REG
 LOCAL_CPPFLAGS += -DNC_JNI_DYNAMIC_REG
 EOF
     if grep -q 'nc_jni_gen_register' "$jni/nc_jni_gen.c" 2>/dev/null; then
+      echo "  [mk] dex2c 注册表已接入（-DNC_HAS_D2C_REG）"
       cat >> "$jni/Android.mk" <<'EOF'
 LOCAL_CFLAGS += -DNC_HAS_D2C_REG
 LOCAL_CPPFLAGS += -DNC_HAS_D2C_REG
 EOF
     fi
+  else
+    # 这条日志同样关键：说明"JNI 符号隐藏没启用"，以及为什么。
+    # 静默跳过是 CI 上最难查的一类问题（报错五十二的同型教训）。
+    echo "  [mk] ⚠️ 未发现 nc_jni_gen.c → JNI 符号隐藏未启用" \
+         "（注册表生成是否晚于 ndk_write_mk？）" >&2
   fi
 
   # ⚠️ include $(BUILD_SHARED_LIBRARY) 必须放在【所有 LOCAL_* 赋值之后】。
