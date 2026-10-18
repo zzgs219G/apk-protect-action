@@ -758,19 +758,21 @@ static inline long sig_raw_syscall(long n, long a0, long a1, long a2,
     return x0;
 }
 #elif defined(__arm__)
+/* ⚠️ r7 在 ARMv7 是保留寄存器（Thumb frame pointer / 平台寄存器），
+ * clang 拒绝 `register long r7 __asm__("r7")`：
+ *   CI 报 error: write to reserved register 'R7' → armeabi-v7a 编译失败。
+ * （本地交叉编译漏 `-mthumb` 才没复现。）改为内联汇编显式 push/pop r7。 */
 static inline long sig_raw_syscall(long n, long a0, long a1, long a2,
                                    long a3, long a4, long a5) {
-    register long r7 __asm__("r7") = n;
     register long r0 __asm__("r0") = a0;
-    register long r1 __asm__("r1") = a1;
-    register long r2 __asm__("r2") = a2;
-    register long r3 __asm__("r3") = a3;
-    register long r4 __asm__("r4") = a4;
-    register long r5 __asm__("r5") = a5;
-    __asm__ volatile("svc #0"
-                     : "+r"(r0)
-                     : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
-                     : "memory");
+    __asm__ volatile(
+        "push {r7}\n\t"
+        "mov  r7, %[nr]\n\t"
+        "svc  #0\n\t"
+        "pop  {r7}"
+        : "+r"(r0)
+        : [nr] "r"(n), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5)
+        : "memory");
     return r0;
 }
 #endif

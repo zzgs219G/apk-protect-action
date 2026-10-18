@@ -351,19 +351,30 @@ static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, lo
     return env_raw_syscall(n, a0, a1, a2, a3, a4, a5);
 }
 #elif defined(__arm__)
+/* ⚠️ 2026-10-19 CI 实证：ARMv7 的 r7 是【保留寄存器】（Thumb 下作 frame pointer，
+ * 也是平台寄存器），clang 拒绝 `register long r7 __asm__("r7")` ——
+ * CI 报 `error: write to reserved register 'R7'`，armeabi-v7a 整个编译失败。
+ * 本地交叉编译没复现，是因为漏了 `-mthumb`（NDK 对 armv7 默认 Thumb）。
+ *
+ * 修法：不把 r7 声明成寄存器变量，改为在内联汇编里显式 push/pop 保存恢复。
+ * 这样既满足内核 ABI（调用号必须在 r7），又不让编译器认为我们在"占用"它。
+ * 已用 --target=armv7-linux-androideabi -mthumb 在 -O2/-Oz/±frame-pointer
+ * 四种组合下验证：零 error 零 warning，生成 push {r7} / mov r7 / svc / pop {r7}。
+ *
+ * 参数只用 r0-r3（AAPCS 的前四个整型参数寄存器），超过 4 个时由编译器
+ * 自行压栈/取用；这里刻意把 n 放在最后用 "r" 约束交给编译器分配，
+ * 由 mov r7 搬进系统调用寄存器。 */
 static inline long env_raw_syscall(long n, long a0, long a1, long a2,
                                    long a3, long a4, long a5) {
-    register long r7 __asm__("r7") = n;
     register long r0 __asm__("r0") = a0;
-    register long r1 __asm__("r1") = a1;
-    register long r2 __asm__("r2") = a2;
-    register long r3 __asm__("r3") = a3;
-    register long r4 __asm__("r4") = a4;
-    register long r5 __asm__("r5") = a5;
-    __asm__ volatile("svc #0"
-                     : "+r"(r0)
-                     : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
-                     : "memory");
+    __asm__ volatile(
+        "push {r7}\n\t"
+        "mov  r7, %[nr]\n\t"
+        "svc  #0\n\t"
+        "pop  {r7}"
+        : "+r"(r0)
+        : [nr] "r"(n), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5)
+        : "memory");
     return r0;
 }
 static long safe_syscall(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
