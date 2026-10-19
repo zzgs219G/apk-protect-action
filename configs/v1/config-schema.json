@@ -4,7 +4,7 @@
     {
       "key": "sigcheck",
       "label": "签名校验",
-      "desc": "防移动端98% ",
+      "desc": "防移动端98%",
       "type": "leaf",
       "default": true,
       "arg": "--sigcheck"
