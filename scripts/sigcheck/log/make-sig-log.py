@@ -8,18 +8,23 @@
 #   - 运行时 siglog_c()/envlog_c() 用同 key 异或解码后写日志文件(哨兵开关控制);
 #   - key 也随本文件生成进头文件(防御定位:让自动扫描(strings)失效,不抗人工逆向)。
 #
-# 用法: make-sig-log.py <sig_check.c路径> <env_check.c路径> <输出sig_log_data.h路径>
+# 用法: make-sig-log.py <源.c> [更多源.c ...] <输出sig_log_data.h路径>
 # 生成文件在流水线 WORK 目录(build 中间产物,不进 git);注释删除/改名 → 生成器 fail-fast。
+#
+# 2026-10-19：参数从「固定 2 个源文件」改为「1..N 个源文件」。
+# 原因：sig_guard2.c（独立的第二签名校验线）此前不在扫描清单里，
+# 导致它的 .rodata 字符串仍是明文（复测报告实测命中 2 处）。
 
 import re
 import sys
 
 def main():
-    if len(sys.argv) != 4:
-        print("用法: make-sig-log.py <sig_check.c> <env_check.c> <out.h>", file=sys.stderr)
+    if len(sys.argv) < 4:
+        print("用法: make-sig-log.py <源.c> [...] <输出sig_log_data.h>", file=sys.stderr)
         return 2
 
-    src_sig, src_env, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    srcs = sys.argv[1:-1]
+    out_path = sys.argv[-1]
 
     # 8 字节 key(避免单字节 key 让密文呈现规律性;足够打散 UTF-8 中文)
     key = bytes([0x5A, 0xC3, 0x11, 0x9E, 0xF0, 0x37, 0xB2, 0x6D])
@@ -77,10 +82,13 @@ def main():
             ids.append((full, prefix, content))
         return 0
 
-    if scan(src_sig, 'sig') != 0:
-        return 1
-    if scan(src_env, 'env') != 0:
-        return 1
+    # 前缀用文件基名（sig_check→sig / env_check→env / sig_guard2→g2），
+    # 保证多文件扫描时宏名不冲突（各文件的 LSG:NAME 各自独立编号）。
+    for src in srcs:
+        base = src.rsplit('/', 1)[-1]
+        prefix = re.sub(r'\.c(pp)?$', '', base)
+        if scan(src, prefix) != 0:
+            return 1
 
     if not ids:
         print("❌ 未扫描到任何 /*LSG:NAME|文案*/ 标记", file=sys.stderr)

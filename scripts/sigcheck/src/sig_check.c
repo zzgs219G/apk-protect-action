@@ -449,7 +449,9 @@ static int find_apk_path(char *out, size_t outlen) {
         /*LSG:MAPS_MISS|【流程】maps 无 base.apk 行,改由 libnc.so 路径反推*/
         LSGI0(LSG_MAPS_MISS);
     } else {
-        LOGE("fopen /proc/self/maps failed: errno=%d", errno);
+        char _mlb[24];
+        const char *_mp = lsg_s(LSGS_PATH_MAPS2, _mlb, sizeof(_mlb));
+        LOGE("%s failed: errno=%d", _mp ? _mp : "maps", errno);
         /*LSG:MAPS_OPEN_ERR|【失败】无法打开 /proc/self/maps*/
         LSGE(LSG_MAPS_OPEN_ERR, "errno=%d", errno);
     }

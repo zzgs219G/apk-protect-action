@@ -43,6 +43,21 @@
 #include <sys/syscall.h>
 
 #include "sig_guard2.h"
+/* LSGS 密文表（2026-10-19 补）：本文件此前不在 make-sig-log.py 的扫描
+ * 清单里，导致 .rodata 字符串全明文（复测报告实测命中 2 处）。 */
+
+/*LSGS:G2_BLOCK_MAGIC|APK Sig Block 42*/
+/* /proc/self/maps 复用 sig_check.c 已定义的 LSGS_PATH_MAPS2，
+ * 不另立标记（同内容两条标记会因生成器的宏名唯一性检查而 fail-fast）。 */
+
+/* ── .rodata 字符串密文化（2026-10-19）─────────────────────────
+ * 本文件是独立的第二签名校验线（与 sig_check.c 双线互备），
+ * 上一轮 LSGS 改造漏了它 —— 复测报告实测：
+ *   APK Sig Block 42 仍在 .rodata 明文（2 处）
+ *   /proc/self/maps   仍在 .rodata 明文
+ * 攻击者 strings 一遍即知道「这里有第二条签名校验线」。
+ * 标记格式见 make-sig-log.py（此处不写其字面形态，防嵌套注释）。
+ * ⚠️ 需同步 make-sig-log.py 的扫描清单与 protect.sh 的传参。 */
 
 /* ── 日志:纯 logcat,零文件 I/O(与第一线解耦,也不受其哨兵开关影响) ── */
 #ifdef __ANDROID__
@@ -50,6 +65,15 @@
 #define G2LOG(...) __android_log_print(ANDROID_LOG_INFO, "nc", __VA_ARGS__)
 #else
 #define G2LOG(...) do { } while (0)
+#endif
+
+/* LSGS 密文表：路径字面量与签名块 magic 走它解码。
+ * ⚠️ 条件包含（与仓库既有的 SIGGUARD2_HOST_TEST 约定一致）：
+ *    宿主测试只验证派生公式，不构建 sig_log_data.h（流水线产物），
+ *    此时退化为明文字面量。测试环境不需要密文，只需要公式对。 */
+#ifndef SIGGUARD2_HOST_TEST
+#  include "sig_log_data.h"
+#  define G2_HAVE_LSGS 1
 #endif
 
 /* ═══════════════════════ SHA-256(公共域精简实现,自包含) ═══════════════════════ */
@@ -178,7 +202,13 @@ static int g2_find_apk(char *out, size_t outlen) {
 #endif
 
     /* 路径 ①:maps 里的 base.apk */
+#ifdef G2_HAVE_LSGS
+    char _mb[24];
+    const char *_mp = lsg_s(LSGS_PATH_MAPS2, _mb, sizeof(_mb));
+    fp = _mp ? fopen(_mp, "r") : NULL;
+#else
     fp = fopen("/proc/self/maps", "r");
+#endif
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
             char *p = strstr(line, "base.apk");
@@ -240,7 +270,20 @@ static int g2_find_apk(char *out, size_t outlen) {
 
 /* ═══════════════════════ APK Signing Block 解析 ═══════════════════════
  * 与第一线同布局(AOSP v2/v3),但独立实现。找出证书 DER。 */
-#define G2_BLOCK_MAGIC "APK Sig Block 42"
+/* magic 改运行期解码（2026-10-19）：明文字面量会告诉攻击者
+ * 「这是 APK 签名块」，strings 一条命令即中。
+ * 返回 16 字节静态缓冲（magic 只有前 14 字节有效，末 2 字节补 0）。 */
+#ifdef G2_HAVE_LSGS
+static const char *g2_block_magic(void) {
+    static char buf[16];
+    const char *s = lsg_s(LSGS_G2_BLOCK_MAGIC, buf, sizeof(buf));
+    if (!s) return NULL;
+    return buf;
+}
+#else
+/* 宿主测试：明文字面量（无密文表） */
+#  define g2_block_magic()  ("APK Sig Block 42")
+#endif
 #define G2_V2_ID 0x7109871aULL
 #define G2_V3_ID 0xf05368c0ULL
 
@@ -266,7 +309,10 @@ static int g2_extract_cert(int fd, unsigned char **out_der, size_t *out_len) {
     if (cd_off == 0 || cd_off == 0xffffffffULL) return -1;
     if ((off_t)cd_off < 32) return -1;
     if (g2_read_at(fd, magic, 16, (off_t)cd_off - 16) != 0) return -1;
-    if (memcmp(magic, G2_BLOCK_MAGIC, 16) != 0) return -1;
+    {
+        const char *gm = g2_block_magic();
+        if (!gm || memcmp(magic, gm, 16) != 0) return -1;
+    }
     if (g2_read_at(fd, sz8, 8, (off_t)cd_off - 24) != 0) return -1;
     block_size = g2_rd64le(sz8);
     if ((off_t)(block_size + 8) > cd_off) return -1;

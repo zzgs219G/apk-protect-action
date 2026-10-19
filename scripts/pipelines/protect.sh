@@ -300,7 +300,9 @@ mkdir -p "$WORK/project"
 # 勾 sigcheck 或 envcheck 时需要;生成失败 fail-fast(文案缺失=编译必炸,早炸早定位)
 if [[ $WANT_SIGCHECK -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
   python3 "$ROOT/scripts/sigcheck/log/make-sig-log.py" \
-    "$ROOT/scripts/sigcheck/src/sig_check.c" "$ROOT/scripts/sigcheck/src/env_check.c" \
+    "$ROOT/scripts/sigcheck/src/sig_check.c" \
+    "$ROOT/scripts/sigcheck/src/env_check.c" \
+    "$ROOT/scripts/sigcheck/src/sig_guard2.c" \
     "$WORK/sig_log_data.h"
 fi
 
