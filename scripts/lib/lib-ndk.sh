@@ -74,16 +74,33 @@ EOF
     # "[jni-reg] 生成注册表" 在 "Compile nc_jni_gen.c" 之前，
     # 看不出 mk 其实更早写完。现在把决策打出来，顺序问题一眼可见。
     echo "  [mk] JNI 符号隐藏已启用（version-script + 动态注册）"
-    # ⚠️ 2026-10-19 真机实证后的关键修正：
-    #   `local: *` 会把 Java_xxx 也隐藏 → ART 的 dlsym 找不到 → ULE。
-    #   JNI 短名绑定【要求】符号导出，这是硬约束。
-    #   所以只隐藏【非 JNI】符号（dex2c 的辅助函数等），
-    #   Java_* 与 JNI_OnLoad 必须 global。
+    # ⚠️ 2026-10-19 两轮实证后的最终形态（这是第三次修正）：
+    #
+    #   第一轮 `local: *`（全隐藏）
+    #     → ART dlsym 找不到 Java_xxx → UnsatisfiedLinkError。错。
+    #
+    #   第二轮 `global: Java_*`（全保留）
+    #     → 能跑，但 dex2c 的业务方法名与精确大小照旧泄露
+    #       （`nm -D` 一条命令拿到 `MainActivity.k = 21692 B`）。对但不够。
+    #
+    #   第三轮 `global: Java_com_nc_*`（只保留手写入口）← 现在这版
+    #     → 依据：dex2c 产物【本来就是动态注册的】
+    #       （Dex2C.cpp 的 JNI_OnLoad 里调 dynamic_register_compile_methods），
+    #        不靠 dlsym 按名查找 → 隐藏它们不影响调用。
+    #       而我们手写的三个入口（NcLink.selftest/ncVerify/heartbeat）
+    #       走 JNI 短名绑定，ART 靠 dlsym 按名找 → 必须导出。
+    #
+    #   实测验证：t2.so 里 Java_com_x_MainActivity_k 被隐藏、
+    #   Java_com_nc_link_NcLink_selftest 保留，各得其所。
+    #
+    #   ⚠️ 动态注册手写入口这条路已试过并回退（a7d9cbc）：
+    #      constructor 里 FindClass 在 so 加载时机不安全，真机起不来。
+    #      所以手写入口只能短名绑定，只能保留符号名。
     cat > "$jni/nc_hide.map" <<'MAPEOF'
 {
   global:
     JNI_OnLoad;
-    Java_*;
+    Java_com_nc_*;
   local:
     *;
 };

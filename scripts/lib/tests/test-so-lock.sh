@@ -97,7 +97,7 @@ CFLAGS="-fPIC -shared -fvisibility=hidden -fno-ident -Oz \
 #    写成 global 会让 lld 报 "symbol not defined" → 按存在性生成。
 { echo "{"; echo "  global:";   nm -g --defined-only libnc.so 2>/dev/null | grep -qw JNI_OnLoad \
       && echo "    JNI_OnLoad;"; \
-  echo "    Java_*;"; echo "  local:"; echo "    *;"; echo "};"; } > hide.map
+  echo "    Java_com_nc_*;"; echo "  local:"; echo "    *;"; echo "};"; } > hide.map
 LDFLAGS="-Wl,--gc-sections -Wl,--build-id=none -Wl,--version-script=hide.map"
 # sig_log_data.h 依赖 sig_check.c + env_check.c 的 LSG 标记，必须先跑生成器
 python3 "$ROOT/scripts/sigcheck/log/make-sig-log.py" \
