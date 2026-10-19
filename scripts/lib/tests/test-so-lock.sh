@@ -394,6 +394,73 @@ else
     skip "T17 无 libnc.so"
 fi
 
+# ── T18 .text 双重覆盖：CRC 自绑定必须覆盖整个 .text ────────────
+# 背景（复测报告 §2.2 说「.text 校验仍报 clean」）：
+#   实测确认那不是缺陷——self_text_crc_probe 与 CRC 自绑定【都覆盖整个
+#   .text】。改 .text 任何字节 → CRC 先失败 → head 解出乱码 → SIGILL，
+#   探针根本没机会跑。所以「报 clean」是被更强机制覆盖的正常表现。
+#
+# 但这个覆盖关系是【隐含的】——没有任何东西保证它成立。若后人把
+# CRC 的 code_addr/code_len 改成只覆盖部分 .text（比如为了缩小自绑定
+# 范围、提速），.text 校验就会变成唯一防线，而它实测有跨映射误判史
+# （报错五十四）。这个断言把隐含依赖变成显式契约。
+if [ -f libnc.so ]; then
+    CRC_INFO=$(python3 - <<'PYT18'
+import struct
+d = open('libnc.so', 'rb').read()
+sh = struct.unpack('<Q', d[0x28:0x30])[0]
+es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]
+si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+secs = {}
+for i in range(en):
+    o = sh + i*es
+    no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    secs[nm] = (struct.unpack('<Q', d[o+0x10:o+0x18])[0],
+                struct.unpack('<Q', d[o+0x20:o+0x28])[0])
+t_addr, t_size = secs['.text']
+# .ncks slot 里的 code_addr/code_len（偏移 36/40，NCG_OFF_CODE_*）
+s_addr, s_size = secs['.ncks']
+slot = d[s_addr: s_addr + s_size]
+ca = struct.unpack('<I', slot[36:40])[0]
+cl = struct.unpack('<I', slot[40:44])[0]
+print('%d %d %d %d' % (ca, cl, t_addr, t_size))
+PYT18
+)
+    read -r CA CL TA TS <<< "$CRC_INFO"
+    if [ "$CA" = "$TA" ] && [ "$CL" = "$TS" ]; then
+        ok "T18 CRC 自绑定覆盖整个 .text（0x$CA +$CL），.text 校验是被覆盖的冗余层"
+    else
+        bad "T18 CRC 覆盖范围(0x$CA +$CL) != .text(0x$TA +$TS) —— \
+.text 完整性校验将变成唯一防线，而它有跨映射误判史（报错五十四）"
+    fi
+else
+    skip "T18 无 libnc.so"
+fi
+
+# ── T19 hook 探针覆盖解密链关键符号 ─────────────────────────
+# 复测报告 §13.3 第一条动态路径：「frida hook mprotect 拿解密后明文」。
+# 原探针只覆盖 fopen/open/connect/read 4 个常规 hook 点，
+# 不含 mprotect/mmap/dlopen/process_vm_readv —— 而它们是
+# dump 和解密链的关键。本项断言这 4 个新符号的标记与引用都在。
+if [ -f env_check.c ]; then
+    miss=""
+    for sym in SYM_MPROTECT SYM_MMAP SYM_DLOPEN SYM_PVMREAD; do
+        # 标记（/*LSGS:xxx|...*/）与引用（lsg_s(LSGS_xxx, ...)）都要在
+        grep -q "LSGS:$sym|" env_check.c || miss="$miss 标记:$sym"
+        grep -q "LSGS_$sym," env_check.c || miss="$miss 引用:$sym"
+    done
+    if [ -z "$miss" ]; then
+        ok "T19 hook 探针覆盖 mprotect/mmap/dlopen/pvm_readv（解密链关键点）"
+    else
+        bad "T19 hook 探针缺项:$miss —— 只加引用不加标记会运行期取不到名字（静默漏检）"
+    fi
+else
+    skip "T19 无 env_check.c"
+fi
+
 # ── T4/T5 运行期：需构造 fake Android 环境 ──
 # 编入 env_check.c/sig_check.c 后会引入 liblog 依赖（__android_log_print）。
 # 宿主没有 bionic，给个桩让 dlopen 能解析到（仅测试用，不进产物）。

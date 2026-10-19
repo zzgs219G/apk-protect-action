@@ -708,6 +708,12 @@ static int xposed_file_probe(void) {
 /*LSGS:SYM_OPEN|open*/
 /*LSGS:SYM_CONNECT|connect*/
 /*LSGS:SYM_READ|read*/
+/* 2026-10-19 新增 4 个（复测报告 §13.3 第一条动态路径）：
+ * hook mprotect 是拿到解密后明文 .ncx 的主力手法，原 4 个符号不含它。 */
+/*LSGS:SYM_MPROTECT|mprotect*/
+/*LSGS:SYM_MMAP|mmap*/
+/*LSGS:SYM_DLOPEN|dlopen*/
+/*LSGS:SYM_PVMREAD|process_vm_readv*/
 
 /* ─────────────────────────── c. 调试器检测 ─────────────────────────── */
 
@@ -954,12 +960,21 @@ static int env_elf_text(const char *path, env_text_t *out) {
 
 /* d4. libc 导出函数入口指令检测(2026-10 借鉴 XopProtector libc_hook_score):
  * Inline hook 的本质是"把函数入口第一条指令改写成跳转/断点",所以不校验
- * 全部 .text(那是 d5 CRC 的活),只读 4 个攻击者最常 hook 的导出函数入口
- * 4 字节,判 arm64 的 B/BL/BRK —— 16 字节 vs d5 的 1-2MB,纳秒级。
+ * 全部 .text(那是 d5 CRC 的活),只读 N 个攻击者最常 hook 的导出函数入口
+ * 4 字节,判 arm64 的 B/BL/BRK —— 4N 字节 vs d5 的 1-2MB,纳秒级。
  * 打分制(照抄 Xop):单个被 hook 可能是 ROM 厂商特性(MIUI 某些隐藏 hook),
  * ≥2 分才报警压误报。读内存走 process_vm_readv(内核拷贝,不经本进程页表,
  * 防 XOM 设备直接解引用 SIGSEGV;Xop safe_read_u32 同款)。
- * 4 个函数名走 LSGS 密文(不然 "fopen"/"connect" 又是明文特征)。 */
+ *
+ * 2026-10-19 扩到 8 个函数（复测报告 §13.3 列的第一条动态路径）：
+ *   报告指出「frida hook mprotect 能拿到解密后的明文 .ncx」。
+ *   原 4 个（fopen/open/connect/read）只覆盖常规 hook，不含解密链关键点。
+ *   新增 mprotect / mmap / dlopen / process_vm_readv ——
+ *     mprotect  解密流程自己要用（切 RWX/RX），hook 它即可 dump 明文段
+ *     mmap      攻击者读 /proc/self/maps 后映射明文段的替代路径
+ *     dlopen    加载/枚举 so 的入口
+ *     process_vm_readv 跨进程读内存的主力系统调用（dump 必用）
+ * 函数名走 LSGS 密文(不然 "mprotect" 又是明文特征)。 */
 static int env_pvm_read_u32(const void *addr, uint32_t *out) {
     struct iovec local, remote;
     if (addr == NULL || out == NULL) return 0;
@@ -975,10 +990,11 @@ static int env_pvm_read_u32(const void *addr, uint32_t *out) {
 /* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
+#define NC_HOOK_PROBE_N 8
 static int libc_hook_probe(void) {
-    char n1[8], n2[8], n3[12], n4[8];
-    const char *names[4];
-    void *fns[4];
+    char n1[8], n2[8], n3[12], n4[8], n5[12], n6[8], n7[8], n8[20];
+    const char *names[NC_HOOK_PROBE_N];
+    void *fns[NC_HOOK_PROBE_N];
     int score = 0, i;
     static const uint32_t masks[3] = { 0xFC000000u, 0xFC000000u, 0xFFE0001Fu };
     static const uint32_t hooks[3] = { 0x14000000u, 0x94000000u, 0xD4200000u };
@@ -986,8 +1002,13 @@ static int libc_hook_probe(void) {
     names[1] = lsg_s(LSGS_SYM_OPEN,    n2, sizeof(n2));
     names[2] = lsg_s(LSGS_SYM_CONNECT, n3, sizeof(n3));
     names[3] = lsg_s(LSGS_SYM_READ,    n4, sizeof(n4));
-    if (!names[0] || !names[1] || !names[2] || !names[3]) return 0;
-    for (i = 0; i < 4; i++) {
+    names[4] = lsg_s(LSGS_SYM_MPROTECT, n5, sizeof(n5));
+    names[5] = lsg_s(LSGS_SYM_MMAP,     n6, sizeof(n6));
+    names[6] = lsg_s(LSGS_SYM_DLOPEN,   n7, sizeof(n7));
+    names[7] = lsg_s(LSGS_SYM_PVMREAD,  n8, sizeof(n8));
+    if (!names[0] || !names[1] || !names[2] || !names[3]
+        || !names[4] || !names[5] || !names[6] || !names[7]) return 0;
+    for (i = 0; i < NC_HOOK_PROBE_N; i++) {
         uint32_t w = 0;
         int j, hooked = 0;
         fns[i] = dlsym(RTLD_DEFAULT, names[i]);
