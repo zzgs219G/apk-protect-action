@@ -7,13 +7,13 @@
 #   定时拉，这个只需在自己改动时推一次。
 #
 # 链路：
-#   push 改了 configs/** → repository_dispatch 通知 zzgs219/json
+#   push 改了 configs/** → repository_dispatch 通知 zzgs219G/json
 #   → json 仓库的 apk-schema.yml 收到后拉取原始文件并提交
 #   → APP 从 gitee 镜像读（仓库地址不暴露在 APK 里）
 #
 # 需要配置的 secret：
 #   JSON_REPO_DISPATCH_TOKEN
-#     fine-grained PAT，仅授权 zzgs219/json 仓库，
+#     fine-grained PAT，仅授权 zzgs219G/json 仓库，
 #     权限：Contents = Read and write（repository_dispatch 需要写权限）
 #
 # ⚠️ 未配置该 secret 时本工作流会**跳过**而不是失败——避免因为一个可选的
@@ -50,12 +50,12 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Dispatch to zzgs219/json
+      - name: Dispatch to zzgs219G/json
         if: steps.gate.outputs.enabled == 'true'
         env:
           # 经 env 中转，token 不出现在命令行参数里（与 protect-modules.yml 一致的做法）
           TOKEN: ${{ secrets.JSON_REPO_DISPATCH_TOKEN }}
-          TARGET_REPO: "zzgs219/json"
+          TARGET_REPO: "zzgs219G/json"
           # 传变更后的 commit，便于 json 仓库侧记录"同步的是哪一版"
           SOURCE_SHA: ${{ github.sha }}
         run: |
