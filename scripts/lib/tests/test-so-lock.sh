@@ -119,6 +119,29 @@ for s in .nck .ncks .ncx .ncxr .ncxh; do
     have_sec "$s" && ok "T1 段 $s 存在" || bad "T1 段 $s 缺失"
 done
 
+# 从指定段读 hex 子串（按段表定位，不用 bytes.find——段名相同的数据
+# 可能在 so 里多处出现，find 会命中错误位置）
+section_bytes() {
+    python3 - "$1" "$2" "$3" "$4" <<'PYB'
+import struct, sys
+sec, off, ln, path = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+d = open(path, 'rb').read()
+sh = struct.unpack('<Q', d[0x28:0x30])[0]
+es = struct.unpack('<H', d[0x3a:0x3c])[0]
+en = struct.unpack('<H', d[0x3c:0x3e])[0]
+si = struct.unpack('<H', d[0x3e:0x40])[0]
+so = struct.unpack('<Q', d[sh+si*es+0x18: sh+si*es+0x20])[0]
+for i in range(en):
+    o = sh + i*es
+    no = struct.unpack('<I', d[o:o+4])[0]
+    nm = d[so+no: d.index(b'\0', so+no)].decode()
+    if nm == sec:
+        fo = struct.unpack('<Q', d[o+0x18:o+0x20])[0]
+        print(d[fo+off: fo+off+ln].hex())
+        break
+PYB
+}
+
 sec_size() {
     python3 - "$1" <<'PY'
 import struct,sys
@@ -347,6 +370,28 @@ else
     readelf -SW libnc.so 2>/dev/null | grep -q "\.ncx" \
         && ok "T16 段名已中性化（.ncx/.ncxr/.ncxh/.ncxhr/.nck/.ncks）" \
         || bad "T16 段名异常（既无中性名也无旧名）"
+fi
+
+# ── T17 诱饵必须真随机（防 diff 识破）────────────────────────
+# 复测报告 §7.1 的识破手法：第一版与第二版的 wrapped_k_so 完全相同
+# （d6054d96f1e71285...），据此判定「诱饵死字段，不参与真实派生」。
+# 确定性诱饵 = 攻击者 diff 两个 so 就能认出来，不需要懂密码学。
+# 改 os.urandom 后每次构建都不同，diff 手法失效。
+if [ -f libnc.so ]; then
+    d1=$(section_bytes .nck 16 16 libnc.so)
+    # 用 --force 重新锁一次，比对 wrapped_k_so 是否变化
+    cp libnc.so libnc_a.so
+    python3 "$LOCK" libnc_a.so libnc_a.so --section ".ncx,.ncxr" \
+        --from-apk "$APK" --force >/dev/null 2>&1
+    d2=$(section_bytes .nck 16 16 libnc_a.so)
+    if [ -n "$d1" ] && [ -n "$d2" ] && [ "$d1" != "$d2" ]; then
+        ok "T17 诱饵真随机（两次构建 wrapped_k_so 不同，diff 手法失效）"
+    else
+        bad "T17 诱饵仍是确定性的（d1=$d1 d2=$d2）—— 复测报告的 diff 识破会再次生效"
+    fi
+    rm -f libnc_a.so
+else
+    skip "T17 无 libnc.so"
 fi
 
 # ── T4/T5 运行期：需构造 fake Android 环境 ──

@@ -650,12 +650,18 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     #
     # 同理 k_mac 也不该落盘 —— 它是 HMAC 密钥，落盘等于把完整性校验
     # 交给攻击者。运行期同样从证书重新派生。
-    _decoy_seed = hashlib.sha256(b'nc-decoy-v1' + (package or '').encode()).digest()
+    # ⚠️ 2026-10-19 诱饵改真随机（原来是确定性 sha256，被复测报告识破）：
+    #   报告 §7.1 实测第一版与第二版的 wrapped_k_so 完全相同
+    #   （d6054d96f1e71285...），据此判定「它是诱饵死字段，不参与真实派生」。
+    #   确定性诱饵的问题：同一个包名永远生成同一串字节，
+    #   **两版产物一比对立功**——攻击者不需要懂任何密码学，只要 diff 两个 so。
+    #   改 os.urandom 后每次构建都不同，diff 手法失效。
+    _decoy_seed = os.urandom(16)
     wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)]
-                    for i, b in enumerate(_decoy_seed[:16]))
-    _decoy_mac = hashlib.sha256(b'nc-decoy-mac' + (package or '').encode()).digest()
+                    for i, b in enumerate(_decoy_seed))
+    _decoy_mac = os.urandom(16)
     wrapped_mac = bytes(b ^ XOR_KEY[i % len(XOR_KEY)]
-                        for i, b in enumerate(_decoy_mac[:16]))
+                        for i, b in enumerate(_decoy_mac))
     pkg_sha8 = hashlib.sha256((package or '').encode('utf-8')).digest()[:8]
     blob = (SLOT_MAGIC + wrapped + wrapped_mac + expect_mac
             + pkg_sha8 + b'\x00' * 8)
