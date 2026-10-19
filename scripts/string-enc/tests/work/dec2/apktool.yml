@@ -1,0 +1,9 @@
+!!brut.androlib.meta.MetaInfo
+apkFileName: stub.apk
+isFrameworkApk: false
+sdkInfo:
+  minSdkVersion: 21
+  targetSdkVersion: 26
+versionInfo:
+  versionCode: 1
+  versionName: "1.0"

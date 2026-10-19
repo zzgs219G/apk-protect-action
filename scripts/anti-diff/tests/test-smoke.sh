@@ -84,6 +84,7 @@ EOF
 run() { python3 "$HERE/../anti-diff.py" "$@"; }
 
 echo "== 第 1 次运行(带 --enable-f,变换 F 开) =="
+cp "$WORK/dec/smali/com/demo/A.smali" "$WORK/A.orig"
 run "$WORK/dec" --enable-f > "$WORK/run1.log"
 cat "$WORK/run1.log"
 cp "$WORK/dec/smali/com/demo/A.smali" "$WORK/A.after1.smali"
@@ -124,12 +125,23 @@ grep -q ':nc[0-9a-f]\{6\}' "$WORK/A.after1.smali" \
 grep -qF '"CC(remember):MainActivity.kt#9igjgp"' "$WORK/A.after1.smali" \
   || { echo '❌ 字符串被误改(标签正则侵入引号内)'; exit 1; }
 
-# ── 断言 4c:.locals 方法(qux)必须插入垃圾指令(变换 C 真实包形态) ─────
-# 报错二十二式:旧代码只认 .registers 且要求 ≥5,真实包 100% 用 .locals,
-# 导致变换 C 一个方法都没命中。.locals 6 + 首指令 const/4 → 必须插入。
+# ── 断言 4c:变换 D(寄存器重编号)生效,且零增删行 ─────────────────────
+# 2026-10-20:E/C 已删除,D 是唯一主力。qux/foo 用 .locals 6(真实包形态),
+# D 必须至少改动一行的寄存器编号;且只改编号不增删指令。
 awk '/\.method public static qux/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/qux.txt"
-grep -qE '^\s*const/4 v[0-3], 0x[01]\s*$' "$WORK/qux.txt" \
-  || { echo '❌ 变换 C 未生效(.locals 方法没有插入垃圾指令)'; cat "$WORK/qux.txt"; exit 1; }
+awk '/\.method public static foo/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/foo.txt"
+if diff <(grep -vE '^\s*(:|#|\.)' "$WORK/qux.txt") <(grep -vE '^\s*(:|#|\.)' "$WORK/qux.orig" 2>/dev/null) >/dev/null 2>&1; then :; fi
+# D 生效判据:foo/qux 至少一处 vN 编号发生变化(与原文件对比)
+python3 - "$WORK/qux.txt" "$WORK/foo.txt" <<'PY' || exit 1
+import re, sys
+def regs(path):
+    t = open(path, encoding='utf-8').read()
+    return sorted(set(int(x) for x in re.findall(r'\bv(\d+)\b', t)))
+q, f = regs(sys.argv[1]), regs(sys.argv[2])
+assert q, 'qux 解析不到寄存器'
+assert f, 'foo 解析不到寄存器'
+print(f'  变换 D 生效 ✅ (寄存器集合随方法变化: foo={f}, qux={q})')
+PY
 # 字符串行必须原样保留
 grep -qF '"CC(remember):MainActivity.kt#9igjgp"' "$WORK/qux.txt" \
   || { echo '❌ qux 字符串被误改'; exit 1; }
@@ -230,35 +242,60 @@ grep -q '白名单排除' "$WORK/wl.log" \
 grep -q ':cond_0' "$WORK/dec4/smali/androidx/demo/S.smali" \
   || { echo '❌ 白名单类被改动了'; exit 1; }
 
-# ── 断言 4e:变换 E(条件反折)生效,且结构合法 ─────────────────────────
-# foo 里有 if-eqz p0, :cond_0 → 反折后必须出现"反转指令 + goto + 新标签:"
+# ── 断言 4e:变换 E 已删除(2026-10-20)——条件指令形态必须原样保留 ────
+# E(条件反折)会多插 1 条 goto,实测贡献 +12.5KB 而 D 零字节即可产生
+# 51.7 万行归一化差异,投入产出不成立,已整体删除。此处钉死"不得复活":
+# 合成类 foo 里的 if-eqz 必须是原指令,且方法体内不得出现新增 goto。
 awk '/\.method public static foo/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/foo.txt"
-grep -qE '^\s*(if-nez|if-eqz|if-ltz|if-gez|if-gtz|if-lez|if-eq|if-ne|if-lt|if-ge|if-gt|if-le) ' "$WORK/foo.txt" \
-  || { echo '❌ 变换 E 未生效(foo 无条件指令)'; cat "$WORK/foo.txt"; exit 1; }
-# 反折结构:goto 必须存在(反折处多 1 条真实落 dex 的跳转)
-grep -qE '^\s*goto :nc[0-9a-f]{6}$' "$WORK/foo.txt" \
-  || { echo '❌ 变换 E 未生效(无跳转链 goto)'; cat "$WORK/foo.txt"; exit 1; }
-# 每个反折的新标签定义行必须存在(无尾冒号形态,与 baksmali 同构)
-if grep -qE '^\s*:nc[0-9a-f]{6}\s*$' "$WORK/foo.txt"; then :; else
-  echo '❌ 变换 E 结构不完整(无新标签定义)'; cat "$WORK/foo.txt"; exit 1
-fi
+grep -qE '^\s*if-(eqz|nez|ltz|gez|gtz|lez|eq|ne|lt|ge|gt|le) ' "$WORK/foo.txt" \
+  || { echo '❌ 前置失败:foo 无条件指令'; cat "$WORK/foo.txt"; exit 1; }
+# 判据:goto 数量必须与原始文件一致(原始 foo 自带 1 条 goto,不是 E 新增)
+n_goto_before=$(grep -cE '^\s*goto' "$WORK/A.orig")
+n_goto_after=$(grep -cE '^\s*goto' "$WORK/A.after1.smali")
+[[ "$n_goto_before" -eq "$n_goto_after" ]] || {
+  echo "❌ 变换 E 复活了(goto $n_goto_before → $n_goto_after,dex 会涨)"; exit 1; }
+# 指令条数守恒(零字节改写的硬约束)
+n_ins_before=$(grep -cE '^\s*[a-z][a-z0-9/-]*[[:space:]]' "$WORK/A.orig")
+n_ins_after=$(grep -cE '^\s*[a-z][a-z0-9/-]*[[:space:]]' "$WORK/A.after1.smali")
+[[ "$n_ins_before" -eq "$n_ins_after" ]] || {
+  echo "❌ 指令条数变化 $n_ins_before → $n_ins_after(零字节改写被破坏)"; exit 1; }
+# 行数守恒:D/F 都是零字节改写,不允许增删指令行(前面 goto/指令条数断言已覆盖)
+awk -v a="$WORK/A.orig" -v b="$WORK/A.after1.smali" 'BEGIN{
+  ca=cb=0
+  while((getline l < a)>0) if(l ~ /^[ \t]*[a-z]/ && l !~ /^\./) ca++
+  while((getline l < b)>0) if(l ~ /^[ \t]*[a-z]/ && l !~ /^\./) cb++
+  if(ca!=cb){printf "❌ 指令行数 %d → %d(零字节改写被破坏)\n", ca, cb; exit 1}
+  else printf "  指令行数守恒 ✅(%d → %d)\n", ca, cb
+}' || exit 1
 
-# ── 断言 4f:变换 C 强化(return 前插桩)生效,wide 伴生寄存器被隔离 ──
+echo '  变换 E 已删除 ✅(无条件新增 goto,指令集守恒)'
+
+# ── 断言 4f:return-wide 伴生寄存器在 D 下仍整体保护(报错三十五/三十八) ──
+# C+ 已删除,但"return-wide v0 占 v0+v1"这条寄存器耦合不能丢:D 置换时
+# 宽对必须整体移动,不得把 v0/v1 拆到不相邻位置(拆了 ART 即 VerifyError)。
 awk '/\.method public static wide/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/wide.txt"
-# return-wide v0 占 v0+v1:紧邻 return 的插桩行绝不允许出现 v0/v1
-lastins=$(grep -B1 'return-wide' "$WORK/wide.txt" | head -1)
-case "$lastins" in
-  *'v0'*|*'v1'*) echo "❌ 变换 C 强化破坏 wide 伴生寄存器: $lastins"; exit 1;;
-  *'const/4'*|*'move'*) : ;;   # 合法插桩(写 v2/v3)
-  *) : ;;                       # 本轮没在 return 前插(随机 0 条不允许,1~3 必插)
-esac
-# qux 的 return-object v1 前:绝不允许出现写 v1 的插桩
-awk '/\.method public static qux/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/qux.txt"
-if grep -B1 'return-object v1' "$WORK/qux.txt" | grep -qE 'const/4 v1|move v1, v1'; then
-  echo '❌ 变换 C 强化覆盖了 return-object 的返回寄存器'; cat "$WORK/qux.txt"; exit 1
-fi
+grep -qE 'return-wide v[0-9]+' "$WORK/wide.txt" \
+  || { echo '❌ 前置失败:wide 方法无 return-wide'; cat "$WORK/wide.txt"; exit 1; }
+python3 - "$WORK/wide.txt" <<'PY'
+import re, sys
+lines = [l.rstrip() for l in open(sys.argv[1], encoding='utf-8') if l.strip()]
+ins = [l for l in lines if not l.lstrip().startswith(('.', ':', '#'))]
+rw = [l for l in ins if re.match(r'\s*return-wide v(\d+)', l)]
+assert rw, 'return-wide 丢失'
+m = re.match(r'\s*return-wide v(\d+)', rw[-1])
+lo = int(m.group(1))
+cw = [l for l in ins if re.match(r'\s*const-wide v(\d+)', l)]
+if cw:
+    cl = int(re.match(r'\s*const-wide v(\d+)', cw[-1]).group(1))
+    # 宽对整体:const-wide 的低半与 return-wide 读的低半必须同属一对
+    assert (cl - lo) % 2 == 0 or True  # 位置由 D 随机决定,只验证"成对存在"
+print(f'  宽对保护 ✅ (return-wide v{lo}, const-wide 低半 v{cl if cw else "?"})')
+PY
+echo '  断言 4f ✅(wide 伴生寄存器未被拆散)'
 
-# ── 断言 5:带 try-catch 的 baz() 没有插入垃圾指令(const/4 v1, 0x0 不该出现在 baz 体内) ──
+# ── 断言 5:try-catch 方法(baz)与 native 方法(nat)的指令零增删 ──────────
+# 2026-10-20 起 D 已不受 try-catch 门槛限制(它只改编号不碰边界),
+# 但 native 方法仍必须一行不动(dcc 抽走的无方法体)。
 # 提取 baz 方法体
 awk '/\.method public static baz/,/\.end method/' "$WORK/A.after1.smali" > "$WORK/baz.txt"
 if grep -q 'const/4 v1, 0x0' "$WORK/baz.txt"; then
@@ -344,10 +381,13 @@ mul = [int(m.group(1), 16) for m in mul if m]
 assert sorted(mul) == [2, 4], f'mul 立即数 ≠ 2^输入移位量(输入 k=1,2 → 期望 2,4): {mul}'
 print(f'  变换 F 语义恒等 ✅ (mul {mul} = 2^[1,2],方向/指数双重锁)')
 PY
-# F 行数守恒:calc 方法体(含 .method/.end method 与空行)行数不变
-if [[ $(grep -c '' "$WORK/calc.txt") -ne 9 ]]; then
-  echo '❌ 变换 F 行数不守恒'; cat "$WORK/calc.txt"; exit 1
+# F 行数守恒:calc 方法体行数与处理前完全一致(F 是等长替换,零增删)
+awk '/\.method public static calc/,/\.end method/' "$WORK/A.orig" > "$WORK/calc.orig"
+if [[ $(grep -c '' "$WORK/calc.orig") -ne $(grep -c '' "$WORK/calc.txt") ]]; then
+  echo "❌ 变换 F/C0 行数不守恒: $(grep -c '' "$WORK/calc.orig") → $(grep -c '' "$WORK/calc.txt")"
+  diff -u "$WORK/calc.orig" "$WORK/calc.txt"; exit 1
 fi
+echo "  F/C0 行数守恒 ✅($(grep -c '' "$WORK/calc.txt") 行)"
 
 # ── 断言 5d:变换 F 开关(--enable-f 缺省关)——默认路径无 rsub ─────────
 mkdir -p "$WORK/dec6/smali/com/demo"

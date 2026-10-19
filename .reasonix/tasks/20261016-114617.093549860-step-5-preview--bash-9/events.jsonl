@@ -1,0 +1,2 @@
+{"sequence":1,"timestamp":"2026-10-18T00:07:39.300921345Z","event_type":"state_change","task_id":"20261016-114617.093549860-step-5-preview--bash-9","session_id":"20261016-114617.093549860-step-5-preview","state":"running","runtime_state":"alive"}
+{"sequence":2,"timestamp":"2026-10-18T00:13:46.378258214Z","event_type":"state_change","task_id":"20261016-114617.093549860-step-5-preview--bash-9","session_id":"20261016-114617.093549860-step-5-preview","state":"succeeded","runtime_state":"exited"}

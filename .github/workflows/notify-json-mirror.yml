@@ -1,0 +1,91 @@
+# ==============================================================================
+# config-schema.json 变更 → 通知 json 仓库同步
+# ==============================================================================
+# 为什么只在 configs/ 变更时触发，不做定时：
+#   这份 schema 是**本仓库自己的文件**，不发版本号就不存在"上游自己变了"。
+#   与 antutu / github-star 那类抓别人数据的定时任务本质不同——那些必须
+#   定时拉，这个只需在自己改动时推一次。
+#
+# 链路：
+#   push 改了 configs/** → repository_dispatch 通知 zzgs219/json
+#   → json 仓库的 apk-schema.yml 收到后拉取原始文件并提交
+#   → APP 从 gitee 镜像读（仓库地址不暴露在 APK 里）
+#
+# 需要配置的 secret：
+#   JSON_REPO_DISPATCH_TOKEN
+#     fine-grained PAT，仅授权 zzgs219/json 仓库，
+#     权限：Contents = Read and write（repository_dispatch 需要写权限）
+#
+# ⚠️ 未配置该 secret 时本工作流会**跳过**而不是失败——避免因为一个可选的
+#    同步步骤让主流水线显示红色。想启用同步就配 secret。
+# ==============================================================================
+
+name: Notify json mirror
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # 只看 schema 与它们依赖的脚本；改 README 之类的无需同步
+      - "configs/**"
+      - ".github/workflows/notify-json-mirror.yml"
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    name: Trigger json repo sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check whether dispatch token is configured
+        id: gate
+        env:
+          TOKEN: ${{ secrets.JSON_REPO_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice title=跳过镜像同步::未配置 JSON_REPO_DISPATCH_TOKEN，本次不同步 schema 到 json 仓库"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch to zzgs219/json
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          # 经 env 中转，token 不出现在命令行参数里（与 protect-modules.yml 一致的做法）
+          TOKEN: ${{ secrets.JSON_REPO_DISPATCH_TOKEN }}
+          TARGET_REPO: "zzgs219/json"
+          # 传变更后的 commit，便于 json 仓库侧记录"同步的是哪一版"
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -o pipefail
+
+          # 只同步 configs/ 目录的变更事件；json 侧按 event_type 过滤
+          payload=$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              "event_type": "apk-schema-updated",
+              "client_payload": {
+                  "source_repo": os.environ.get("GITHUB_REPOSITORY", ""),
+                  "source_sha": os.environ.get("SOURCE_SHA", ""),
+              },
+          }))
+          PY
+          )
+
+          code=$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$TARGET_REPO/dispatches" \
+            --data-binary "$payload")
+
+          echo "HTTP $code"
+          if [ "$code" != "204" ]; then
+            echo "::error title=镜像通知失败::向 $TARGET_REPO 发 repository_dispatch 返回 HTTP $code"
+            cat /tmp/resp.txt
+            exit 1
+          fi
+          echo "::notice title=已通知镜像::$TARGET_REPO 将在 workflow 中拉取最新 schema"
