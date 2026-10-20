@@ -843,7 +843,27 @@ static void ncg_stub_recover(void) {
     uintptr_t ps = getpagesize();
     uintptr_t s = (uintptr_t) start & ~(ps - 1);
     uintptr_t e = ((uintptr_t) start + head_size - 1 & ~(ps - 1)) + ps;
-    mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC);
+    /* ⚠️ 2026-10-20 补返回值检查（此前未查，是本文件 5 个 mprotect 调用点
+     *    里唯一漏的一处）。
+     *
+     * 不查的后果：mprotect 失败时下面那个 XOR 循环会往【仍只读】的页里写
+     * → SIGSEGV。而 SIGSEGV 与"密文段被改过"的 SIGILL 是两种死法，
+     * 排查时会被误导成"段被篡改"，实际是权限没改成功。
+     *
+     * 失败处理：直接 return，让 head 段【保持密文】。这与 655/666 的
+     * -8/-10 语义对等（fail-closed），也与本函数上方 MAC 校验失败分支
+     * （return、不动 mprotect）完全一致。本函数是 static void、无返回值
+     * 通道，故用 return 而非返回码；后续对 head 段函数的调用都会踩密文
+     * → SIGILL，从"非法指令"而非"段错误"即可判断是解密链路失败。
+     *
+     * 为什么早先不查：本函数在 .text 明文 stub 里，曾担心多加分支会改变
+     * stub 形态。该顾虑不成立——CRC 自绑定是每次构建时对【当次】.text
+     * 现算的（so-section-lock.py 的 lock_head），锁箱与运行天然自洽；
+     * 且已发布 .so 是独立二进制，源码改动碰不到它。 */
+    if (mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        memset(k, 0, sizeof(k));
+        return;   /* 权限没改成功 → 不解密，段保持密文 → 调用即 SIGILL */
+    }
 
     for (uint32_t i = 0; i < head_size; i++) start[i] ^= k[i & 15];
 
