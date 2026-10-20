@@ -1,5 +1,41 @@
 /* nc_guard_boot.c — 自解谜引导（明文 stub + 密文 unlock 本体）
  *
+ * ───────────────────────────────────────────────────────────────────
+ * 函数索引（2026-10-20 加。本文件 918 行，读之前先看这张表——
+ *           它标了每个函数在哪一段、被谁调，能省掉全文扫描）
+ * ───────────────────────────────────────────────────────────────────
+ *
+ * 第一部分：密文 unlock 本体（NC_SEC_HEAD = .ncxh，构建期被锁成密文）
+ *   行 285  ncg_rc4              RC4（与 so-section-lock.py 逐字节同算法）
+ *   行 307  ncg_find_section     按名字在 ELF 文件里找段（ELF64 only）
+ *   行 341  ncg_resolve_self     dladdr 拿自身基址与路径
+ *   行 372  ncg_self_pkg         从 /proc/self/cmdline 取包名（截到第一个 ':'）
+ *   行 396  ncg_pkg_matches      包名指纹比对（SHA256(包名)[:8] vs slot）
+ *   行 413  ncg_find_apk_path    定位自身 APK（maps 含 base.apk / so 路径反推）
+ *   行 472  ncg_head_unlock      ★主流程★ 解出 .ncx/.ncxr 业务段
+ *
+ * 第二部分：明文 stub（.text，攻击者唯一能直接读到的部分）
+ *   行 227  ncg_xor_key          运行期拼回 XOR_KEY（4 个 volatile uint16）
+ *   行 715  ncg_crc32            CRC32（代码自绑定用，软件实现不用 __crc32d）
+ *   行 761  ncg_magic_ok         magic 种子比对（恒定时间，无明文字面量）
+ *   行 767  ncg_rd32             小端读 4 字节
+ *   行 776  ncg_stub_recover     ★把 .ncxh 还原成明文★（-O2 下被内联进
+ *                               ncguard_unlock，实测 225 行反汇编）
+ *
+ * 第三部分：对外接口与触发（.text 明文）
+ *   行 916  ncguard_unlock       对外入口：算 CRC → 解 head → 解业务段
+ *   行 950  ncg_boot_init        constructor(50)，so 加载即跑
+ *
+ * ⚠️ 三条调用纪律（违反即死锁/崩溃，均有真机实测依据）：
+ *   ① stub（第二部分）只能调【.text 里】的函数。调 head 段里的函数
+ *      （如 ncg_rc4）会执行密文 → 卡死/SIGILL。见行 851 附近注释。
+ *   ② ncg_head_unlock 及其私有函数绝不能标进 .ncx —— 它得先被 stub
+ *      解出来才能跑，标进去 = 开锁器被锁进箱子。
+ *   ③ ncVerify/heartbeat 两个 JNI 入口（在 nc_link.c）绝不能标段——
+ *      它们是 unlock 的调用方，标了即死锁。
+ *
+ * ───────────────────────────────────────────────────────────────────
+ *
  * ⚠️ 2026-10-18 新增。这是"把开锁器锁进它开的那只箱子"的落地，针对外部
  *    逆向报告（docs/so层防御/简盒-06 §6.2）指出的唯一质变线：
  *    「解锁逻辑本身是明文，攻击者直接读函数反汇编就知道怎么解」。
