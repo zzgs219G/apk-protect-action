@@ -21,22 +21,23 @@ import sys
 # (更早教训 0f80c69: 移动脚本后基于 __file__ 的相对路径必须重算,
 #  否则云端 ModuleNotFoundError: androguard)
 DCC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       '..', '..', 'tools', 'dcc')
+                       '..', '..', 'tools', 'Dex2C')
 
 
 def _ensure_dcc_dir():
-    """dcc 摊开目录不存在时,从 tools/dcc.zip 解压(幂等)。返回绝对路径。"""
+    """androguard 供应目录缺失时从 dex2c.zip 幂等解压（2026-10-21 起
+    供应源由 dcc.zip 换为 dex2c.zip，原 tools/dcc 已退役删除）。"""
     dcc_dir = os.path.abspath(DCC_DIR)
-    if not os.path.isfile(os.path.join(dcc_dir, 'dcc.py')):
-        dcc_zip = os.path.normpath(os.path.join(dcc_dir, '..', 'dcc.zip'))
-        if not os.path.isfile(dcc_zip):
-            raise FileNotFoundError(f'dcc 分发包缺失: {dcc_zip}')
+    if not os.path.isfile(os.path.join(dcc_dir, 'androguard', 'core', 'bytecodes', 'apk.py')):
+        ag_zip = os.path.normpath(os.path.join(dcc_dir, '..', 'dex2c.zip'))
+        if not os.path.isfile(ag_zip):
+            raise FileNotFoundError(f'dex2c 分发包缺失: {ag_zip}')
         import zipfile
         os.makedirs(os.path.dirname(dcc_dir), exist_ok=True)
-        with zipfile.ZipFile(dcc_zip) as zf:
+        with zipfile.ZipFile(ag_zip) as zf:
             zf.extractall(os.path.dirname(dcc_dir))
-        if not os.path.isfile(os.path.join(dcc_dir, 'dcc.py')):
-            raise FileNotFoundError(f'dcc.zip 解压后缺 dcc.py: {dcc_dir}')
+        if not os.path.isfile(os.path.join(dcc_dir, 'androguard', 'core', 'bytecodes', 'apk.py')):
+            raise FileNotFoundError(f'dex2c.zip 解压后缺 androguard: {dcc_dir}')
     return dcc_dir
 
 

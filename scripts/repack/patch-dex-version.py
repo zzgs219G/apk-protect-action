@@ -37,15 +37,30 @@ _ORDER = {v: i for i, v in enumerate(DEX_VERSIONS)}
 
 
 def dcc_dir():
-    """dcc 内置 androguard 的路径(与 common.sh ensure_dcc 解压位置一致: <仓库根>/tools/dcc)。
+    """androguard 供应目录（2026-10-21 起为 tools/Dex2C，原 tools/dcc 已退役删除）。
 
-    报错二十九: 本路径曾写死 <仓库根>/build/dcc/dcc;dcc 分发从 build/dcc 迁到 tools/dcc 时
-    漏改此处(路径写成 os.path.join(root, "build", "dcc", "dcc"),不含连续字面量 "build/dcc",
-    全仓 grep 搜不到),restore 阶段 sys.path 插入不存在的目录 → `import androguard`
-    ModuleNotFoundError。改动此文件时务必与 common.sh ensure_dcc 的目标位置保持一致。
+    androguard 现由 dex2c.zip 携带（解压后 tools/Dex2C/androguard）。
+    与 dcc 版的差异仅为字符串转义写法（backslash-d 的两种形态，语义逐字节相同），
+    且 Dex2C 版更新（多 permissions_29-36），切换无行为影响。
+
+    报错二十九的教训仍有效：路径必须 fail-fast 校验（见 read_manifest_min_sdk），
+    防止 sys.path 静默插入不存在目录后抛难懂的 ModuleNotFoundError。
+    改动此文件时务必与 common.sh ensure_dex2c 的目标位置保持一致。
     """
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(root, "tools", "dcc")
+    d = os.path.join(root, "tools", "Dex2C")
+    if not os.path.isfile(os.path.join(d, "androguard", "core", "bytecodes", "apk.py")):
+        # 幂等解压（与 common.sh ensure_dex2c 同语义）
+        z = os.path.join(root, "tools", "dex2c.zip")
+        if os.path.isfile(z):
+            import zipfile
+            os.makedirs(d, exist_ok=True)
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(os.path.dirname(d))
+        if not os.path.isfile(os.path.join(d, "androguard", "core", "bytecodes", "apk.py")):
+            raise FileNotFoundError(
+                f"androguard 缺失: {d};请确认 tools/dex2c.zip 存在（见 common.sh ensure_dex2c）")
+    return d
 
 
 def minsdk_to_dex_version(min_sdk: int) -> str:
@@ -64,8 +79,7 @@ def read_manifest_min_sdk(apk_path: str) -> int:
     # fail-fast: 路径写错时给出可诊断错误,而不是 sys.path 静默忽略不存在的目录后
     # 抛出看不懂的 ModuleNotFoundError(报错二十九的暴露形态)。
     if not os.path.isfile(os.path.join(d, "androguard", "core", "bytecodes", "apk.py")):
-        raise FileNotFoundError(
-            f"dcc 内置 androguard 缺失: {d};请确认 tools/dcc.zip 已解压(见 common.sh ensure_dcc)")
+        pass  # dcc_dir() 内已含 fail-fast 与幂等解压
     sys.path.insert(0, d)
     from androguard.core.bytecodes.apk import APK
     a = APK(apk_path)

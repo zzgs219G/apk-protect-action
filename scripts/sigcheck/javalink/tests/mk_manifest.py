@@ -149,7 +149,7 @@ def self_check(path, package, app_class, launcher1):
     """生成即自检:必须能被 AXMLPrinter 解析出全部关键信息,否则 fail-fast。"""
     import os
     sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(
-        os.path.abspath(__file__)), '..', '..', '..', '..', 'tools', 'dcc')))
+        os.path.abspath(__file__)), '..', '..', '..', '..', 'tools', 'Dex2C')))
     from androguard.core.bytecodes.axml import AXMLPrinter
     with open(path, 'rb') as fp:
         raw = fp.read()

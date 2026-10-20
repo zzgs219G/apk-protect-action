@@ -38,25 +38,26 @@ import sys
 
 SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')
 
-# androguard 从 dcc 目录导入(dcc 内置版,勿用 pip 版替换,见 make-filter-from-apk.py)
-# dcc 已改为 tools/dcc.zip 分发:目录缺失时从 zip 幂等解压到 <仓库根>/tools/(得单层 tools/dcc/)
-_DCC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         '..', '..', 'tools', 'dcc'))
+# androguard 从 Dex2C 目录导入（2026-10-21 起；原 tools/dcc 已退役删除）。
+# dex2c.zip 携带的 androguard 与原 dcc 版语义逐字节相同（仅转义写法差异）。
+# 目录缺失时从 dex2c.zip 幂等解压到 <仓库根>/tools/（得单层 tools/Dex2C/）。
+_AG_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        '..', '..', 'tools', 'Dex2C'))
 
 
 def _ensure_dcc_dir():
-    """dcc 摊开目录不存在时,从 tools/dcc.zip 解压(幂等)。返回 _DCC_DIR。"""
-    if not os.path.isfile(os.path.join(_DCC_DIR, 'dcc.py')):
-        dcc_zip = os.path.normpath(os.path.join(_DCC_DIR, '..', 'dcc.zip'))
-        if not os.path.isfile(dcc_zip):
-            raise FileNotFoundError(f'dcc 分发包缺失: {dcc_zip}')
+    """androguard 供应目录不存在时,从 dex2c.zip 幂等解压。返回 _AG_DIR。"""
+    if not os.path.isfile(os.path.join(_AG_DIR, 'androguard', 'core', 'bytecodes', 'apk.py')):
+        ag_zip = os.path.normpath(os.path.join(_AG_DIR, '..', 'dex2c.zip'))
+        if not os.path.isfile(ag_zip):
+            raise FileNotFoundError(f'dex2c 分发包缺失: {ag_zip}')
         import zipfile
-        os.makedirs(os.path.dirname(_DCC_DIR), exist_ok=True)
-        with zipfile.ZipFile(dcc_zip) as zf:
-            zf.extractall(os.path.dirname(_DCC_DIR))
-        if not os.path.isfile(os.path.join(_DCC_DIR, 'dcc.py')):
-            raise FileNotFoundError(f'dcc.zip 解压后缺 dcc.py: {_DCC_DIR}')
-    return _DCC_DIR
+        os.makedirs(os.path.dirname(_AG_DIR), exist_ok=True)
+        with zipfile.ZipFile(ag_zip) as zf:
+            zf.extractall(os.path.dirname(_AG_DIR))
+        if not os.path.isfile(os.path.join(_AG_DIR, 'androguard', 'core', 'bytecodes', 'apk.py')):
+            raise FileNotFoundError(f'dex2c.zip 解压后缺 androguard: {_AG_DIR}')
+    return _AG_DIR
 
 
 def _count_param_regs(args_sig):
@@ -268,9 +269,9 @@ def _find_launcher_from_axml(manifest_path, package_name):
         head = fp.read(4)
     if head != b'\x03\x00\x08\x00':     # 非二进制 AXML → 交给文本正则分支
         return None
-    _DCC_DIR = _ensure_dcc_dir()
-    if _DCC_DIR not in sys.path:
-        sys.path.insert(0, _DCC_DIR)
+    _AG_DIR = _ensure_dcc_dir()
+    if _AG_DIR not in sys.path:
+        sys.path.insert(0, _AG_DIR)
     try:
         from androguard.core.bytecodes.axml import AXMLPrinter
         with open(manifest_path, 'rb') as fp:
@@ -280,7 +281,7 @@ def _find_launcher_from_axml(manifest_path, package_name):
     except ImportError as e:
         # 常见根因(报错六):dcc 内置 androguard 的 AXMLPrinter 依赖 lxml,
         # runner 系统 python 不带 → pip3 install -r tools/dcc/requirements.txt
-        print(f'⚠️ androguard 不可用({_DCC_DIR}): {e};'
+        print(f'⚠️ androguard 不可用({_AG_DIR}): {e};'
               f'若提示缺 lxml,请先 pip3 install -r tools/dcc/requirements.txt;'
               f'降级文本解析(仅对文本 XML 有效,二进制 AXML 必失败)', file=sys.stderr)
         return None

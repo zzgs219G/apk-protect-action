@@ -13,7 +13,7 @@ set -euo pipefail
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _ROOT="$(dirname "$(dirname "$_HERE")")"                      # scripts/string-enc → 仓库根
-APKTOOL="${_ROOT}/tools/dcc/tools/apktool.jar"
+APKTOOL="${_ROOT}/tools/apktool.jar"
 
 SRC="$_HERE/stub-src/StrDec.java"
 OUT_DIR="${1:-$_HERE/stub-src}"

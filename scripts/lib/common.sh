@@ -66,29 +66,13 @@ require_env() {
   [[ -n "${!name:-}" ]] || { log_err "环境变量 $name 未设置${2:+（$2）}"; exit 1; }
 }
 
-# ensure_dcc [解压根目录，默认 "$ROOT/tools"] → 解压后 dcc 目录路径(stdout)
-# ⚠️ 职责已变更（2026-12 dcc 引擎下架）：dcc 不再是转译引擎（dex2c 是唯一引擎），
-# 本函数仅作为【apktool.jar + 内置 androguard】的载体被保留——dcc.zip 是这两者的
-# 唯一供应源（dex2c.zip 不含 apktool.jar，其 androguard 与 dcc 版有内容差异）。
-# lib-repack.sh 解包/回编、4 个 python 脚本的 androguard import 都依赖它，勿删。
-#
-# dcc 已从 sigcheck/dex2c/dcc/ 摊开目录改为 tools/dcc.zip 分发(单文件制品,
-# 与 dpt-shell 形态一致)。zip 内顶层是 dcc/,解压到 tools/ 即得单层 tools/dcc/
-# (与真源 dcc.zip 同目录);解压产物不进版本库,由 .gitignore 的 /tools/dcc/ 忽略。
-# 幂等:目标已存在(dcc.py 可见)则跳过解压,重复调用零开销。
-DCC_ZIP="$ROOT/tools/dcc.zip"    # dcc 分发包(唯一真源,严禁与解压产物混改)
-ensure_dcc() {
-  local dest="${1:-$ROOT/tools}"
-  if [[ -f "$dest/dcc/dcc.py" ]]; then
-    echo "$dest/dcc"
-    return 0
-  fi
-  require_file "$DCC_ZIP" "dcc 分发包"
-  mkdir -p "$dest"
-  unzip -qo "$DCC_ZIP" -d "$dest"
-  [[ -f "$dest/dcc/dcc.py" ]] || { log_err "dcc.zip 解压后缺 dcc/dcc.py: $dest"; exit 1; }
-  echo "$dest/dcc"
-}
+# ── dcc 已退役（2026-10-21）────────────────────────────────────────
+# dcc.zip 及其解压产物 tools/dcc/ 已删除。原 ensure_dcc() 一并移除——
+# 它的两个历史职责各有归宿：
+#   · apktool.jar → tools/apktool.jar（git 跟踪的独立文件，见 lib-repack.sh）
+#   · androguard  → dex2c.zip 携带（tools/Dex2C/androguard，语义逐字节相同，
+#                   见各消费者文件的 _ensure_dcc_dir/ensure 逻辑）
+# ensure_dex2c 保留（现役转译引擎）。
 
 # ensure_dex2c [解压根目录，默认 "$ROOT/tools"] → 解压后 Dex2C 目录路径(stdout)
 # 唯一转译引擎分发包(--dex2c)。真源 tools/dex2c.zip =

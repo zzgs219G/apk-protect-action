@@ -27,7 +27,7 @@ smali)逐方法对比,只看**语义层**差异。MT 管理器自带的 dex 对�
   配套 dex 层实证(androguard 读回,验证"新增指令分类"):
   python3 - <<'EOF'
   import sys, re
-  sys.path.insert(0, '<仓库根>/tools/dcc')
+  sys.path.insert(0, '<仓库根>/tools/Dex2C')
   from androguard.core.bytecodes.dvm import DalvikVMFormat as DEX
   ...  # 按 (name, descriptor) 对齐方法,双指针扫描找新增指令,按 opcode 分类
   EOF

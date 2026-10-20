@@ -43,24 +43,24 @@ BRIDGE_DESC = 'Lcom/nc/link/NcLink;'
 SO_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,30}$')
 SMALI_DIR_RE = re.compile(r'^smali(?:_classes\d+)?$')   # 与 inject-loadlib/mark-native 同源,改动须 grep 三处
 
-_DCC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         '..', '..', '..', 'tools', 'dcc'))
+_AG_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        '..', '..', '..', 'tools', 'Dex2C'))
 
 
 def _ensure_dcc_dir():
-    """dcc 解压目录缺失时从 tools/dcc.zip 幂等解压(项目导览 §四份解压设计的
-    第 5 份副本:同目标路径、幂等、解压后校验 dcc.py 在位)。"""
-    if not os.path.isfile(os.path.join(_DCC_DIR, 'dcc.py')):
-        dcc_zip = os.path.normpath(os.path.join(_DCC_DIR, '..', 'dcc.zip'))
-        if not os.path.isfile(dcc_zip):
-            raise FileNotFoundError(f'dcc 分发包缺失: {dcc_zip}')
+    """androguard 供应目录缺失时从 dex2c.zip 幂等解压（2026-10-21 起
+    供应源由 dcc.zip 换为 dex2c.zip，原 tools/dcc 已退役删除）。"""
+    if not os.path.isfile(os.path.join(_AG_DIR, 'androguard', 'core', 'bytecodes', 'apk.py')):
+        ag_zip = os.path.normpath(os.path.join(_AG_DIR, '..', 'dex2c.zip'))
+        if not os.path.isfile(ag_zip):
+            raise FileNotFoundError(f'dex2c 分发包缺失: {ag_zip}')
         import zipfile
-        os.makedirs(os.path.dirname(_DCC_DIR), exist_ok=True)
-        with zipfile.ZipFile(dcc_zip) as zf:
-            zf.extractall(os.path.dirname(_DCC_DIR))
-        if not os.path.isfile(os.path.join(_DCC_DIR, 'dcc.py')):
-            raise FileNotFoundError(f'dcc.zip 解压后缺 dcc.py: {_DCC_DIR}')
-    return _DCC_DIR
+        os.makedirs(os.path.dirname(_AG_DIR), exist_ok=True)
+        with zipfile.ZipFile(ag_zip) as zf:
+            zf.extractall(os.path.dirname(_AG_DIR))
+        if not os.path.isfile(os.path.join(_AG_DIR, 'androguard', 'core', 'bytecodes', 'apk.py')):
+            raise FileNotFoundError(f'dex2c.zip 解压后缺 androguard: {_AG_DIR}')
+    return _AG_DIR
 
 
 # ───────────────────────── Manifest 解析 ─────────────────────────

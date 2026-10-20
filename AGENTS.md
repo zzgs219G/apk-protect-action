@@ -47,8 +47,8 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 | `scripts/inject/inject-loadlib.py` | loadLibrary 插桩(幂等、多 dex、AXMLPrinter) | `tests/test_inject_loadlib.py`(冒烟,若存在) |
 | `scripts/sigcheck/hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景,若存在) |
 | `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: 回归测试内嵌 |
-| `tools/dcc/`(解压产物;真源 `tools/dcc.zip`) | dcc 工具(**引擎已下架**,现仅为 apktool.jar + 内置 androguard 载体) | 严禁任何改动(历史: 报错三/九);真源包 `tools/dcc.zip` 严禁改包/换版/**删除** |
-| `tools/dcc/tools/apktool.jar` | 解包/重打包工具(apktool 3.0.3,随 dcc.zip 解压) | 严禁替换版本(历史: 报错四/五);dcc 引擎下架后这是该 zip 的唯一存在理由 |
+| `tools/apktool.jar` | 解包/重打包工具(apktool 3.0.3,2026-10-21 从已退役的 dcc.zip 原样提取,sha256 不变) | 严禁替换版本(历史: 报错四/五);现为 git 跟踪的独立文件,不再依赖任何解压步骤 |
+| ~~tools/dcc.zip + tools/dcc/~~ | **已删除(2026-10-21,用户点名)**:dcc 引擎 2026-12 起下架,apktool.jar 已独立提取;androguard 由 dex2c.zip 携带(与 dcc 版语义逐字节相同,仅转义写法差异) | 消费者已全部切换:lib-repack(build)/build-stub(jar 路径)、patch-dex-version/inject-loadlib/inject-javacheck/make-filter-from-apk(androguard 源) |
 | `scripts/sigcheck/archive/nc_guard_unlock.c` | `.ncx` 段运行期自解密(**2026-10-18 起已退出 NDK 工程**;**2026-10-20 已移出 src/ 到 archive/**,因其契约逐条过期——slot 80 字节/旧 XOR_KEY/`slot^XOR_KEY` 取钥——留在真相源旁会误导人与 AI) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化。**它不再进 NDK 工程、不再参与任何构建**;仅作历史查阅。现行入口是 `nc_guard_boot.c` |
 | `scripts/sigcheck/src/nc_guard_boot.c` | 自解谜设施:明文 stub(`.text`)+ unlock 本体(`.ncxh` 密文) | 真机链路已验证: 两级锁箱后 dlopen → add/mul/selftest 全对;**绝不可把 `ncg_head_unlock` 标进 `.ncxh`**(它得先被 stub 解出来);stub 用简单 XOR 而非 RC4,`lock_head()` 必须同算法 |
 | `scripts/sigcheck/src/nc_guard_boot.c` 补充 | **2026-10-19 master 随机化**:master 藏在 `.ncxhr`(AWR,32B),用 **`k_stub`** 加密——用 `k_so` 会死循环(k_so 派生正需要 master)。slot 96→104。**stub 只能调 `.text` 里的函数**(用 head 段里的 `ncg_rc4` 会执行密文 → 卡死);**mprotect 粒度是页**,head_ro 与 `.data`/`.bss` 同页,解完必须恢复 `RW` 而非 `R`(否则 .bss 变只读 → SIGSEGV) | `test-so-lock.sh` T11/T12 |

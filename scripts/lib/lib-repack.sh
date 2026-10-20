@@ -21,15 +21,16 @@ _lib_repack_guard() {
 }
 _lib_repack_guard
 
-# apktool.jar 随 dcc 分发包(dcc.zip)携带:dcc 改为 tools/dcc.zip 分发后,
-# jar 从解压产物取。⚠️ dcc 引擎已于 2026-12 下架,此处保留 ensure_dcc 仅为
-# 取得 apktool.jar(dcc.zip 是它的唯一供应源,dex2c.zip 不含)。ensure_dcc 幂等,零开销。
-ensure_dcc >/dev/null
-APKTOOL_JAR="$ROOT/tools/dcc/tools/apktool.jar"
+# apktool.jar 独立放 tools/apktool.jar（2026-10-21 从 dcc.zip 原样提取，
+# sha256 与 zip 内文件逐字节一致）。dcc 引擎连同 dcc.zip 已退役删除——
+# apktool 是解包/回编核心链路，不该寄居在已下架引擎的分发包里，
+# 且 15MB 的 jar 藏在 zip 里导致每次构建都要解压整个 dcc（23MB）。
+# 现为 git 跟踪的独立文件，不再依赖任何解压步骤。
+APKTOOL_JAR="$ROOT/tools/apktool.jar"
 
 # repack_require_tools — 开工前校验 apktool.jar 存在
 repack_require_tools() {
-  require_file "$APKTOOL_JAR" "apktool.jar（dcc.zip 解压产物，dcc 引擎已下架但 jar 仍由此供应）"
+  require_file "$APKTOOL_JAR" "apktool.jar（tools/ 根下，git 跟踪）"
 }
 
 # repack_unpack <输出目录> <输入.apk>

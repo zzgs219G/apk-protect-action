@@ -10,13 +10,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
 [[ -f "$ROOT/AGENTS.md" ]] || { echo "❌ ROOT 定位失败"; exit 1; }
 JL="$ROOT/scripts/sigcheck/javalink"
-APKTOOL="$ROOT/tools/dcc/tools/apktool.jar"
+APKTOOL="$ROOT/tools/apktool.jar"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 PASS=0
 ok() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 
-[[ -f "$APKTOOL" ]] || { echo "❌ apktool 不在位(先 ensure_dcc 或解压 dcc.zip)"; exit 1; }
+[[ -f "$APKTOOL" ]] || { echo "❌ apktool 不在位(应在 tools/apktool.jar，git 跟踪)"; exit 1; }
 
 echo "[1/9] py_compile + javac 语义真相源(对 android API 桩编译,校验 API 形态)"
 python3 -m py_compile "$JL/inject-javacheck.py"
@@ -148,7 +148,7 @@ ok "6 个 smali 全部汇编通过(无 Invalid register / no viable alternative)
 echo "[5/9] androguard 读回(dex 层结构断言)"
 python3 - "$T/out.dex" <<'PY'
 import sys
-sys.path.insert(0, 'tools/dcc')
+sys.path.insert(0, 'tools/Dex2C')
 from androguard.core.bytecodes.dvm import DalvikVMFormat
 dvm = DalvikVMFormat(open(sys.argv[1], 'rb').read())
 classes = {c.get_name(): c for c in dvm.get_classes()}
