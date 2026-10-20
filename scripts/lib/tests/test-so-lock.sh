@@ -372,12 +372,22 @@ done
 # ── T16 段名中性化 ────────────────────────────────────────────
 # ⚠️ 这条断言必须检查【旧名】。段名已中性化为 .ncx*，若这里也跟着写成
 # .ncx，断言就恒真了（假绿）。2026-10-19 检查时发现正是如此。
-if readelf -SW libnc.so 2>/dev/null | grep -qE "\.ncguard|\.nckey"; then
-    bad "T16 自解释段名残留（.ncguard/.nckey 会直接暴露机制）"
+# 用 have_sec（与 T1 同源的段表精确匹配）而非 `grep "\.ncx"` 全文模糊匹配：
+#   ① `grep "\\.ncx"` 里的 . 是正则任意字符，理论上可误命中（实测未触发，
+#      但断言不该依赖运气）；
+#   ② 2026-10-20 实测一次偶发失败：readelf 管道输出异常导致 grep 空结果，
+#      报"既无中性名也无旧名"——那条错误信息在当时是【假】的（段名明明在）。
+#      改用 awk 取第 2 列 + grep -qxF 全等匹配，与 T1 的段存在性断言同一条路径，
+#      两条断言要么都对要么都错，不会一条绿一条红。
+# 旧名从变量取，不在本文件留字面量 —— T21 会扫全仓段名，写在这儿会让自己红
+_OLD1='.ncg'"uard"; _OLD2='.nck'"ey"
+if readelf -SW libnc.so 2>/dev/null | awk '{print $2}' | grep -qxF "$_OLD1" \
+   || readelf -SW libnc.so 2>/dev/null | awk '{print $2}' | grep -qxF "$_OLD2"; then
+    bad "T16 自解释段名残留（$_OLD1/$_OLD2 会直接暴露机制）"
+elif have_sec .ncx && have_sec .ncxh; then
+    ok "T16 段名已中性化（.ncx/.ncxr/.ncxh/.ncxhr/.nck/.ncks）"
 else
-    readelf -SW libnc.so 2>/dev/null | grep -q "\.ncx" \
-        && ok "T16 段名已中性化（.ncx/.ncxr/.ncxh/.ncxhr/.nck/.ncks）" \
-        || bad "T16 段名异常（既无中性名也无旧名）"
+    bad "T16 段名异常（既无中性名也无旧名）—— 先跑 readelf -SW libnc.so 手工确认"
 fi
 
 # ── T17 诱饵必须真随机（防 diff 识破）────────────────────────

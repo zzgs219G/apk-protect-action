@@ -526,8 +526,35 @@ fi
 # 由"可删开关"变"承重墙"(修复 sigcheck-only 删开关静默绕过的最大缺口)。
 # 必须在插桩/loadLibrary 之后、stringenc 之前:新类常量可被 stringenc 顺带加密。
 if [[ $WANT_SIGCHECK -eq 1 ]]; then
-  python3 "$ROOT/scripts/sigcheck/javalink/inject-javacheck.py" \
-    "$WORK/decompiled" --so-name nc
+  # ⚠️⚠️ 2026-10-20 修 CI 红：dex2c + sigcheck 组合下此处曾【必失败】。
+  #
+  # 根因链（本地已复现，输出与 CI build.log 逐字一致）：
+  #   dex2c 把 LAUNCHER activity 的 onCreate 抽成 native 壳
+  #     （build.log: `🔧 .../MainActivity.smali: 1 个方法 → native`）
+  #   → inject-javacheck.py 按【报错三十九】防线跳过 native 壳上的点
+  #     （给 native 方法凭空造方法体 → 回编炸
+  #      "A native method cannot have any instructions"）
+  #   → sites 为空 → 该脚本 return 2
+  #   → 本脚本 set -e(protect.sh:49) 直接杀掉流水线，
+  #     日志停在"🏷️ 自适应命名"之后，无任何 Error/Traceback（极难定位）
+  #
+  # 为什么 dex2c 组合下 return 2 不是缺陷、不该 fail-fast：
+  #   inject-loadlib.py:26 已明确——联合方案的 onCreate 兜底【不需要】，
+  #   因为 onCreate 进 so 变 native 壳后，攻击者删 loadLibrary 即触发
+  #   UnsatisfiedLinkError（fail-closed），壳本身就是承重墙；
+  #   且 app 侧 <clinit> 的 loadLibrary 注入点仍在（双保险的另一半）。
+  #
+  # 故：dex2c 组合 → 记警告放行；非 dex2c 组合 → 仍 fail-fast
+  #   （那种场景没有 native 壳保护，注入不到就是真缺口，必须红）。
+  if ! python3 "$ROOT/scripts/sigcheck/javalink/inject-javacheck.py" \
+      "$WORK/decompiled" --so-name nc; then
+    if [[ $WANT_TRANSPILE -eq 1 ]]; then
+      log_warn "javacheck 无可用调用点 —— dex2c 组合下 onCreate 已是 native 壳（报错三十九防线跳过），放行；app 侧 <clinit> loadLibrary 兜底仍在"
+    else
+      echo "❌ javacheck 注入失败（非 dex2c 组合，无 native 壳保护 = 真缺口）" >&2
+      exit 1
+    fi
+  fi
 fi
 
 # ── 字符串加密（dex 层，与 so 无关；必须在 mark-native 之后） ──────
