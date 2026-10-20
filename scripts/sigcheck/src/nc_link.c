@@ -32,6 +32,7 @@ void nc_heartbeat_arm_constructor(void);
 #include <jni.h>
 #include <stddef.h>
 #include <time.h>
+#include "nc_guard_layout.h"  /* 契约常数单一真相源：段名/尺寸/偏移 */
 #include "sig_hash.h"
 
 /* ── 判决核心进加密段（2026-10-19，修实测报告 §8.1 最致命缺陷）───────
@@ -64,7 +65,7 @@ void nc_heartbeat_arm_constructor(void);
  * 的编译都会踩坑（标了段却没人解锁 → 读到密文 → 假红）。显式开关让
  * "我要标段"成为必须说出口的事，protect.sh 负责定义它。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)
-#  define NC_VERIFY_SECTION __attribute__((section(".ncx"), retain, used))
+#  define NC_VERIFY_SECTION __attribute__((section(NC_SEC_CODE), retain, used))
 #else
 #  define NC_VERIFY_SECTION            /* 宿主测试/普通宿主构建：不标段 */
 #endif
@@ -79,7 +80,7 @@ void nc_heartbeat_arm_constructor(void);
  *    这也更合理——代码段解出来是 RX，数据段解出来是 R，权限各自最小。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)
 #  define NC_VERIFY_TABLE_SECTION \
-        __attribute__((section(".ncxr"), retain, used))
+        __attribute__((section(NC_SEC_CONST), retain, used))
 #else
 #  define NC_VERIFY_TABLE_SECTION
 #endif

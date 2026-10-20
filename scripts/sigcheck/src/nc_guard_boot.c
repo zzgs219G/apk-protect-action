@@ -58,18 +58,14 @@
  * ⚠️ 为什么必须加密：这两个字面量所在函数虽标进 .ncxh，
  *    但 **C 的字符串字面量永远进 .rodata，不会跟着函数进自定义段**。
  *    实测确认：锁箱后 /proc/self/cmdline 仍在 .rodata 明文可搜。 */
+#include "nc_guard_layout.h"  /* 契约常数单一真相源：段名/slot尺寸/偏移/magic seed */
 #include "sig_log_data.h"
 
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一侧 ── */
-#define NCG_SECTION      ".ncx"
 /* 常量表专用段（2026-10-19）：签名表的 salt/期望值放这里。
  * 为什么不能放 .ncx：那是 AXR（可执行）段，clang 拒绝让 const 数据
  * 进去（'causes a section type conflict'）。本段是 AWR，不可执行。
  * 与 .ncx 共用同一把 k_so 和同一个 MAC —— 逻辑上是同一份资产。 */
-#define NCG_SECTION_RO   ".ncxr"
-#define NCG_SLOT         ".nck"
-#define NCG_HEAD         ".ncxh"
-#define NCG_STUB_SLOT    ".ncks"
 /* ⚠️ 2026-10-19：magic 不再以明文字面量出现在 .rodata。
  *
  * 原实现是字符串常量 "NCKEYLOCK"/"NCSTUBLK"，`strings -n 6` 直接扫出——
@@ -86,23 +82,26 @@
  *   事实：ncg_magic_ok() 只做 `diff |= got[i] ^ seed[i]` 累或，
  *   【碎片密钥完全不参与 magic 比较】（它只在 ncg_xor_key() 里用于
  *   恢复 k_stub / k_mac_head）。攻击者 dump 到 slot 前 8 字节即可
- *   直接与本文件的 NCG_MAGIC_SEED_* 比对，零额外成本。
+ *   直接与本文件的 NCG_MAGIC_SEED_SLOT/NCG_MAGIC_SEED_STUB 比对，零额外成本。
  *
  *   本机制的真实收益【只有一条】：strings 搜不到 "NCKEYLOCK" /
  *   "NCSTUBLK" 字面量。它买的是"自动扫描失效"，不是"人工逆向成本"。
  *   写清楚这条，是为了防止后人（或 AI）据此高估防御强度、少做别的加固。
  *
  * 语义不变：仍"匹配 = 已锁，不匹配 = 未锁放行"，开发期照常能跑。
- * 两侧契约：本文件的 NCG_MAGIC_SEED_* 与 so-section-lock.py 的
+ * 两侧契约：本文件的 NC_SEED_*（来自 nc_guard_layout.h）与 so-section-lock.py 的
  * SLOT_MAGIC_SEED / STUB_MAGIC_SEED 必须逐字节一致（该文件头部有
  * `assert seed ^ XOR_KEY == b'NCKEYLOC'` 自校验，但它只验 Python
  * 自我一致，不校验 C 侧——所以 test-so-lock.sh T20 负责跨语言对拍）。 */
 /* magic 种子：落盘即此值，运行期与 slot 前 8 字节逐字节比。
- * 不是 magic 本身（magic = seed ^ XOR_KEY，仅用于人类记忆）。 */
-static const uint8_t NCG_MAGIC_SEED_SLOT[8] =
-        {0x30, 0x72, 0xEE, 0x48, 0x91, 0xDE, 0x04, 0xB5};   /* ^ xor_key → NCKEYLOCK */
-static const uint8_t NCG_MAGIC_SEED_STUB[8] =
-        {0x30, 0x72, 0xF6, 0x59, 0x9D, 0xD0, 0x07, 0xBD};   /* ^ xor_key → NCSTUBLK  */
+ * 不是 magic 本身（magic = seed ^ XOR_KEY，仅用于人类记忆）。
+ *
+ * ⚠️ 值来自 nc_guard_layout.h 的 NC_SEED_*_INIT —— 契约的单一真相源。
+ *    数组名保留 NCG_ 前缀：它是本文件的 C 侧私有符号，不属于跨语言契约
+ *    （跨语言契约是"值"，不是"C 变量叫什么"）。刻意不改符号名——
+ *    改名会改变 .rodata 布局，使 T22 的二进制等价性验证失效。 */
+static const uint8_t NCG_MAGIC_SEED_SLOT[8] = NC_SEED_SLOT_INIT;
+static const uint8_t NCG_MAGIC_SEED_STUB[8] = NC_SEED_STUB_INIT;
 static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
 /* slot 80 → 96（2026-10-19 P1-a）：
  *   [80:88] pkg_sha8   SHA256(包名) 前 8 字节 —— 运行期证书派生的包名一致性校验
@@ -110,7 +109,6 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  * 为什么需要它：k_so = HKDF(master, SHA256(certDER), "nc-so-v1"+包名)，
  * 运行期必须拿到【构建期用的那个包名】，否则派生值不同、密文解不开。
  * 存明文包名会暴露"密钥与包名有关"，故只存指纹。 */
-#define NCG_SLOT_SIZE    96
 /* stub slot 88 → 96（2026-10-19 阶段3 代码自绑定）：
  *   [ 0: 8) magic seed
  *   [ 8:24) wrapped k_stub
@@ -130,7 +128,6 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  *   为什么不复用 [44:48) 的原 reserved：[64:96) 已被 expect_mac_head 占满，
  *   4 字节装不下 addr+size 两个值；硬塞会与 MAC 字段重叠（静默破坏校验）。
  *   扩到 104 是最小改动，且 .ncks 段同步 +8 字节即可。 */
-#define NCG_STUB_SIZE    104
 
 /* ═══════════════════════════════════════════════════════════════════
  * ⚠️⚠️ 下方整段是【历史存档】，勿以此图为布局依据 ⚠️⚠️
@@ -139,13 +136,13 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  *   [36:40) reserved
  *   [40:56) wrapped_k_mac_head
  *   [56:88) expect_mac_head
- * 与【当前】实际偏移（见下方 NCG_OFF_* 宏：36=code_addr、40=code_len、
+ * 与【当前】实际偏移（见 nc_guard_layout.h 的 NC_OFF_* 宏：36=code_addr、40=code_len、
  * 48=k_mac_head、64=expect_mac_head、96/100=head_ro）逐条矛盾。
  * 2026-10-19 阶段3（代码自绑定）与 master 随机化两次扩容后已是 104 字节版，
  * 此图未同步更新 —— 保留它是因为"过期图比没图更坏"（AI/人会照着改），
  * 所以用显式的存档横幅标死，而不是删掉了让人以为从没存在过。
  *
- * 【当前布局的唯一真相源 = 下方 NCG_OFF_* 宏 + NCG_STUB_SIZE】，
+ * 【当前布局的唯一真相源 = nc_guard_layout.h 的 NC_OFF_* + NC_STUB_SIZE】，
  * 锁箱侧 = so-section-lock.py lock_head() 的 blob 组装 + assert len(blob)==104。
  * 两侧不一致时构建期 AssertionError，不会静默出错。
  *
@@ -169,7 +166,7 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  * MAC 对【密文】算，与 .ncx 一致：解密前就能验，验不过就不装明文。
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── 当前 .ncks stub slot 偏移表（NCG_STUB_SIZE=104 字节）─────────
+/* ── 当前 .ncks stub slot 偏移表（NC_STUB_SIZE=104 字节）─────────
  * 顺序即内存顺序，每个字段与锁箱侧 blob 组装处一一对应。
  * ⚠️ 改任何偏移或尺寸，必须同步 so-section-lock.py 的两条 assert：
  *      assert len(blob) == 104
@@ -178,11 +175,6 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
 
 /* .nck slot 的包名指纹（P1-a，2026-10-19）：SHA256(包名)[:8]。
  * 放这里而不是 §319 附近，因为它被 ncg_pkg_matches() 在更早处引用。 */
-#define NCG_OFF_PKG_SHA      80
-#define NCG_OFF_CODE_ADDR    36
-#define NCG_OFF_CODE_LEN     40
-#define NCG_OFF_K_MAC_HEAD   48
-#define NCG_OFF_EXPMAC_HEAD  64
 /* master 数据段（.ncxhr）的定位（2026-10-19）：
  * 复用原 reserved 区与其后的 4 字节，slot 仍 96 字节。
  * [44:48) 原 reserved → head_ro_addr
@@ -190,8 +182,6 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  * ⚠️ [64:96) 已被 expect_mac_head 占用，故 head_ro_size 只能放在 [44:48)
  *    之后的空位。实际：[40:44) 是 code_len，[44:48) 是原 reserved。
  *    两个 u32 需要 8 字节，而 [44:48) 只有 4 字节 —— 见下方 slot 扩容说明。 */
-#define NCG_OFF_HEADRO_ADDR  96
-#define NCG_OFF_HEADRO_SIZE  100
 
 /* ⚠️ 2026-10-18 与 LSGS 彻底分离（原值与 make-sig-log.py 的 key 相同，
  * 注释还写"与 LSGS 同源"——那是错的）：同一把 8 字节密钥此前同时护三处
@@ -214,7 +204,7 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  *   frag_c=0xf6a5 → 低位=逻辑2(0xa5) 高位=逻辑7(0xf6)
  *   frag_d=0x4b0d → 低位=逻辑3(0x0d) 高位=逻辑6(0x4b)
  * 运行时规则：逻辑 i<4 取低位、i>=4 取高位；碎片编号查 NCG_XOR_FRAG[i]。 */
-static const uint8_t NCG_XOR_FRAG[8] = {1, 0, 2, 3, 0, 1, 3, 2};
+static const uint8_t NCG_XOR_FRAG[8] = NC_XOR_FRAG_INIT;
 
 /* ⚠️ 碎片必须是「运行期才知道」的值，否则白拆。
  *
@@ -287,12 +277,11 @@ static void ncg_xor_key(uint8_t out[8]) {
  * 东西"——循环依赖。用 k_stub 则链路是单向的：
  *   碎片 → XOR_KEY → k_stub → {解 head, 解 head_ro → master} → k_so
  * 且 stub 只需碎片、零 I/O，能独立完成这一步。 */
-#define NCG_HEAD_RO      ".ncxhr"
-__attribute__((section(NCG_HEAD_RO), used, retain, aligned(16)))
+__attribute__((section(NC_SEC_HEADRO), used, retain, aligned(16)))
 static uint8_t ncg_master[32] = {0};
 
 /* RC4 —— 与 so-section-lock.py 的 rc4() 逐字节同算法 */
-__attribute__((section(NCG_HEAD), used, retain, noinline))
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static void ncg_rc4(const uint8_t *key, size_t keylen,
                     const uint8_t *in, uint8_t *out, size_t len) {
     uint8_t S[256];
@@ -314,7 +303,7 @@ static void ncg_rc4(const uint8_t *key, size_t keylen,
 
 /* 在 ELF 文件里按名字找段（ELF64；armeabi-v7a 的 ELF32 支持是既有缺口，
  * 见 unlock.c 同款函数的历史说明，本轮不扩范围） */
-__attribute__((section(NCG_HEAD), used, retain, noinline))
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_find_section(const char *so_path, const char *name,
                             Elf64_Shdr *out) {
     int fd = open(so_path, O_RDONLY);
@@ -348,7 +337,7 @@ static int ncg_find_section(const char *so_path, const char *name,
 
 /* so 路径解析：用 head 本体的地址 dladdr（dladdr 是 libc 的，但本体已在
  * 明文状态才被调用，所以这里用 libc 无妨——约束只针对明文 stub） */
-__attribute__((section(NCG_HEAD), used, retain, noinline))
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
     Dl_info info;
     memset(&info, 0, sizeof(info));
@@ -379,7 +368,7 @@ static int ncg_resolve_self(void **base, char *path, size_t pathcap) {
  * 子进程会带 ":remote" / ":push" / ":service" 之类后缀。若不截断，
  * 主进程能通过指纹校验、子进程全部 fail-closed(-12) → 正常功能挂掉。
  * 这里统一截到第一个 ':' 之前，与 AndroidManifest 的 package 对齐。 */
-__attribute__((section(NCG_HEAD), used, retain, noinline))
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_self_pkg(char *out, size_t cap) {
     char _cb[24];
     const char *_cp = lsg_s(LSGS_PATH_CMDLINE, _cb, sizeof(_cb));
@@ -399,13 +388,13 @@ static int ncg_self_pkg(char *out, size_t cap) {
     return 0;
 }
 
-/* 包名指纹校验：构建期把 SHA256(pkg) 前 8 字节写进 slot[NCG_OFF_PKG_SHA]。
+/* 包名指纹校验：构建期把 SHA256(pkg) 前 8 字节写进 slot[NC_OFF_PKG_SHA]。
  * 为什么要指纹而不是直接存明文包名：明文包名会让攻击者一眼看出
  * "密钥与包名有关"，且 slot 是明文段（.nck 只有内部字段被 XOR）。
  * 指纹长度 8 字节 = 64 bit，碰撞概率对本用途可忽略。 */
-__attribute__((section(NCG_HEAD), used, retain, noinline))
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_pkg_matches(const uint8_t *slotdata, const char *pkg) {
-    const uint8_t *want = slotdata + NCG_OFF_PKG_SHA;
+    const uint8_t *want = slotdata + NC_OFF_PKG_SHA;
     uint8_t h[32];
     ksha256((const uint8_t *)pkg, strlen(pkg), h);
     uint8_t diff = 0;
@@ -420,7 +409,7 @@ static int ncg_pkg_matches(const uint8_t *slotdata, const char *pkg) {
  *   ② 由 so 自身路径反推：.../lib/<abi>/libnc.so → .../base.apk
  * 与 sig_check.c:find_apk_path() 同思路，但不复用它——那是冻结模块，
  * 且这里在密文段里，必须自包含。 */
-__attribute__((section(NCG_HEAD), used, retain, noinline))
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
     char _mb[24];
     const char *_mp = lsg_s(LSGS_PATH_MAPS, _mb, sizeof(_mb));
@@ -475,25 +464,23 @@ static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
     return -1;
 }
 
-#define NCG_OFF_K_MAC   32
-#define NCG_OFF_EXPMAC  48
 
 /* ── unlock 本体主流程：解出 .ncx 业务段 ──────────────────────
  * 由明文 stub 解密后才可调用（此前它是密文）。
  * 返回 0 成功；负值含义与 nc_guard_unlock.c 的码表一致。 */
-__attribute__((section(NCG_HEAD), used, retain, noinline))
+__attribute__((section(NC_SEC_HEAD), used, retain, noinline))
 int ncg_head_unlock(void) {
     void *base;
     char so_path[512];
     if (ncg_resolve_self(&base, so_path, sizeof(so_path)) != 0) return -1;
 
     Elf64_Shdr sec, slot;
-    if (ncg_find_section(so_path, NCG_SECTION, &sec) != 0) return -2;
-    if (ncg_find_section(so_path, NCG_SLOT, &slot) != 0) return -3;
+    if (ncg_find_section(so_path, NC_SEC_CODE, &sec) != 0) return -2;
+    if (ncg_find_section(so_path, NC_SEC_SLOT, &slot) != 0) return -3;
     if (sec.sh_size == 0) return -4;
     if ((sec.sh_flags & SHF_ALLOC) == 0) return -5;
 
-    uint8_t slotdata[NCG_SLOT_SIZE];
+    uint8_t slotdata[NC_SLOT_SIZE];
     memset(slotdata, 0, sizeof(slotdata));
     int fd = open(so_path, O_RDONLY);
     if (fd < 0) return -6;
@@ -503,7 +490,7 @@ int ncg_head_unlock(void) {
     if (!ncg_magic_ok(slotdata, NCG_MAGIC_SEED_SLOT)) {
         return 0;   /* 未锁，无需解锁 */
     }
-    int have_mac = (got >= NCG_SLOT_SIZE) && (slot.sh_size >= NCG_SLOT_SIZE);
+    int have_mac = (got >= NC_SLOT_SIZE) && (slot.sh_size >= NC_SLOT_SIZE);
 
     static int ncg_unlocked = 0;
     if (ncg_unlocked) return 0;
@@ -613,7 +600,7 @@ int ncg_head_unlock(void) {
     segs[nseg++] = sec;
     {
         Elf64_Shdr ro;
-        if (ncg_find_section(so_path, NCG_SECTION_RO, &ro) == 0
+        if (ncg_find_section(so_path, NC_SEC_CONST, &ro) == 0
             && ro.sh_size > 0 && (ro.sh_flags & SHF_ALLOC)) {
             segs[nseg++] = ro;
         }
@@ -653,7 +640,7 @@ int ncg_head_unlock(void) {
             khmac_final(hc, got_mac);
             memset(hcbuf, 0, sizeof(hcbuf));
         }
-        const uint8_t *want = slotdata + NCG_OFF_EXPMAC;
+        const uint8_t *want = slotdata + NC_OFF_EXPMAC;
         uint8_t diff = 0;
         for (int i = 0; i < 32; i++) diff |= (uint8_t)(got_mac[i] ^ want[i]);
         memset(k_mac, 0, sizeof(k_mac));
@@ -718,8 +705,8 @@ int ncg_head_unlock(void) {
  *   改用【段头信息】推导：strip 只删 .symtab/.strtab，section header
  *   table 始终完整，段地址与段大小照样拿得到。
  *   镜像基址 = &ncg_stub_slot(运行期, PC 相对) − stub_slot_sh_addr(链接期) */
-__attribute__((section(NCG_STUB_SLOT), used, aligned(1), retain))
-static const volatile unsigned char ncg_stub_slot[NCG_STUB_SIZE] = {0};
+__attribute__((section(NC_SEC_STUBSLOT), used, aligned(1), retain))
+static const volatile unsigned char ncg_stub_slot[NC_STUB_SIZE] = {0};
 
 /* CRC32（IEEE 802.3，多项式 0xEDB88320）。软件实现——不用 __crc32d：
  * 那需要 -march=armv8-a+crc，而 armeabi-v7a 根本没有该指令，arms 上编译
@@ -755,7 +742,7 @@ static uint32_t ncg_crc32(const uint8_t *p, size_t n) {
 static uint32_t ncg_self_crc;   /* 由 ncguard_unlock() 在调用前算好 */
 
 /* 生成式 magic 比较（2026-10-19）：字面量不进二进制。
- * want 由 NCG_MAGIC_SEED_* 与碎片密钥运行期异或得出，不落在 .rodata。
+ * want 由 NC_SEED_* 与碎片密钥运行期异或得出，不落在 .rodata。
  * ⚠️ 恒定时间不受影响：magic 不是秘密（攻击者能从密文段反推），
  *    这里求的是"没有明文字面量可搜"，不是防时序侧信道。
  *
@@ -839,7 +826,7 @@ static void ncg_stub_recover(void) {
      * 完全对等）。此前 head 只有 XOR，攻击者可改"unlock 本体里的 MAC 校验
      * 函数"那几位，把 .ncx 的 HMAC 保护改成恒真从而绕过。
      *
-     * k_mac_head 的恢复与 k_stub 同源：都是 wrapped ^ NCG_XOR_KEY。
+     * k_mac_head 的恢复与 k_stub 同源：都是 wrapped ^ XOR_KEY。
      * 调用 khmac_sha256 不破坏"stub 无智力"约束——它只是复用 .text 里
      * 现成的密码学原语（nc_guard_key.c 的函数全在明文段），stub 本身仍没有
      * ELF 解析、没有 RC4 S 盒、没有密钥派生、没有 slot 布局解释。 */
@@ -848,12 +835,12 @@ static void ncg_stub_recover(void) {
         uint8_t xk[8];
         ncg_xor_key(xk);
         for (int i = 0; i < 16; i++)
-            k_mac[i] = (uint8_t)(slot[NCG_OFF_K_MAC_HEAD + i] ^ xk[i & 7]);
+            k_mac[i] = (uint8_t)(slot[NC_OFF_K_MAC_HEAD + i] ^ xk[i & 7]);
         memset(xk, 0, sizeof(xk));
     }
     khmac_sha256(k_mac, 16, start, head_size, got_mac);
     {
-        const volatile unsigned char *want = slot + NCG_OFF_EXPMAC_HEAD;
+        const volatile unsigned char *want = slot + NC_OFF_EXPMAC_HEAD;
         uint8_t diff = 0;
         for (int i = 0; i < 32; i++)
             diff |= (uint8_t)(got_mac[i] ^ want[i]);
@@ -887,8 +874,8 @@ static void ncg_stub_recover(void) {
      *   ncg_head_unlock 检测到全零即判定"未锁"直接返回 0。
      *   这是 fail-safe 而非 fail-open：未锁状态下 .ncx 本就是明文。 */
     {
-        uint32_t ro_addr = ncg_rd32(slot + NCG_OFF_HEADRO_ADDR);
-        uint32_t ro_size = ncg_rd32(slot + NCG_OFF_HEADRO_SIZE);
+        uint32_t ro_addr = ncg_rd32(slot + NC_OFF_HEADRO_ADDR);
+        uint32_t ro_size = ncg_rd32(slot + NC_OFF_HEADRO_SIZE);
         if (ro_addr != 0 && ro_size > 0 && ro_size <= (1u << 16)) {
             uint8_t *ro = (uint8_t *)(base + ro_addr);
             uintptr_t ps2 = getpagesize();
@@ -940,8 +927,8 @@ int ncguard_unlock(void) {
      * 未锁时 slot 无 magic，ncg_self_crc 保持 0，stub 会直接返回，
      * 不影响开发期"不锁箱也能跑"。 */
     if (ncg_magic_ok(ncg_stub_slot, NCG_MAGIC_SEED_STUB)) {
-        uint32_t code_addr = ncg_rd32(ncg_stub_slot + NCG_OFF_CODE_ADDR);
-        uint32_t code_len  = ncg_rd32(ncg_stub_slot + NCG_OFF_CODE_LEN);
+        uint32_t code_addr = ncg_rd32(ncg_stub_slot + NC_OFF_CODE_ADDR);
+        uint32_t code_len  = ncg_rd32(ncg_stub_slot + NC_OFF_CODE_LEN);
         if (code_len > 0 && code_len < (64u << 20) && code_addr != 0) {
             /* 镜像基址 = slot 运行期地址 − slot 链接期地址（同 stub 的算法） */
             uintptr_t base = (uintptr_t) ncg_stub_slot

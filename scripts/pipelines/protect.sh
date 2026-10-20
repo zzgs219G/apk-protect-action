@@ -316,6 +316,7 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
   if [[ $WANT_TRANSPILE -eq 1 ]]; then
     mkdir -p "$WORK/project/jni/nc"
     cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$WORK/project/jni/nc/"
     cp "$ROOT/scripts/sigcheck/src/nc_link.c"   "$WORK/project/jni/nc/"
     cp "$ROOT/scripts/sigcheck/src/sig_guard2.c" "$WORK/project/jni/nc/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/nc/"
@@ -324,6 +325,7 @@ if [[ $WANT_SIGCHECK -eq 1 ]]; then
   else
     mkdir -p "$WORK/project/jni"
     cp "$ROOT/scripts/sigcheck/src/sig_check.c" "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$WORK/project/jni/"
     cp "$ROOT/scripts/sigcheck/src/nc_link.c"   "$WORK/project/jni/"
     cp "$ROOT/scripts/sigcheck/src/sig_guard2.c" "$WORK/project/jni/"
     cp "$WORK/sig_hash.h"               "$WORK/project/jni/"
@@ -336,9 +338,11 @@ if [[ $WANT_ENVCHECK -eq 1 ]]; then
   if [[ $WANT_TRANSPILE -eq 1 ]]; then
     mkdir -p "$WORK/project/jni/nc"
     cp "$ROOT/scripts/sigcheck/src/env_check.c" "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$WORK/project/jni/nc/"
   else
     mkdir -p "$WORK/project/jni"
     cp "$ROOT/scripts/sigcheck/src/env_check.c" "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$WORK/project/jni/"
   fi
   # envcheck 未勾 sigcheck 时也要有文案表(仅勾 envcheck 的组合)
   if [[ $WANT_SIGCHECK -ne 1 ]]; then
@@ -362,18 +366,23 @@ fi
 # ⚠️ nc_guard_key.c 必须一起拷：boot.c 的 unlock 本体 include 了
 #    nc_guard_key.h 并调 khmac_sha256()（HMAC 校验）。漏拷 = ndk-build 就红
 #    （fail-fast 反而是好事，比运行期 SIGILL 好定位）。
+# ⚠️ nc_guard_layout.h 同理必拷（2026-10-20）：它是 so 加密契约的唯一真相源
+#    （段名/尺寸/偏移/magic seed），5 个 .c 都 include 它。漏拷 = 编译期
+#    "file not found" —— 比漏同步常量安全得多，那种要等到运行期 SIGILL。
 if [[ -d "$WORK/project/jni/nc" ]]; then
   cp "$ROOT/scripts/sigcheck/src/nc_guard_boot.c"  "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c" "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"   "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"   "$WORK/project/jni/nc/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$WORK/project/jni/nc/"
 else
   cp "$ROOT/scripts/sigcheck/src/nc_guard_boot.c"  "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c" "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"   "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"   "$WORK/project/jni/"
+  cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$WORK/project/jni/"
 fi
 
 ndk_write_mk "$WORK/project/jni" nc   # mk 模板唯一来源（报错十一），模块名固定 nc

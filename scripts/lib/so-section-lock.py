@@ -60,21 +60,92 @@ import argparse
 import hashlib
 import math
 import os
+import re
 import struct
 import sys
 import zlib
 
+
+# ── 从 nc_guard_layout.h 抽取契约常量（2026-10-20）──────────────────
+# 为什么让 Python 从 C 头文件抽，而不是反过来（C 从 Python 抽）：
+#   · C 头文件是编译期强制生效的（_Static_assert 已在里头把关偏移重叠），
+#     让 Python 当消费者，它不可能漂移；
+#   · 反过来 Python 要写一个 C 头解析器，那本身就是新的 bug 源。
+#
+# 失败即抛错，绝不静默兜底："以为同步了其实没同步"比编译失败危险得多。
+def _load_layout_contract():
+    """从 nc_guard_layout.h 抽取段名/尺寸/偏移/种子，返回 dict。
+
+    头文件定位：本脚本在 scripts/lib/，头文件在 scripts/sigcheck/src/。
+    找不到头文件 → 抛 FileNotFoundError（调用方应视为构建配置错误）。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, '..', 'sigcheck', 'src', 'nc_guard_layout.h'),
+                 os.path.join(here, 'nc_guard_layout.h')):
+        cand = os.path.normpath(cand)
+        if os.path.isfile(cand):
+            path = cand
+            break
+    else:
+        raise FileNotFoundError(
+            '找不到 nc_guard_layout.h（契约真相源）。'
+            '它应在 scripts/sigcheck/src/ 下；缺失意味着锁箱契约无从对拍，'
+            '拒绝继续——否则会用过期常量锁出一个运行期 SIGILL 的包。')
+
+    with open(path, encoding='utf-8') as f:
+        text = f.read()
+
+    out = {}
+    # ① 段名：#define NC_SEC_XXX  ".yyy"
+    for m in re.finditer(r'#define\s+(NC_SEC_[A-Z_]+)\s+"([^"]+)"', text):
+        out[m.group(1)] = m.group(2)
+    # ② 尺寸/偏移：#define NC_XXX_YYY  104
+    for m in re.finditer(r'#define\s+(NC_(?:SLOT|STUB|OFF)_[A-Z0-9_]+)\s+(\d+)', text):
+        out[m.group(1)] = int(m.group(2))
+    # ③ magic 种子初始化列表：#define NC_SEED_XXX_INIT { 0x.., ... }
+    # ⚠️ 必须支持【续行】形态（`#define X \` + 换行 + `{ ... }`）——
+    #    layout.h 为可读性把初始化列表放在下一行，\s* 匹配不到换行。
+    #    2026-10-20 实测踩过：漏掉续行支持 → 两个 seed 抽不到 →
+    #    "缺少必需常量" 直接构建失败。
+    for m in re.finditer(
+            r'#define\s+(NC_SEED_[A-Z_]+_INIT)\s*\\?\s*\{([^}]*)\}', text):
+        vals = [int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]+)', m.group(2))]
+        out[m.group(1)] = bytes(vals)
+
+    required = ['NC_SEC_CODE', 'NC_SEC_CONST', 'NC_SEC_HEAD', 'NC_SEC_HEADRO',
+                'NC_SEC_SLOT', 'NC_SEC_STUBSLOT',
+                'NC_SLOT_SIZE', 'NC_STUB_SIZE',
+                'NC_SEED_SLOT_INIT', 'NC_SEED_STUB_INIT']
+    missing = [k for k in required if k not in out]
+    if missing:
+        raise ValueError(
+            'nc_guard_layout.h 缺少必需常量: %s —— 头文件被改坏了？' % ', '.join(missing))
+    return out
+
+
+_LAYOUT = _load_layout_contract()
+
 # ── 常量契约（与运行期 C 代码共享，改这里必须同步改 C 侧）────────────
-SECTION_NAME = '.ncx'           # 加密代码段（Xop 用 .bitcode，改名避开指纹）
-SLOT_NAME = '.nck'                # 密钥槽段（Xop 用 .protwrap）
+# ⚠️⚠️ 2026-10-20 起，本区常量不再手写，而是从 nc_guard_layout.h 抽取。
+#   那是契约的【唯一真相源】。此前这些值在 C 侧与 Python 侧各写一份，
+#   改一处漏一处的症状是运行期 SIGILL（不是编译错误），极难定位；
+#   仓库历史报错三/九/十一/十二全是同类根因。
+#   抽取失败（头文件缺失/正则不匹配）直接抛错，绝不静默用旧值兜底 ——
+#   "以为同步了其实没同步"比编译失败危险得多。
+#
+# 抽取规则：只认 `#define NAME value` 形态，值必须是 8/16 位十六进制串
+# （段名是带引号的字符串，另行处理）。见 _load_layout_contract()。
+
+SECTION_NAME = _LAYOUT['NC_SEC_CODE']   # 加密代码段（Xop 用 .bitcode，改名避开指纹）
+SLOT_NAME = _LAYOUT['NC_SEC_SLOT']      # 密钥槽段（Xop 用 .protwrap）
 # ⚠️ 2026-10-19：magic 不再以明文字面量落进 .nck/.ncks。
 # 原实现直接写 b'NCKEYLOCK' / b'NCSTUBLK'，攻击者 `strings -n 6` 就能扫出
 # 两条明确路标（实测旧产物可见 3 条）。现在改成 seed ^ XOR_KEY 的形式，
 # 二进制里不再有该字面量；运行期 C 侧由 ncg_magic_ok() 用同样的
 # seed ^ 碎片密钥 生成后比对，语义（匹配=已锁，不匹配=未锁放行）不变。
 # 改这四个常量必须同步 nc_guard_boot.c 的 NCG_MAGIC_SEED_SLOT/STUB。
-SLOT_MAGIC_SEED = bytes([0x30, 0x72, 0xEE, 0x48, 0x91, 0xDE, 0x04, 0xB5])
-STUB_MAGIC_SEED = bytes([0x30, 0x72, 0xF6, 0x59, 0x9D, 0xD0, 0x07, 0xBD])
+SLOT_MAGIC_SEED = _LAYOUT['NC_SEED_SLOT_INIT']   # ← 来自 nc_guard_layout.h
+STUB_MAGIC_SEED = _LAYOUT['NC_SEED_STUB_INIT']   # ← 来自 nc_guard_layout.h
 XOR_KEY = bytes([0x7E, 0x31, 0xA5, 0x0D, 0xC8, 0x92, 0x4B, 0xF6])
 # 注意：'NCKEYLOCK' 是 9 字节，seed 只覆盖前 8 字节（第 9 字节 'K' 由
 # 运行期 C 侧的 8 字节比较不涉及——C 侧比的是前 8 字节 'NCKEYLOC'）。
@@ -112,9 +183,9 @@ SLOT_MAGIC = SLOT_MAGIC_SEED + b'\x00' * 8   # 16 字节，后 8 保留
 # fail-fast）。也不能靠"让 CI 不 strip"绕过——那会把 frida_port_probe /
 # xposed_maps_probe 等探针名暴露进符号表，等于泄露检测意图。
 # 改用 section header table：strip 只删 .symtab/.strtab，段表始终完整。
-HEAD_NAME = '.ncxh'
-HEAD_RO_NAME = '.ncxhr'   # 存 master（2026-10-19 随机化）
-STUB_SLOT = '.ncks'
+HEAD_NAME = _LAYOUT['NC_SEC_HEAD']      # 装 unlock 本体的段
+HEAD_RO_NAME = _LAYOUT['NC_SEC_HEADRO']  # 存 master（2026-10-19 随机化）
+STUB_SLOT = _LAYOUT['NC_SEC_STUBSLOT']  # stub 的密钥槽
 STUB_MAGIC = STUB_MAGIC_SEED
 
 
@@ -686,10 +757,13 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     pkg_sha8 = hashlib.sha256((package or '').encode('utf-8')).digest()[:8]
     blob = (SLOT_MAGIC + wrapped + wrapped_mac + expect_mac
             + pkg_sha8 + b'\x00' * 8)
-    assert len(blob) == 96, 'blob %d != 96' % len(blob)
+    assert len(blob) == _LAYOUT['NC_SLOT_SIZE'], \
+        ('blob %d != NC_SLOT_SIZE %d（nc_guard_layout.h 与 C 侧 ncg_key_slot[] '
+         '长度不一致；改一侧必须同步另一侧）'
+         % (len(blob), _LAYOUT['NC_SLOT_SIZE']))
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nck 段需扩到 96；改了一侧必须同步另一侧）' \
-        % (len(blob), slot['size'])
+        'blob %d != slot size %d（.nck 段需扩到 %d；改了一侧必须同步另一侧）' \
+        % (len(blob), slot['size'], _LAYOUT['NC_SLOT_SIZE'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
 
     # 熵值安检（2026-10-18）：必须在【写盘之前】。
@@ -908,11 +982,14 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
             + expect_mac_head
             + _s.pack('<I', head_ro['addr'])
             + _s.pack('<I', 32))
-    assert len(blob) == 104, 'stub blob %d != 104' % len(blob)
+    assert len(blob) == _LAYOUT['NC_STUB_SIZE'], \
+        ('stub blob %d != NC_STUB_SIZE %d（nc_guard_layout.h 与 C 侧 '
+         'ncg_stub_slot[] 长度不一致；改一侧必须同步另一侧）'
+         % (len(blob), _LAYOUT['NC_STUB_SIZE']))
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.ncks 段需扩到 104 字节；' \
-        '改 nc_guard_boot.c 的 NCG_STUB_SIZE 必须同步这里）' \
-        % (len(blob), slot['size'])
+        'blob %d != slot size %d（.ncks 段需扩到 %d 字节；' \
+        '改 nc_guard_layout.h 的 NC_STUB_SIZE 必须同步 C 侧）' \
+        % (len(blob), slot['size'], _LAYOUT['NC_STUB_SIZE'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
 
     # 熵值安检（2026-10-18）：必须在【写盘之前】，理由同 lock()——

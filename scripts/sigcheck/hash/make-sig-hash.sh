@@ -123,7 +123,27 @@ fi
   echo "#if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)"
   echo "/* 数据段必须是【不可执行】的独立段：clang 不允许 const 数据进 AXR 段，"
   echo " * 会报 \"causes a section type conflict\"。见 nc_link.c 的注释。 */"
-  echo "#  define SIG_HASH_SECTION __attribute__((section(\".ncxr\"), retain, used))"
+  # ⚠️ 显式判存在性，不依赖 set -e/pipefail 兜底：
+  #    sed 失败时若被加上 2>/dev/null，$(...) 会静默返回空；
+  #    而 set -e 对【命令替换赋值】不生效（`x=$(false)` 的退出码是 0），
+  #    结果是一个空段名被原样 echo 进头文件，锁箱阶段才炸。
+  #    2026-10-20 实测：只靠 set -e 时 exit=2 但报的是 sed 的错，
+  #    排查者看不出"契约真相源缺失"这个根因。
+  _LAYOUT_H="$SCRIPT_DIR/../src/nc_guard_layout.h"
+  if [ ! -f "$_LAYOUT_H" ]; then
+    echo "❌ 找不到 nc_guard_layout.h（so 加密契约的唯一真相源）: $_LAYOUT_H" >&2
+    echo "   它应在 scripts/sigcheck/src/ 下；缺失 = 无法对拍 C 侧与 Python 侧" >&2
+    echo "   的段名/尺寸/偏移契约，拒绝继续（否则会产出运行期 SIGILL 的包）。" >&2
+    exit 1
+  fi
+  NC_CONST_SEC=$(sed -n 's/^#define NC_SEC_CONST[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "$_LAYOUT_H" || true)
+  if [ -z "$NC_CONST_SEC" ]; then
+    echo "❌ 无法从 nc_guard_layout.h 抽取 NC_SEC_CONST" >&2
+    echo "   文件存在但没有 '#define NC_SEC_CONST \".xxx\"' 这行 —— 头文件被改坏了？" >&2
+    exit 1
+  fi
+  echo "#  define SIG_HASH_SECTION __attribute__((section(\"${NC_CONST_SEC}\"), retain, used))"
   echo "#else"
   echo "#  define SIG_HASH_SECTION"
   echo "#endif"

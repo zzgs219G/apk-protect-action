@@ -47,6 +47,9 @@ fi
 
 cp "$SRC_ENV" "$T/env_check.c"
 cp "$SRC_SIG" "$T/sig_check.c"
+# 2026-10-20：两者都 include nc_guard_layout.h（so 加密契约唯一真相源），
+# 必须一并拷到 -I 搜索路径，否则编译期 "file not found"。
+cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$T/"
 # sig_check.c 引用 sig_hash.h(构建期由 make-sig-hash.sh 生成;测试用空桩)
 printf '#ifndef _SIG_HASH_H_\n#define _SIG_HASH_H_\n#define SIG_HASH_LEN 32\n#define SIG_SALT_LEN 16\nstatic const unsigned char SIG_SALT[16]={0};\nstatic const unsigned char SIG_HASH_STORED[32]={0};\n#endif\n' > "$T/sig_hash.h"
 

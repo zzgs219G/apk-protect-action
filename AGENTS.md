@@ -56,6 +56,7 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 | `scripts/sigcheck/src/nc_guard_key.c` | HKDF-SHA256 + 证书 DER 提取(`k_so = HKDF(master, SHA256(certDER), info)` ) | **2026-10-20 更正**:本文件【有调用方】——`ncg_derive_k_so_from_der`/`ncg_derive_k_mac_from_der` 由 `nc_guard_boot.c` 调(P1-a 运行期证书派生),它们内部再调本文件的 `ncg_derive_k_so`/`ncg_derive_k_mac`。sha256/hmac/hkdf 三组测试向量对拍过,勿重写密码学原语 |
 | `scripts/sigcheck/src/nc_link.c` | Java↔Native 判决核心 `nc_verify_t1` + 心跳记录侧 | `test-javacheck.sh` 11 大项(判决对拍/心跳语义)。**2026-10-19**:`nc_verify_t1` 进 `.ncx` 段,两张签名表进 `.ncxr`——**`ncVerify`/`heartbeat` 两个 JNI 入口绝不能标段**(它们是 unlock 调用方,标了即死锁);段标记必须条件化 `NC_GUARD_SECTIONED && !NCLINK_HOST_TEST`(否则宿主测试读到密文假红) |
 | `scripts/sigcheck/src/nc_guard_probe.c` | `.ncx`/`.nck` 两段的**唯一定义处**(`ncg_key_slot[96]` 就是 `.nck` 段全部内容) | 改数组长度必须同步 `so-section-lock.py` 的 `assert len(blob)==96` 与 `nc_guard_boot.c` 的 `NCG_SLOT_SIZE`——不一致在构建期即 AssertionError。**2026-10-19 P1-a 从 80 扩到 96**：新增 `pkg_sha8`(包名指纹)+reserved |
+| `scripts/sigcheck/src/nc_guard_layout.h` | so 加密契约的【唯一真相源】:段名/slot 尺寸/偏移/magic seed/XOR 碎片表,带 `_Static_assert` 挡偏移重叠 | 改任一常量必跑 `test-so-lock.sh` 的 T20(跨语言对拍)/T21(段名登记)/T22(二进制等价)。它被 5 个 .c include、被 protect.sh 三个分支拷贝——漏拷的症状是编译期 "file not found"(比漏同步常量安全得多,那种要等到运行期 SIGILL)。⚠️ 本文件零 include、零逻辑,故 NDK/host/任何工具链都能编 |
 | `scripts/lib/so_section_mark.py` | 通用段标记器(第2层设施):规则=函数头正则,零模块逻辑 | 新消费者接入前必读 `docs/流程文档.md` §3.12.1 的接入清单;改规则必须跑 `--check -v` 实测命中,不许只看正则可编译 |
 
 ### 段名中性化对照表(2026-10-19 改名,2026-10-20 补表)
@@ -76,10 +77,27 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 工程),**刻意保留旧段名**——读到 `.ncguard` 说明那是旧版实现,不要照着改。
 现行实现是 `nc_guard_boot.c`(用 `.ncxh`/`.ncxhr`)。
 
-**2026-10-20 起,契约常数的单一真相源见 `test-so-lock.sh` 的 T20/T21/T22**:
-T20 把 C 侧宏与 `so-section-lock.py` 的 Python 常量跨语言对拍,T21 扫描全仓
-段名字面量(未登记即构建失败),T22 验证改动不改变产物字节。
-新增段名/偏移/尺寸时,先改 C 侧与 Python 侧,再跑这三项。
+**2026-10-20 起,契约常数的单一真相源是 `scripts/sigcheck/src/nc_guard_layout.h`**：
+段名(6)、slot 尺寸(96/104)、偏移(8)、magic seed(2)、XOR 碎片表(1)全在那里,
+带 `_Static_assert` 挡"偏移重叠/越界"类手误(上一轮 88→104 扩容最危险的错误模式)。
+
+消费方(改契约前先看这张表会波及谁)：
+  C:    nc_guard_boot.c / nc_link.c / env_check.c / sig_check.c / nc_guard_probe.c
+  Py:   so-section-lock.py（`_load_layout_contract()` 抽取,抽不到即抛错）
+  Sh:   make-sig-hash.sh（sed 抽 NC_SEC_CONST,抽不到即 exit 1）
+  构建: protect.sh 三个分支都拷它;test-so-lock.sh / test-javacheck.sh /
+        test-lsgs-strings.sh 的编译也都需要它
+
+⚠️ C 侧数组【符号名】刻意不跟着改(`NCG_MAGIC_SEED_SLOT` 等保持原样,
+只把值换成 `NC_SEED_*_INIT`)：改名会改变 `.rodata` 布局,使 T22 的
+二进制等价性验证失效。跨语言契约是"值",不是"C 变量叫什么"。
+
+三项反向保险(`test-so-lock.sh`)：
+  T20 C↔Python 跨语言对拍(双路抽取,防"抽取器本身写错也自洽通过")
+  T21 全仓段名字面量登记检测(防手打错一个字母——那种编译链接全过,
+      直到锁箱期才报"段不存在",且不告诉你是拼错了)
+  T22 二进制等价性(需调用方传 NC_BASELINE_SO；不固定 sig_hash.h 时
+      随机 salt 会让 cmp 永远不一致,见 make-sig-hash.sh 的 os.urandom)
 
 ### LSGS 密文机制约束(2026-10 新增,改 sig_check.c/env_check.c 前必读)
 

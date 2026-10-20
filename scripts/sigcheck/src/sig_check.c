@@ -165,6 +165,7 @@ static void siglog(const char *prio, const char *fmt, ...) {
  * 三级前缀约定(用户约定,勿改):
  *   【流程】= 正常走到某一步  【成功】【通过】= 该步/校验正常
  *   【失败】= 出错,走 fail 链  【数据】= 关键中间值(路径/指纹) */
+#include "nc_guard_layout.h"  /* 契约常数单一真相源：段名/尺寸/偏移 */
 #include "sig_log_data.h"
 
 /* LSGS 解码包装函数(2026-10-16):siglog_detect 定义在 sig_log_data.h
@@ -741,7 +742,7 @@ static void derive_expected(const unsigned char actual[32], unsigned char out[32
  * ⚠️ 本函数是【被调用方】，调用方 sig_verify/sig_check_entry 不标段
  *    （它们是 unlock 的使用者，标进去会导致"解锁前就要调用密文"）。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(SIGCHECK_HOST_TEST)
-#  define SIG_KILL_SECTION __attribute__((section(".ncx"), retain, used, noinline))
+#  define SIG_KILL_SECTION __attribute__((section(NC_SEC_CODE), retain, used, noinline))
 #else
 #  define SIG_KILL_SECTION
 #endif

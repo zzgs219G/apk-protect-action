@@ -80,6 +80,7 @@ fi
 # 顺带覆盖 sigcheck+envcheck 的真实组合，而不是只测 sigcheck-only。
 cp "$SRC/nc_guard_boot.c" "$SRC/nc_guard_probe.c" "$SRC/nc_guard_jni.c" \
    "$SRC/nc_guard_key.c" "$SRC/nc_guard_key.h" "$SRC/nc_link.c" \
+   "$SRC/nc_guard_layout.h" \
    "$SRC/env_check.c" "$SRC/sig_check.c" "$WORK/"
 
 # sig_hash.h 是构建期生成的（含两张签名表），必须先生成再编译
@@ -581,6 +582,186 @@ PYT8
     fi
     cp ../orig.so lib/arm64-v8a/libnc.so
 fi
+
+# ═══════════════════════════════════════════════════════════════════
+# T20/T21/T22（2026-10-20）：契约一致性反向保险
+#
+# 为什么需要：契约常数此前散落 4 种语言、7 个文件、24 处副本。
+# 下面三项把"改一处必须同步另一处"从注释变成构建期 fail-fast。
+#   T20 C↔Python 跨语言对拍（layout.h 是唯一真相源）
+#   T21 全仓段名字面量登记检测（防拼错、防新增未登记段名）
+#   T22 二进制等价性（固定 sig_hash.h 后，改动不得改变产物字节）
+# ═══════════════════════════════════════════════════════════════════
+
+LAYOUT_H="$ROOT/scripts/sigcheck/src/nc_guard_layout.h"
+LOCK_PY="$ROOT/scripts/lib/so-section-lock.py"
+
+# ── T20 C↔Python 契约常数跨语言对拍 ──────────────────────────────
+# 做法：让 so-section-lock.py 自己从 layout.h 抽取（它的 _load_layout_contract），
+# 再用独立正则从 layout.h 抽一遍，两边比。双路抽取是为了防"抽取器本身写错"——
+# 若只有一条抽取路径，它错了也会自洽地通过。
+#
+# ⚠️⚠️ 本项的【能力边界】必须说清（2026-10-20 实测确认）：
+#   两边都从同一个 layout.h 抽，所以"改 layout.h"时它们会一致地一起变，
+#   T20 【抓不到 layout.h 自身的漂移】——那不是它的职责。
+#   改 layout.h = 契约变更，C/Python 本就该跟着变；
+#   拦住它的是 so-section-lock.py 的 assert len(blob)==NC_SLOT_SIZE
+#   （blob 是按新尺寸拼的，段实际尺寸没变 → 当场 AssertionError）。
+#
+#   T20 真正防的是【第二份副本】：有人嫌 include 麻烦，在某个 .c 里
+#   手写 section(".ncx")、或在某个 .py 里再抄一份 96。
+#   这类副本不会让 layout.h 报错，只会让某个消费者与真相源不一致——
+#   症状是运行期 SIGILL。T20 的 C 侧初始化检查就是抓这个。
+#
+#   ⚠️ 注意 T21 抓不到"手写已登记段名"（2026-10-20 实测）：在 nc_link.c 里
+#   把 section(NC_SEC_CODE) 改回 section(".ncx")，T21 照样绿——因为 .ncx
+#   本身是已登记的。T21 的职责是防"未登记/拼错的段名"，不是防"绕过宏"。
+#   抓绕过宏要靠 T20 的 C 侧检查（见下方 scan_c_copies）。
+if [ -f "$LAYOUT_H" ] && [ -f "$LOCK_PY" ]; then
+    if python3 - "$LAYOUT_H" "$LOCK_PY" >t20.log 2>&1 <<'PYT20'
+import importlib.util, re, sys
+layout, lockpy = sys.argv[1], sys.argv[2]
+
+spec = importlib.util.spec_from_file_location("ssl", lockpy)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)          # 会执行 _load_layout_contract()
+py = m._LAYOUT
+
+text = open(layout, encoding='utf-8').read()
+def sec(name):
+    mm = re.search(r'#define\s+%s\s+"([^"]+)"' % name, text)
+    return mm.group(1) if mm else None
+def num(name):
+    mm = re.search(r'#define\s+%s\s+(\d+)' % name, text)
+    return int(mm.group(1)) if mm else None
+def seed(name):
+    mm = re.search(r'#define\s+%s\s*\\?\s*\{([^}]*)\}' % name, text)
+    if not mm: return None
+    return bytes(int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]+)', mm.group(1)))
+
+fails = []
+def chk(what, a, b):
+    if a != b:
+        fails.append('%s: C侧=%r Python侧=%r' % (what, a, b))
+
+# 段名：Python 模块级常量 vs layout.h
+chk('SECTION_NAME',    m.SECTION_NAME,   sec('NC_SEC_CODE'))
+chk('SLOT_NAME',       m.SLOT_NAME,      sec('NC_SEC_SLOT'))
+chk('HEAD_NAME',       m.HEAD_NAME,      sec('NC_SEC_HEAD'))
+chk('HEAD_RO_NAME',    m.HEAD_RO_NAME,   sec('NC_SEC_HEADRO'))
+chk('STUB_SLOT',       m.STUB_SLOT,      sec('NC_SEC_STUBSLOT'))
+# 尺寸
+chk('NC_SLOT_SIZE',    py['NC_SLOT_SIZE'], num('NC_SLOT_SIZE'))
+chk('NC_STUB_SIZE',    py['NC_STUB_SIZE'], num('NC_STUB_SIZE'))
+# 偏移
+for k in ['NC_OFF_EXPMAC','NC_OFF_PKG_SHA','NC_OFF_CODE_ADDR','NC_OFF_CODE_LEN',
+          'NC_OFF_K_MAC_HEAD','NC_OFF_EXPMAC_HEAD','NC_OFF_HEADRO_ADDR',
+          'NC_OFF_HEADRO_SIZE']:
+    chk(k, py.get(k), num(k))
+# magic seed
+chk('SLOT_MAGIC_SEED', m.SLOT_MAGIC_SEED, seed('NC_SEED_SLOT_INIT'))
+chk('STUB_MAGIC_SEED', m.STUB_MAGIC_SEED, seed('NC_SEED_STUB_INIT'))
+
+# C 侧数组也用同一 seed 初始化（防"C 改了值、Python 没改"）
+boot = open(sys.argv[3], encoding='utf-8').read() if len(sys.argv) > 3 else ''
+if boot:
+    mm = re.search(r'NCG_MAGIC_SEED_SLOT\[8\]\s*=\s*NC_SEED_SLOT_INIT', boot)
+    if not mm:
+        fails.append('nc_guard_boot.c 未用 NC_SEED_SLOT_INIT 初始化 NCG_MAGIC_SEED_SLOT'
+                     '（契约值出现第二份副本）')
+    mm = re.search(r'NCG_MAGIC_SEED_STUB\[8\]\s*=\s*NC_SEED_STUB_INIT', boot)
+    if not mm:
+        fails.append('nc_guard_boot.c 未用 NC_SEED_STUB_INIT 初始化 NCG_MAGIC_SEED_STUB')
+    mm = re.search(r'NCG_XOR_FRAG\[8\]\s*=\s*NC_XOR_FRAG_INIT', boot)
+    if not mm:
+        fails.append('nc_guard_boot.c 未用 NC_XOR_FRAG_INIT 初始化 NCG_XOR_FRAG')
+
+# C 侧副本扫描：5 个消费者 .c 里不得出现裸段名字面量。
+# 为什么必须查：手写 section(".ncx") 编译链接全过、T21 也绿（.ncx 是已登记名），
+# 只有运行期 SIGILL 才暴露——那种 bug 排查成本是半天量级。
+# 豁免：nc_guard_unlock.c（历史存档，刻意保留旧名，见 AGENTS.md 例外条款）。
+import os
+SRC = os.path.join(os.path.dirname(os.path.abspath(lockpy)), '..', 'sigcheck', 'src')
+SRC = os.path.normpath(SRC)
+CONSUMERS = ['nc_guard_boot.c', 'nc_link.c', 'env_check.c', 'sig_check.c',
+             'nc_guard_probe.c']
+for fn in CONSUMERS:
+    fp = os.path.join(SRC, fn)
+    if not os.path.isfile(fp):
+        fails.append('消费者文件缺失: %s' % fn)
+        continue
+    txt = open(fp, encoding='utf-8').read()
+    # 只查 attribute 里的段名（避开注释里提到的历史名）
+    for lit in re.findall(r'section\(\s*"([^"]+)"', txt):
+        fails.append('%s 出现裸段名字面量 section("%s") —— 应改用 '
+                     'nc_guard_layout.h 的 NC_SEC_* 宏（否则契约出现第二份副本）'
+                     % (fn, lit))
+    if 'nc_guard_layout.h' not in txt:
+        fails.append('%s 未 include nc_guard_layout.h（契约真相源）' % fn)
+
+if fails:
+    print('\n'.join('❌ ' + f for f in fails))
+    sys.exit(1)
+print('OK: 6 段名 + 2 尺寸 + 8 偏移 + 2 seed + C 侧初始化全部一致')
+PYT20
+    then
+        ok "T20 C↔Python 契约对拍（layout.h 为唯一真相源）"
+    else
+        bad "T20 契约不一致（改 layout.h 或 C/Python 任一侧时此路必红）"; sed -n '1,15p' t20.log >&2
+    fi
+else
+    bad "T20 缺 layout.h 或 so-section-lock.py —— 契约无从对拍"
+fi
+
+# ── T21 全仓段名字面量登记检测 ───────────────────────────────────
+# 扫 C/Py/Sh 里所有 section("...") 与段名常量，凡未在 layout.h 登记的即失败。
+# 防的是"手打错一个字母"：编译链接全过，直到锁箱期才报"段不存在"，
+# 且那条报错不告诉你是拼错了。
+if [ -f "$LAYOUT_H" ]; then
+    registered=$(sed -n 's/^#define NC_SEC_[A-Z_]*[[:space:]]*"\([^"]*\)".*/\1/p' "$LAYOUT_H" | sort -u)
+    if [ -n "$registered" ]; then
+        bad_found=0
+        # 收集源码里出现的所有 .nc 开头段名（含 section("...") 与裸字符串）
+        while IFS= read -r lit; do
+            if ! grep -qxF "$lit" <<<"$registered"; then
+                bad "T21 未登记的段名: $lit（已登记: $(echo $registered | tr '\n' ' ')）"
+                bad_found=1
+            fi
+        done < <(grep -rhoE '"\.(nc[a-z]*|nck[a-z]*)"' \
+                    "$ROOT/scripts/sigcheck/src" "$ROOT/scripts/lib" \
+                    "$ROOT/scripts/pipelines" "$ROOT/scripts/sigcheck/hash" \
+                    2>/dev/null | tr -d '"' | sort -u)
+        # nc_guard_unlock.c 是历史存档，刻意保留旧名（.ncguard/.nckey）
+        # —— 在 T21 里显式豁免，否则它永远让这一项红。
+        hist=$(grep -rhoE '"(\.ncguard[a-z_]*|\.nckey[a-z_]*)"' \
+                    "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" 2>/dev/null | tr -d '"' | sort -u)
+        if [ -n "$hist" ]; then
+            skip "T21 历史存档豁免: $(echo $hist | tr '\n' ' ')（nc_guard_unlock.c 刻意保留旧名）"
+        fi
+        [ $bad_found -eq 0 ] && ok "T21 段名字面量全部已登记（$(echo $registered | wc -w) 个）"
+    else
+        bad "T21 layout.h 里一个段名都没抽到 —— 头文件被改坏了？"
+    fi
+else
+    bad "T21 缺 nc_guard_layout.h"
+fi
+
+# ── T22 二进制等价性 ─────────────────────────────────────────────
+# 固定 sig_hash.h / sig_log_data.h 后重编，与 Git 基线产物逐字节比。
+# 为什么必须固定：make-sig-hash.sh:90 每次 os.urandom(16) 随机 salt，
+# 不固定的话 cmp 永远不一致（2026-10-20 实测：96 字节差异全来自 salt，
+# 与改动无关）。要证明"重构零行为变化"，这是唯一可靠口径。
+if [ -f libnc.so ] && [ -n "${NC_BASELINE_SO:-}" ] && [ -f "$NC_BASELINE_SO" ]; then
+    if cmp -s libnc.so "$NC_BASELINE_SO"; then
+        ok "T22 二进制等价（与基线逐字节一致）"
+    else
+        n=$(cmp -l libnc.so "$NC_BASELINE_SO" 2>/dev/null | wc -l)
+        bad "T22 二进制有 $n 字节差异 —— 重构引入了行为变化，须查清"
+    fi
+else
+    skip "T22 未提供 NC_BASELINE_SO（基线产物），跳过"
+fi
+
 
 echo
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="

@@ -346,10 +346,13 @@ open(os.path.join(out, 'bad.bin'), 'wb').write(bytes(bad))
 emit(out + '0', bytes(32))
 PY
 cp "$ROOT/scripts/sigcheck/src/nc_link.c" "$T/ncl/"   # 引号包含优先搜源文件目录,须就位编译
+# 2026-10-20：nc_link.c 现在 include nc_guard_layout.h（契约真相源），必须一并拷
+cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$T/ncl/"
 clang -O1 -DNCLINK_HOST_TEST -I"$T/ncl" \
   "$T/ncl/nc_link.c" "$JL/tests/test-nclink.c" -o "$T/ncl/test"
 "$T/ncl/test" "$T/ncl/good.bin" "$T/ncl/bad.bin"
 cp "$ROOT/scripts/sigcheck/src/nc_link.c" "$T/ncl0/"
+cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$T/ncl0/"
 clang -O1 -DNCLINK_HOST_TEST -I"$T/ncl0" \
   "$T/ncl0/nc_link.c" "$JL/tests/test-nclink.c" -o "$T/ncl/test0"
 "$T/ncl/test0" "$T/ncl/good.bin" "$T/ncl/good.bin" debug-skip

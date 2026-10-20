@@ -25,9 +25,14 @@
  * ndk_write_mk 的两级 wildcard 自动收编，无需改 mk。
  *
  * 注：不引 <jni.h> —— 本文件无 JNI 类型需求，而 host 侧缺 jni_md.h、
- * NDK 侧也平白多一个依赖。保持零头文件依赖，任何工具链都能编。
+ * NDK 侧也平白多一个依赖。
+ * 唯一例外是 nc_guard_layout.h（2026-10-20 引入）：它只含段名/尺寸/偏移
+ * 常量与 _Static_assert，零 include、零逻辑，任何工具链都能编。
+ * 引入它是为了消掉"段名在本文件与 so-section-lock.py 各写一份"的副本
+ * （改一处漏一处的症状是运行期 SIGILL，极难定位）。
  */
 
+#include "nc_guard_layout.h"  /* 契约常数单一真相源：段名/尺寸/偏移 */
 /* 密钥槽：运行期 ncguard_unlock() 从这里恢复 K_so。
  * const volatile 的理由同 Xop：writable 对象在 SHF_EXECINSTR 段里会让 LLD
  * 生成 W+X 的 PT_LOAD，而 Android 10+ 拒绝可写可执行段。用 const 让它进
@@ -41,7 +46,7 @@
  * .nck 段的全部内容】—— 长度不一致时 Python 的
  * assert len(blob)==slot['size'] 会当场炸，属好消息；
  * 坏消息是它只在跑过锁箱后才暴露，所以改一侧必须立刻改另一侧。 */
-__attribute__((section(".nck"), used, aligned(1), retain))
+__attribute__((section(NC_SEC_SLOT), used, aligned(1), retain))
 static const volatile unsigned char ncg_key_slot[96] = {0};
 
 /* ── 被锁的业务逻辑：只有解锁后才能调用 ────────────────────────────
@@ -49,7 +54,7 @@ static const volatile unsigned char ncg_key_slot[96] = {0};
  * 对拍契约：ncguard_probe(0) == ((0^0x5A)+0x0F)*3 & 0xFF == 59。
  * 取值刻意不取 42/0/1 这类哨兵值，避免 strings 一眼定位。
  * retain 同密钥槽：防 --gc-sections 回收。 */
-__attribute__((section(".ncx"), used, retain))
+__attribute__((section(NC_SEC_CODE), used, retain))
 int ncguard_probe(int token) {
     /* 用 token 派生一个确定性结果；逻辑本身不重要，重要的是"这段代码在
      * 锁箱后不可读、解锁后可正确执行"。Android 验证用的对拍契约：
