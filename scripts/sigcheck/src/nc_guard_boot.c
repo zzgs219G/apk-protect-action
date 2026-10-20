@@ -184,6 +184,19 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  * 密钥在 .rodata 里消失（实测归零），攻击者要凑齐必须同时读出查表、4 个
  * 常量与高低位规则三处再手工重组。
  *
+ * ── 意外之喜：栈槽隐式传参（2026-10-21 记录，破解复盘唯一 ★★★★★）──
+ * 攻击者实测：key16 重组用到的中间值经栈偏移（如 [sp+0x40]）在函数间
+ * 隐式传递——IDA/r2 追不到源（写入它的函数帧已返回），标 undefined，
+ * "完全卡住静态分析"。这不是刻意设计，是 -Oz 的栈分配副产品。
+ *
+ * 会消失吗：同一源码+同一 clang → 产物逐字节确定（已实测 sha256 一致），
+ * CI 的 NDK 版本固定，故不会自发消失。
+ * 怎么"冻结"：不靠冻结代码，靠 T22（二进制等价）——NDK 升级或源码
+ * 改动若导致栈布局变化（密钥落回寄存器/可追溯位置），T22 立即红。
+ * ⚠️ 反向纪律：不要为了"可读性"给 ncg_xor_key / ncg_stub_recover
+ * 加参数或改局部变量结构——那可能把密钥材料挪进可追溯位置，
+ * 静默丢掉这层白捡的防御。
+ *
  * 存放约定（每个碎片装 2 个"逻辑字节"，无固定逻辑序）：
  *   frag_a=0xc831 → 低位=逻辑1(0x31) 高位=逻辑4(0xc8)
  *   frag_b=0x927e → 低位=逻辑0(0x7e) 高位=逻辑5(0x92)
@@ -203,23 +216,61 @@ static const uint8_t NCG_XOR_FRAG[8] = NC_XOR_FRAG_INIT;
  * .data 而非 .rodata）。volatile 读阻止编译期折叠，于是 .rodata 里
  * 不再出现连续 8 字节密钥；攻击者 dump 到的是 4 个看似无关的 16 位
  * 常量，还必须另外读出 NCG_XOR_FRAG 表与高低位规则才能重组。 */
-static volatile uint16_t ncg_frag_a = 0xc831u;  /* 逻辑 1,4 */
-static volatile uint16_t ncg_frag_b = 0x927eu;  /* 逻辑 0,5 */
-static volatile uint16_t ncg_frag_c = 0xf6a5u;  /* 逻辑 2,7 */
-static volatile uint16_t ncg_frag_d = 0x4b0du;  /* 逻辑 3,6 */
+/* ⚠️ 2026-10-21 起这 4 个是【诱饵】——真碎片在 slot 碎片区
+ * （NC_OFF_FRAGS，锁箱器随机生成，见 ncg_xor_key 注释）。
+ * 旧值 0xc831/0x927e/0xf6a5/0x4b0d 曾是真碎片（破解复盘实测 5 分钟
+ * 重组出 XOR_KEY），现在改成与 XOR_KEY 无关的随机样值。
+ * 保留它们的理由：① 防 gc-sections 回收（历史上真实踩过：无引用
+ * 段被连段回收，报错十一同款）；② 攻击者 diff 两个 so 时这组常量
+ * 恒定存在，掩护 slot 里的真碎片（他读到 .data 常量会以为还是老机制）。
+ * volatile 读在 ncg_decoy_sink() 里消费，防编译期折叠。 */
+static volatile uint16_t ncg_frag_a = 0x51a3u;
+static volatile uint16_t ncg_frag_b = 0xe27bu;
+static volatile uint16_t ncg_frag_c = 0x9c47u;
+static volatile uint16_t ncg_frag_d = 0x30d9u;
+
+/* 诱饵消费点：让 ncg_frag_* 有"可观测的使用"（防回收），但结果
+ * 丢弃——与真 XOR_KEY 无关。noinline 防 -O2 把假运算折叠成常量。 */
+__attribute__((noinline, used))
+static uint32_t ncg_decoy_sink(void) {
+    uint32_t acc = (uint32_t)ncg_frag_a << 16 | ncg_frag_b;
+    acc ^= (uint32_t)ncg_frag_c << 8;
+    acc += ncg_frag_d;
+    return acc;
+}
 
 /* 运行期拼回完整 8 字节密钥。每次调用重算，不缓存——缓存就是又把密钥
  * 写进内存某处。调用方用完必须 memset 擦除。 */
+/* 前向声明：ncg_stub_slot 定义在第二部分（本函数与其同在 .text），
+ * PC 相对引用不受定义顺序影响，只需声明可见。 */
+static const volatile unsigned char ncg_stub_slot[NC_STUB_SIZE];
 static void ncg_xor_key(uint8_t out[8]) {
-    /* volatile 读：编译器无法在编译期算出结果，也就无法把完整 8 字节
-     * 密钥折回 .rodata。代价是 4 次 volatile load（若干纳秒），可忽略。 */
-    uint16_t fr[4];
-    fr[0] = ncg_frag_a;
-    fr[1] = ncg_frag_b;
-    fr[2] = ncg_frag_c;
-    fr[3] = ncg_frag_d;
+    /* ⚠️ 2026-10-21：碎片来源从 .data 常量改为【slot 碎片区】。
+     *
+     * 破解复盘实测（libnc_破解复盘文档最新.md）："objdump 读 .data +
+     * 反汇编 0x25740 即可重组，5 分钟拿到 XOR_KEY"——真碎片作为编译期
+     * 常量躺在 .data，静态重组的输入摆在明面上。
+     *
+     * 现在：真碎片由锁箱器每次构建随机生成，写进 slot 碎片区
+     * （NC_OFF_FRAGS，[104:112)）。.data 的 ncg_frag_* 退化为【诱饵】：
+     * 随机初值、参与假运算、防 gc-sections 回收——攻击者读 .data 拼出
+     * 的是随机值，与真 XOR_KEY 无关。碎片每次构建不同，diff 两个 so
+     * 无法识别碎片（原诱饵是确定性常量，曾被复测报告的 diff 手法识破，
+     * 同款问题不再重演）。
+     *
+     * 读取源 = ncg_stub_slot（本函数与 stub 同在 .text，PC 相对引用
+     * slot 天然可达，无需额外定位）。运行期从 slot 读——slot 本来就是
+     * 攻击者要解析的格式（wrapped_k_stub 也在里面），真碎片混在其中：
+     * 攻击者必须先读懂 slot 布局才有重组输入，且哪 4 个字节是碎片
+     * 无法与将来的新字段区分（每次构建内容都不同）。
+     *
+     * 查表 NCG_XOR_FRAG 仍在 .rodata（编译期常量，锁箱器按它反推生成
+     * 碎片，见 so-section-lock.py lock_head 的自检逻辑）——表本身
+     * 不构成独立泄露：没有 slot 里的真碎片，表只是排列规则。 */
+    const volatile unsigned char *fr = ncg_stub_slot + NC_OFF_FRAGS;
     for (int i = 0; i < 8; i++) {
-        uint16_t v = fr[NCG_XOR_FRAG[i]];
+        uint16_t v = (uint16_t)(fr[NCG_XOR_FRAG[i] * 2]
+                               | (fr[NCG_XOR_FRAG[i] * 2 + 1] << 8));
         out[i] = (i < 4) ? (uint8_t)(v & 0xFF) : (uint8_t)((v >> 8) & 0xFF);
     }
 }
@@ -962,6 +1013,7 @@ int ncguard_unlock(void) {
         }
     }
 
+    (void)ncg_decoy_sink();      /* 诱饵消费：防 .data 碎片被 gc-sections 回收 */
     ncg_stub_recover();          /* 先确保 head 本体是明文 */
     int rc = ncg_head_unlock();  /* 再调本体解 .ncx */
     if (rc == 0) {

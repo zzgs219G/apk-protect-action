@@ -13,7 +13,7 @@
 # 排在末尾；用 APK=... bash $0 指定已签名 APK 才跑，缺 APK 时跳过）：
 #   T1 编译（同 NDK flags）→ 六段齐全
 #   T2 一级锁箱 → .nck 96 字节
-#   T3 二级锁箱 → .ncks 104 字节
+#   T3 二级锁箱 → .ncks = NC_STUB_SIZE（从 layout.h 抽取，不写死）
 #   T4 未改代码 → selftest == 59
 #   T5 改 .text 1 位 → 自绑定生效 → 非 59（SIGILL/崩溃）
 #   T6 明文路标归零（NCKEYLOCK / NCSTUBLK 不可 strings 搜到）
@@ -179,8 +179,10 @@ fi
 # ── T3 二级锁箱 ──
 if python3 "$LOCK" libnc.so libnc.so --lock-head >l2.log 2>&1; then
     ok "T3 二级锁箱成功"
-    [ "$(sec_size .ncks)" = 104 ] && ok "T3 .ncks 104 字节" \
-        || bad "T3 .ncks 大小 $(sec_size .ncks) != 104"
+    _EXP=$(sed -n 's/^#define NC_STUB_SIZE[[:space:]]*\([0-9]*\).*/\1/p' \
+           "$ROOT/scripts/sigcheck/src/nc_guard_layout.h")
+    [ "$(sec_size .ncks)" = "$_EXP" ] && ok "T3 .ncks ${_EXP} 字节" \
+        || bad "T3 .ncks 大小 $(sec_size .ncks) != ${_EXP}（layout.h NC_STUB_SIZE）"
 else
     bad "T3 二级锁箱失败"; tail -20 l2.log >&2; exit 1
 fi

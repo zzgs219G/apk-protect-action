@@ -112,11 +112,21 @@ def _load_layout_contract():
             r'#define\s+(NC_SEED_[A-Z_]+_INIT)\s*\\?\s*\{([^}]*)\}', text):
         vals = [int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]+)', m.group(2))]
         out[m.group(1)] = bytes(vals)
+    # XOR 碎片表（2026-10-21）：同跨行形态。与非 INIT 数组的区别：
+    # 这是"逻辑字节 i 取哪个碎片"的映射表，值为十进制小整数。
+    for m in re.finditer(
+            r'#define\s+(NC_XOR_FRAG_INIT)\s*\\?\s*\{([^}]*)\}', text):
+        vals = [int(x) for x in re.findall(r'\d+', m.group(2))]
+        out[m.group(1)] = bytes(vals)
+    # 碎片区契约（layout.h → 锁箱器，T20 对拍用）
+    for m in re.finditer(r'#define\s+(NC_OFF_FRAGS)\s+(\d+)', text):
+        out[m.group(1)] = int(m.group(2))
 
     required = ['NC_SEC_CODE', 'NC_SEC_CONST', 'NC_SEC_HEAD', 'NC_SEC_HEADRO',
                 'NC_SEC_SLOT', 'NC_SEC_STUBSLOT',
                 'NC_SLOT_SIZE', 'NC_STUB_SIZE',
-                'NC_SEED_SLOT_INIT', 'NC_SEED_STUB_INIT']
+                'NC_SEED_SLOT_INIT', 'NC_SEED_STUB_INIT',
+                'NC_XOR_FRAG_INIT', 'NC_OFF_FRAGS']
     missing = [k for k in required if k not in out]
     if missing:
         raise ValueError(
@@ -972,6 +982,45 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     wrapped = bytes(b ^ XOR_KEY[i % len(XOR_KEY)] for i, b in enumerate(k_stub))
     wrapped_mac = bytes(b ^ XOR_KEY[i % len(XOR_KEY)]
                         for i, b in enumerate(k_mac_head))
+    # 碎片区（2026-10-21）：XOR_KEY 的 4 个 uint16，构建期随机生成。
+    # ⚠️ 碎片的【逻辑序】必须与 C 侧 ncg_xor_key 的读取规则一致：
+    #    C 侧按 NC_XOR_FRAG 查表 + 高低位规则拼回——但查表本身在 C 侧
+    #    仍以常量表存在（.rodata 的 8 字节表，见复盘报告"已摸清"）。
+    #    本处直接按"逻辑字节 i 的真实值"生成随机碎片，并同步随机化
+    #    查表（NCG_XOR_FRAG 表也在 .rodata——它必须与碎片配套！）
+    #    ⚠️⚠️ 但 .rodata 表是【编译期】常量，锁箱器改不了它——
+    #    所以碎片必须【按 C 侧既定的查表规则】反推生成：
+    #    逻辑字节 i 取 frag[FRAG_TABLE[i]] 的低/高 8 位。
+    #    FRAG_TABLE = NC_XOR_FRAG（从 layout.h 抽取）。
+    #    锁箱器为每个逻辑字节随机挑一个"放置碎片"并填入对应槽位，
+    #    使拼回结果 == 原 XOR_KEY（与 C 侧运行期行为逐字节一致）。
+    frag_table = _LAYOUT.get('NC_XOR_FRAG_INIT')
+    if not frag_table or len(frag_table) != 8:
+        raise ElfError('NC_XOR_FRAG_INIT 缺失或长度异常——layout.h 被改坏？')
+    # 4 个碎片槽位，每个 uint16：低 8 位 = 逻辑字节 i<4，高 8 位 = 逻辑字节 i>=4
+    frag_slots = [None, None, None, None]   # [uint16 序号] = 16 位值
+    for logical, slot_idx in enumerate(frag_table):
+        target_byte = XOR_KEY[logical]
+        if logical < 4:
+            placed = frag_slots[slot_idx]
+            lo = target_byte
+            hi = (placed >> 8) if placed is not None else os.urandom(1)[0]
+            frag_slots[slot_idx] = (hi << 8) | lo
+        else:
+            placed = frag_slots[slot_idx]
+            hi = target_byte
+            lo = (placed & 0xFF) if placed is not None else os.urandom(1)[0]
+            frag_slots[slot_idx] = (hi << 8) | lo
+    # 未被引用的槽位（若查表有重复引用则全被占）填随机值
+    frag_bytes = b''.join(_s.pack('<H', v if v is not None else int.from_bytes(os.urandom(2), 'little'))
+                          for v in frag_slots)
+    # 自检：用 C 侧同款规则拼回，必须 == XOR_KEY
+    _verify = bytearray(8)
+    for logical, slot_idx in enumerate(frag_table):
+        v = _s.unpack('<H', frag_bytes[slot_idx*2: slot_idx*2+2])[0]
+        _verify[logical] = (v & 0xFF) if logical < 4 else ((v >> 8) & 0xFF)
+    if bytes(_verify) != XOR_KEY:
+        raise ElfError('碎片生成自检失败：拼回 != XOR_KEY（查表规则与生成不一致）')
     blob = (STUB_MAGIC + wrapped
             + _s.pack('<I', slot['addr'])
             + _s.pack('<I', head['addr'])
@@ -982,7 +1031,8 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
             + wrapped_mac
             + expect_mac_head
             + _s.pack('<I', head_ro['addr'])
-            + _s.pack('<I', 32))
+            + _s.pack('<I', 32)
+            + frag_bytes)
     assert len(blob) == _LAYOUT['NC_STUB_SIZE'], \
         ('stub blob %d != NC_STUB_SIZE %d（nc_guard_layout.h 与 C 侧 '
          'ncg_stub_slot[] 长度不一致；改一侧必须同步另一侧）'

@@ -83,12 +83,22 @@
  *   [64:96) expect_mac_head     HMAC-SHA256(k_mac_head, head 密文)
  *   [96:100) head_ro_addr       .ncxhr 段链接期虚拟地址
  *   [100:104) head_ro_size      该段字节数
+ *   [104:112) frag[4]           XOR_KEY 碎片（构建期随机，见 NC_OFF_FRAGS）
  *
  * 锁箱侧：so-section-lock.py lock_head() 的 blob 组装 + 两条 assert
  * 开箱侧：nc_guard_boot.c 明文 stub（ncg_stub_recover / ncguard_unlock）
  * C 侧段本体：nc_guard_boot.c 的 ncg_stub_slot[NC_STUB_SIZE]
  */
-#define NC_STUB_SIZE        104
+#define NC_STUB_SIZE        112   /* 2026-10-21 104→112：[104:112) 碎片区 */
+/* 碎片区（2026-10-21）：XOR_KEY 的 4 个 uint16，构建期随机生成。
+ * 为什么挪进 slot：原放 .data（ncg_frag_a/b/c/d volatile 常量），
+ * 攻击者 objdump 读 .data + 反汇编拼回逻辑即可重组（破解复盘实测
+ * "5 分钟拿到 XOR_KEY"）。挪进 slot 后：
+ *   · .data/.rodata 不再有真碎片（留诱饵，见 boot.c）
+ *   · 碎片每次构建随机（diff 两个 so 无法识别碎片）
+ *   · 与 wrapped_k_stub 同住 slot——攻击者必须先读懂 slot 布局
+ *     （壳的核心格式）才有重组输入，把"读常量"变成"读格式" */
+#define NC_OFF_FRAGS        104   /* [104:112) 4×uint16 碎片（随机）*/
 #define NC_OFF_CODE_ADDR    36   /* 代码自绑定 CRC 区间起始*/
 #define NC_OFF_CODE_LEN     40   /* 区间长度（字节）*/
 #define NC_OFF_K_MAC_HEAD   48   /* wrapped k_mac_head 起点*/
@@ -144,5 +154,7 @@ _Static_assert(NC_OFF_EXPMAC_HEAD + 32 <= NC_OFF_HEADRO_ADDR,
                "expect_mac_head 与 head_ro 字段重叠");
 _Static_assert(NC_OFF_K_MAC_HEAD + 16 <= NC_OFF_EXPMAC_HEAD,
                "k_mac_head 与 expect_mac_head 重叠");
+_Static_assert(NC_OFF_FRAGS + 8 <= NC_STUB_SIZE,
+               "碎片区溢出 .ncks slot");
 
 #endif /* _NC_GUARD_LAYOUT_H_ */
