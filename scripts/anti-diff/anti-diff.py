@@ -1,40 +1,33 @@
 #!/usr/bin/env python3
-"""anti-diff.py — 防对比混淆(anti-diff)模块 · 零字节改写版(变换 A+B+D+F)
+"""anti-diff.py — 防对比混淆(anti-diff)模块 · MVP(变换 A+B+C)
 
 【这是什么】
 攻击者手上同时有原版 APK 和处理过的 APK 时,反编译两份做逐文件 diff,
 被抽/被改的类"稀疏、可定位"——本模块给全量 smali 加一层**零语义无损**的
-结构噪声(标签重命名 / 类内块重排 / 局部寄存器重编号 / 恒等算术重编码),
-让 diff 全红,像"同一 App 的不同编译版本",而不是"被精确动过手"。
-
-【2026-10-20 重构:去掉体积增量,E/C 两个变换整体删除】
-实测(同一样本 简盒_signed_09_09_37_sign.apk,回编→再反编译→归一化对比):
-  * E(条件反折)+ C+(return 前插桩)合计 +20.8KB dex,占全模块 +70.8KB 的
-    主要部分;剩余的 ~50KB 是 C0 提升 .locals 后 C+/D 覆盖率暴涨的交互效应。
-  * D(局部寄存器重编号)单独即可产生 51.7 万行归一化差异、覆盖 11,516 个
-    方法,而它是**零字节**。
-  * A(标签重命名)往返后零存活——改了 13.7 万处,归一化后 0 行差异
-    (dex 不存标签名,反编译重新生成)。
-  * add⇄sub 等长替换往返后零存活(汇编到同一 dex 字节),与 F 有本质区别:
-    F 能活是因为 R8/D8 从不产出"乘 2 的幂"的 mul 形态。
-结论:防对比强度不该用体积换。D 做唯一主力,E/C 删除。
+结构噪声(标签重命名 / 类内块重排 / 方法入口垃圾指令),让 diff 全红,
+像"同一 App 的不同编译版本",而不是"被精确动过手"。
 
 【红线(开发文档 §2.2,绝不能破)】
   * 不改类名 / 方法名 / 字段名 / 方法签名 / 字段类型 / 字符串内容
   * 不注入死代码 / 死方法 / nop 填充 / 控制流平坦化
-  * 只动 smali 文本层"标签名、块顺序、寄存器编号、算术指令形态"——
+  * 只动 smali 文本层"注释、标签名、块顺序、入口垃圾指令"——
     dex 语义(方法/字段/类型/字符串表引用)一项都不许变
 
-【现存变换】
+【变换清单(level 1)】按主流程调用序(_process_method_block 内):
+  A 跳转标签重命名 → C0 .locals 提升 → D 寄存器重编号(主力)
+  → F 恒等算术重编码(可选,默认关) → E 条件反折 → C+ return 前插桩
+  方法级处理完再到类级:B 类内块重排。
+  另:C 入口垃圾指令【已下线】(_inject_junk_at_entry 函数保留、调用点注释掉)。
+  ⚠️ D/E/C+ 三个都仍在跑,勿据"已删除"的旧表述改动它们。
+  各变换的跳过规则见 README.md 的变换表,此处不重复。
+
   A 跳转标签重命名:方法内 :label_name 全部换成确定性随机名(:nc3f9 风格)。
     baksmali 生成的标签名局部唯一,换成等价随机名后 diff 必变,语义零变。
     跳过 <init>/<clinit>(执行顺序敏感,sigcheck/dcc 依赖)。
-    ⚠️ 实测往返后零存活,保留仅为"处理前 smali 文本层"的观感,
-    不贡献 MT 对比效果。
   B 类内块重排:一个类的多个 .method/.field 块按确定性随机序重排。
     跳过 <init>/<clinit>(必须紧跟 .class 声明,不能挪)与含 .annotation 的块。
     smali 允许方法任意顺序,DEX 无序;重排只改文本,引用全部按描述符解析。
-  D 局部寄存器重编号(主力):方法内局部寄存器 v0..vN 做确定性随机
+  D 局部寄存器重编号(覆盖增强):方法内局部寄存器 v0..vN 做确定性随机
     置换,dex 层每条指令的寄存器号真实变化,规则归一化无法抹平。
     硬约束(报错三十三):低/高双域(4-bit 指令只能寻址 v0..v15),
     /range 连续区间成员锁定不动,wide 对作整体单元、永不跨域拆分,
@@ -45,9 +38,16 @@
     硬约束(报错四十):替换只作用于指令操作数前段——`->`(方法/字段/
     注解引用)与 `"`(字符串字面量)之后永不改写;R8 混淆短名恰似寄存器
     token(如 ->v2(),曾被改写致 NoSuchMethodError)。
-    ⚠️ 2026-10-20 解放 try 门槛:D 只改寄存器编号,不增删指令、不改变量
-    生命周期,try-catch 边界对它无风险。此前它与 E/C 共用一道 has_try
-    判断,purely 因为 E/C 不敢碰 catch 块边界 —— 白扔了大量覆盖面。
+  E 条件反转 + 跳转链(阶段 2 增强):方法内的条件分支做"反折"——
+      if-eqz vX, :L      →    if-nez vX, :nc新
+                                goto :L
+                              :nc新
+    生成的指令真实落进 dex(if+goto 都是真实执行流,非 nop),MT/IDA 对比下
+    每个反折处都多出 1 条 goto 指令 + 新标签名;原目标标签定义行不动,
+    多分支引用同一标签也不受影响。语义零变(验证器可见的执行路径不变)。
+    跳过:含 try-catch 的方法(保守,不碰边界)、fall-through 恰为跳转
+    目标的分支(反折绕路无意义,还可能让 diff 工具一眼看穿模式)。
+    跳过 <init>/<clinit>(执行顺序敏感,sigcheck/dcc 依赖)。
   F 恒等算术重编码(零损耗):shl-int/lit8 vA, vB, k → mul-int/lit8
     vA, vB, 2^k 的确定性单向改写。两者同为 22b 格式
     (4 字节,等长零膨胀),32 位补码语义下 vB << k ≡ vB × 2^k(含负数与
@@ -56,9 +56,23 @@
     写移位量 k ∈ 0x1..0x6(2^k ≤ 0x40 才落回 mul 的 8 位字面量域),
     k=0 与 k>6
     原样保留。跳过 <init>/<clinit>(同 A)。
+  C 方法入口 + return 前垃圾指令(谨慎版·强化):仅当方法同时满足全部
+    硬条件才插:
+      - 不是 <init>/<clinit>
+      - 不是 native(dcc 抽走的,无方法体,天然跳过)
+      - 方法体内没有任何 .catchall/.catch(try-catch 边界禁止动)
+      - .locals ≥ 4(v0..v3 必为纯局部寄存器)
+    插入位置(打破"只插方法开头"的可识别模式):
+      - 方法入口 1~max_per_method 条(原行为)
+      - 每个 return 指令前 1~2 条;被 return 读取的寄存器(return vX /
+        return-wide vX 占 v 与 v+1)绝对排除,return-void 无限制
+    插入条只用 const/4 纯写,只写 v0..v3 局部寄存器,不改 .locals 值。
+    (报错三十二:曾含 move 自赋值——move 读源寄存器,而局部寄存器在方法
+    入口处可能从未初始化,ART verifier 直接 VerifyError 秒闪退,已移除。)
     C0 .locals 提升(覆盖增强):.locals N<4 的方法(R8 产物常见 0/1,
     无局部寄存器可用)提升到 4——smali pN 是虚拟参数名,汇编时自动重映射,
-    参数语义不变;提升后这些方法才有局部寄存器可置换。
+    参数语义不变;提升后这些方法才有 v0..v3 可插垃圾指令/可置换。
+    return 前的指令从方法入口可达,反编译器不会丢弃。
 
 【幂等】
   * 类文件一旦被处理,会在 .class 声明行下方写一行标记注释
@@ -86,6 +100,7 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))          # scripts/anti-diff → 仓库根
 
+
 def _load_module(name: str, rel_path: str):
     import importlib.util
     path = os.path.join(_ROOT, rel_path)
@@ -93,6 +108,7 @@ def _load_module(name: str, rel_path: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
 
 _INJECT = _load_module('inject_loadlib', 'scripts/inject/inject-loadlib.py')
 SMALI_DIR_RE = _INJECT.SMALI_DIR_RE
@@ -115,7 +131,9 @@ SKIP_CLASS_PREFIXES = (
     'org.commonmark.', 'io.ktor.', 'coil3.', 'moe.shizuku.',
 )
 
+
 _SMALI_DIR_PREFIX_RE = re.compile(r'^smali(?:_classes\d+)?/')
+
 
 def _class_desc_from_path(rel_path):
     """smali 相对路径 → 类描述符(如 smali/com/demo/A.smali → Lcom/demo/A;)。
@@ -126,6 +144,7 @@ def _class_desc_from_path(rel_path):
     no_ext = rel_path[:-len('.smali')] if rel_path.endswith('.smali') else rel_path
     no_ext = _SMALI_DIR_PREFIX_RE.sub('', no_ext)
     return 'L' + no_ext + ';'
+
 
 def _is_skip_class(rel_path):
     desc = _class_desc_from_path(rel_path)
@@ -160,6 +179,7 @@ _LABEL_REF_RE = re.compile(r'(?<![\w])(:[A-Za-z0-9_.$]+)\b')
 # "不改字符串内容",必须在文本层替换前把引号内区间整段保护起来。)
 _STRING_SPAN_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 
+
 def _replace_outside_strings(line, fn):
     """对一行做替换,但跳过所有双引号字符串字面量内的区间。
 
@@ -183,10 +203,12 @@ def _replace_outside_strings(line, fn):
         return protected[int(mm.group(1))]
     return re.sub(r'\x00(\d+)\x00', _unmask, out)
 
+
 def _is_label_token(tok: str) -> bool:
     """过滤掉 :array_0 这类被 packed-switch-data 用的伪标签名冲突之外,
     普通分支标签统一视为可重命名。"""
     return tok.startswith(':')
+
 
 # ── 标签重命名(变换 A)──────────────────────────────────────────────
 
@@ -254,6 +276,7 @@ def _rename_labels(method_lines, rng):
         out.append(_replace_outside_strings(ln, _do))
     return out, len(mapping)
 
+
 # ── 类内块重排(变换 B)──────────────────────────────────────────────
 
 def _split_member_blocks(lines):
@@ -310,8 +333,10 @@ def _split_member_blocks(lines):
             i += 1
     return header, blocks
 
+
 def _block_has_annotation(block_lines):
     return any(ln.strip().startswith('.annotation') for ln in block_lines)
+
 
 def _method_is_pinned(block_lines):
     """方法块是否"不许动":<init>/<clinit> 或 含 .annotation 的块。"""
@@ -323,6 +348,7 @@ def _method_is_pinned(block_lines):
         if ln.strip().startswith('.annotation'):
             return True
     return False
+
 
 def _reorder_blocks(blocks, rng):
     """对 member 块做确定性重排;pinned 的块钉在原地(保持原相对顺序与位置)。
@@ -357,6 +383,41 @@ def _reorder_blocks(blocks, rng):
     return out, len(movable_idx)
 
 
+# ── 方法入口垃圾指令(变换 C)────────────────────────────────────────
+
+def _method_first_code_index(method_lines):
+    """返回方法体内"第一条真实指令"的行号(跳过 .registers/.locals/.param/
+    .prologue/.line/标签/注释,以及**完整的 .annotation 块**)。
+
+    报错二十二式教训:.annotation...end annotation 是方法内的注解子块
+    (MethodParameters/Signature 等),块体是注解元素不是指令;旧实现只
+    按"跳过点开头行"推进,把垃圾指令插进了注解块中间 → smali 汇编报
+    "missing EQUAL"。必须整体跳过配对的 .annotation...end annotation。"""
+    depth = 0
+    for i, ln in enumerate(method_lines):
+        s = ln.strip()
+        if depth > 0:
+            if s.startswith('.annotation'):
+                depth += 1
+            elif s.startswith('.end annotation'):
+                depth -= 1
+            continue
+        if not s:
+            continue
+        if s.startswith('.annotation'):
+            depth = 1
+            continue
+        if s.startswith('.'):
+            # .registers/.locals/.param/.prologue/.line 等,仍跳过
+            continue
+        if s.startswith('#'):
+            continue
+        if _LABEL_DEF_RE.match(ln):
+            continue
+        return i
+    return -1
+
+
 def _method_registers(method_lines):
     for ln in method_lines:
         s = ln.strip()
@@ -367,6 +428,7 @@ def _method_registers(method_lines):
             except (IndexError, ValueError):
                 return -1
     return -1
+
 
 def _method_locals_count(method_lines):
     """返回 .locals N 的 N;.registers 模式返回 -1。
@@ -389,6 +451,7 @@ def _method_locals_count(method_lines):
             return -1
     return -1
 
+
 # 参数槽计数单一真相(报错七/红线 7):count_param_slots/max_param_index
 # 抽到 scripts/lib/lib-smali-params.py,anti-diff 独占该实现
 # (历史上 light-obf 也曾共用;该模块 2026-09 已下线删除),
@@ -397,13 +460,16 @@ _PARAMS_LIB = _load_module('lib_smali_params', 'scripts/lib/lib-smali-params.py'
 count_param_slots = _PARAMS_LIB.count_param_slots
 max_param_index = _PARAMS_LIB.max_param_index
 
+
 def _count_param_slots(method_sig):
     """兼容别名(报错七:本文件历史调用点统一走 lib 单一真相)。"""
     return count_param_slots(method_sig)
 
+
 def _max_param_index(method_lines):
     """兼容别名(报错七:本文件历史调用点统一走 lib 单一真相)。"""
     return max_param_index(method_lines)
+
 
 def _bump_locals(method_lines, method_sig=None):
     """把 .locals N < 4 的方法提升到 4,返回(新行列表, 是否提升)。
@@ -475,6 +541,188 @@ def _bump_locals(method_lines, method_sig=None):
             return method_lines, False
     return method_lines, False
 
+
+def _inject_junk_at_entry(method_lines, rng, max_per_method):
+    """满足全部硬条件时,在方法入口插 1~max_per_method 条垃圾指令。
+
+    安全模型(.locals 模式,真实包 100% 形态):
+      - v0..v3 是纯局部寄存器(Dalvik/ART 验证器强制:局部寄存器被读之前
+        必有写,方法开头覆盖它们不影响任何路径的语义);
+      - 参数在 pN(= 高端寄存器),完全不触碰;
+      - 覆盖后原有指令逐条不动 → try-catch 边界内的寄存器状态也不受影响
+        (但保守起见含 try 的方法仍跳过,见硬条件 1)。"""
+    # 硬条件 1:不能有 try-catch(保守:避免验证器对边界寄存器状态的重校验)
+    joined = '\n'.join(method_lines)
+    if _TRY_RE.search(joined):
+        return method_lines, 0
+    # 硬条件 2:.locals ≥ 4(v0..v3 全部是局部寄存器);
+    # .registers 模式返回 -1,直接跳过(低端寄存器可能是参数,不可覆盖)
+    n_locals = _method_locals_count(method_lines)
+    if n_locals < 4:
+        return method_lines, 0
+    # 定位第一条真实指令:插在它之前(所有声明行之后)
+    idx = _method_first_code_index(method_lines)
+    if idx < 0:
+        return method_lines, 0
+    ins = _junk_ins(rng, rng.randint(1, max_per_method))
+    # 插在第一条真实指令之前
+    new_lines = method_lines[:idx] + ins + method_lines[idx:]
+    return new_lines, len(ins)
+
+
+# ── 变换 E:条件反转 + 跳转链(阶段 2)──────────────────────────────
+
+# 条件零值分支(22t 格式,寄存器 + 标签)
+_COND_Z_RE = re.compile(r'^(\s*)(if-eqz|if-nez|if-ltz|if-gez|if-gtz|if-lez)\s+(v\d+|p\d+)\s*,\s*(:[A-Za-z0-9_.$]+)\s*$')
+# 条件双值分支(22t 格式)
+_COND_2RE = re.compile(r'^(\s*)(if-eq|if-ne|if-lt|if-ge|if-gt|if-le)\s+(v\d+|p\d+)\s*,\s*(v\d+|p\d+)\s*,\s*(:[A-Za-z0-9_.$]+)\s*$')
+
+_Z_INVERSE = {
+    'if-eqz': 'if-nez', 'if-nez': 'if-eqz',
+    'if-ltz': 'if-gez', 'if-gez': 'if-ltz',
+    'if-gtz': 'if-lez', 'if-lez': 'if-gtz',
+}
+_2_INVERSE = {
+    'if-eq': 'if-ne', 'if-ne': 'if-eq',
+    'if-lt': 'if-ge', 'if-ge': 'if-lt',
+    'if-gt': 'if-le', 'if-le': 'if-gt',
+}
+
+# return 指令形态:return-void / return[-wide|-object] vX
+_RETURN_RE = re.compile(r'^\s*return(?:-void|-wide|-object)?(?:\s+(v\d+|p\d+))?\s*$')
+
+
+def _invert_conditionals(method_lines, rng, max_per_method):
+    """变换 E:方法内条件分支反折(确定性选择,非全量)。
+
+    改写:
+      if-eqz vX, :L   →   if-nez vX, :nc新
+                          goto :L
+                        :nc新
+    原目标标签的定义行不动(可能被多个分支引用);新标签名走种子驱动
+    确定性随机,与其余变换一致。落进 dex 的是 1 条真实 goto 指令。"""
+    # 逐行扫描,收集可反折的分支(带行号)
+    candidates = []
+    n = len(method_lines)
+    for i, ln in enumerate(method_lines):
+        m = _COND_Z_RE.match(ln) or _COND_2RE.match(ln)
+        if not m:
+            continue
+        target = m.groups()[-1]
+        # fall-through 恰为跳转目标:反折产生 goto :target 紧跟 :target
+        # 定义,纯绕路且模式明显 → 跳过
+        if i + 1 < n and method_lines[i + 1].strip() == target + ':':
+            continue
+        candidates.append(i)
+    if not candidates:
+        return method_lines, 0
+    n_flip = min(len(candidates), rng.randint(1, max_per_method))
+    picks = set(rng.sample(candidates, n_flip))
+    used_names = set()
+    out = []
+    flips = 0
+    for i, ln in enumerate(method_lines):
+        if i not in picks:
+            out.append(ln)
+            continue
+        m = _COND_Z_RE.match(ln) or _COND_2RE.match(ln)
+        if not m:
+            out.append(ln)
+            continue
+        groups = m.groups()
+        op = groups[1]
+        while True:
+            new_lab = ':nc' + ''.join(rng.choice('0123456789abcdef') for _ in range(6))
+            if new_lab not in used_names:
+                used_names.add(new_lab)
+                break
+        if op in _2_INVERSE:
+            indent, op2, a, b, target = groups
+            inverse = _2_INVERSE[op2]
+            out.append(f'{indent}{inverse} {a}, {b}, {new_lab}')
+        else:
+            indent, opz, a, target = groups
+            inverse = _Z_INVERSE[opz]
+            out.append(f'{indent}{inverse} {a}, {new_lab}')
+        out.append(f'{indent}goto {target}')
+        # 新标签定义行不带尾冒号(smali 3.x 解析器对 ":label:" 尾冒号形态
+        # 在"后续紧跟指令"时解析炸:报 no viable alternative;真实
+        # baksmali 产物 100% 无尾冒号,保持同构)
+        out.append(f'{indent}{new_lab}')
+        flips += 1
+    return out, flips
+
+
+def _insert_before_returns(method_lines, rng, max_per_method):
+    """变换 C 强化:每个 return 指令前插 1~max_per_method 条垃圾指令。
+
+    排除被 return 读取的寄存器(return vX / return-wide vX 占 v 与 v+1);
+    return-void 不读任何寄存器,全部 v0..v3 可用。插在 return 前的指令
+    从方法入口可达,反编译器(baksmali)不会丢弃 → 真实落进 dex。"""
+    out = []
+    inserted = 0
+    # 硬条件:.locals ≥ 4 才能保证 v0..v3 全是纯局部寄存器。
+    # 真实包教训(首次回编往返验证抓出):漏掉此门槛时,.locals 2 的方法
+    # 里 v2/v3 是参数寄存器(p0/p1),垃圾指令直接覆盖 this/参数 → 语义
+    # 被破坏。与入口插桩共用同一安全模型。
+    if _method_locals_count(method_lines) < 4:
+        return method_lines, 0
+    for ln in method_lines:
+        m = _RETURN_RE.match(ln)
+        if m:
+            reg = m.group(1)
+            if reg is None:
+                # return-void:不读任何寄存器,v0..v3 全部可写
+                pool = _junk_pool()
+            elif reg.startswith('v'):
+                # vN:return 读取 vN(ban 掉);return-wide 还读伴生 vN+1。
+                # 历史教训:此处曾把集合方向写反(排除"其余全部"导致插的
+                # 恰恰全是返回寄存器,直接覆盖返回值),probe 复测抓出。
+                banned = {reg}
+                if '-wide' in ln:
+                    banned.add('v' + str(int(reg[1:]) + 1))
+                pool = _junk_pool(banned)
+            else:
+                # pN 形态只是 baksmali 的参数视图,反编译产物中 return
+                # 始终以 vN 出现;防御性兜底:全部封禁(只剩 const 之外的
+                # 空池 → 不插),等价于跳过该处
+                pool = []
+            ins = _junk_ins(rng, rng.randint(1, max_per_method), pool)
+            out.extend(ins)
+            inserted += len(ins)
+        out.append(ln)
+    return out, inserted
+
+
+def _junk_pool(banned=frozenset()):
+    """构造垃圾指令池:只写 v0..v3 局部寄存器,排除 banned。
+
+    报错三十二(真实包 classes.dex 闪退实证):池中原含 `move r, r` 自赋值
+    ——move 会**读取**源寄存器,而 ".locals ≥ 4" 只保证 v0..v3 是局部寄存器,
+    **不保证已初始化**:方法入口处它们可以从未被写过(dex 层 13 处实证)。
+    ART verifier 读到未初始化寄存器直接拒绝整个方法 → VerifyError 秒闪退。
+    修复:垃圾指令只保留 const/4 纯写形态(const 对目标寄存器是"先定义后
+    使用",不读任何源寄存器);move 自赋值彻底移除,并加断言防回归。"""
+    pool = []
+    for i in range(4):
+        r = f'v{i}'
+        if r in banned:
+            continue
+        pool.append(f'    const/4 {r}, 0x0')
+        pool.append(f'    const/4 {r}, 0x1')
+    return pool
+
+
+def _junk_ins(rng, count, pool=None):
+    """从池中确定性随机选 count 条垃圾指令。"""
+    if pool is None:
+        pool = _junk_pool()
+    count = min(count, len(pool))
+    return [rng.choice(pool) for _ in range(count)]
+
+
+# ── 变换 F:恒等算术重编码(零损耗)─────────────────────────────────
+
 # 仅匹配 shl-int/lit8 的 22b 三操作数形态:目标 vA、源 vB、移位量 #+CC。
 # 恒等对应:mul-int/lit8 vA, vB, 2^k(22b 同为 4 字节;32 位补码语义下
 # vB << k ≡ vB × 2^k,含负数与溢出回绕,数学恒等)。R8 强度削减把"乘 2
@@ -488,6 +736,7 @@ def _bump_locals(method_lines, method_sig=None):
 # 恒等替代只有 add 自身,不存在正确的 rsub 对应 → 整体换成 shl⇄mul。
 _SHL_LIT8_RE = re.compile(
     r'^(\s*)shl-int/lit8\s+(v\d+|p\d+)\s*,\s*(v\d+|p\d+)\s*,\s*(-?0x[0-9a-fA-F]+)\s*$')
+
 
 def _reencode_shl_mul(method_lines, rng):
     """变换 F:shl-int/lit8 vA, vB, k → mul-int/lit8 vA, vB, 2^k(单向)。
@@ -514,6 +763,7 @@ def _reencode_shl_mul(method_lines, rng):
         else:
             out.append(ln)
     return out, n
+
 
 # ── 变换 D:局部寄存器重编号(阶段 2 增强)──────────────────────────
 
@@ -542,6 +792,7 @@ _INT_FLOAT_TO_WIDE = re.compile(r'^(int|float)-to-(long|double)$')
 # invoke 行:op {寄存器列表}, 方法引用(参数描述符)返回类型
 _INVOKE_RE = re.compile(
     r'^\s*(invoke-[a-z0-9/]+)\s+\{([^}]*)\}\s*,\s*[^\s(]+\(([^)]*)\)')
+
 
 def _param_slot_list(desc):
     """把参数描述符展开为槽列表,如 '(JLjava/lang/String;D)V' → [2, 1, 2]。
@@ -577,6 +828,7 @@ def _param_slot_list(desc):
             i += 1
     return out
 
+
 def _collect_invoke_wide_pairs(line):
     """返回 invoke 指令传入的 wide 参数寄存器对集合。
 
@@ -611,6 +863,8 @@ def _collect_invoke_wide_pairs(line):
                     pairs.add((a, a + 1))
         idx += s
     return pairs
+
+
 
 def _wide_operand_bases(name, regs):
     """返回该指令中**全部** 64 位操作数的基址集合(含 dst 与所有 src)。
@@ -690,6 +944,7 @@ _RANGE_REG_RE = re.compile(r'(\{[^}]*\})')
 # [vp]\d+ 全部是真寄存器。
 _MASK_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\[?L[^;"\s]*;')
 
+
 def _mask_refs(s):
     """把字符串字面量与类型描述符掩码为 \\x00N\\x00 占位符。
 
@@ -703,10 +958,12 @@ def _mask_refs(s):
 
     return _MASK_RE.sub(_m, s), parts
 
+
 def _unmask_refs(s, parts):
     for i, part in enumerate(parts):
         s = s.replace(f'\x00{i}\x00', part)
     return s
+
 
 def _collect_wide_pairs(method_lines):
     """收集方法内所有 wide 寄存器对(vN 与 vN+1)。
@@ -750,6 +1007,7 @@ def _collect_wide_pairs(method_lines):
             pairs.add((b, b + 1))
     return pairs
 
+
 def _operand_regs(s):
     """按文本顺序解析指令操作数寄存器;pN 记 None(位置占位,值不可见)。
 
@@ -768,6 +1026,7 @@ def _operand_regs(s):
     for m in re.finditer(r'\b([vp])(\d+)\b', head):
         out.append(int(m.group(2)) if m.group(1) == 'v' else None)
     return out
+
 
 def _collect_range_blocks(method_lines):
     """收集 /range 指令的连续寄存器区间列表 [(start, end), ...]。
@@ -788,6 +1047,7 @@ def _collect_range_blocks(method_lines):
             a, b = min(regs), max(regs)
             blocks.append((a, b))
     return blocks
+
 
 def _collect_low_reg_set(method_lines):
     """收集 4-bit 寄存器指令(35c invoke / 12x /2addr / 11n const/4 等)
@@ -817,6 +1077,7 @@ def _collect_low_reg_set(method_lines):
                                                   'rem-')):
             low.update(int(x) for x in re.findall(r'\bv(\d+)\b', s))
     return low
+
 
 def _permute_registers(method_lines, rng):
     """变换 D:方法内局部寄存器 v0..vN 做确定性随机置换。
@@ -995,21 +1256,24 @@ def _permute_registers(method_lines, rng):
             _REG_TOKEN_RE.sub(_sub, masked[:cut]) + masked[cut:], parts))
     return out, True
 
+
+
+
 def _method_name(block_lines):
     first = block_lines[0].strip() if block_lines else ''
     # .method ... name(args)ret
     m = re.search(r'\s([A-Za-z0-9_.$<>]+)\(', first)
     return m.group(1) if m else ''
 
+
 def _method_is_native(block_lines):
     return any(' native ' in ln or ln.rstrip().endswith(' native')
                for ln in block_lines[:1])
 
-def _process_method_block(block_lines, rng, enable_f=False):
-    """对一个 .method 块做 A+B+D+F。返回(新块, 改动计数)。
 
-    注:2026-10-20 起 max_per_method / max_cond_flip 两个参数已移除——
-    它们原先只服务 C+/E,两变换已删除。CLI 侧同步见 main()。"""
+def _process_method_block(block_lines, rng, max_per_method, max_cond_flip,
+                          enable_f=False):
+    """对一个 .method 块做 A(+C+E+F)。返回(新块, 改动计数)。"""
     changes = 0
     lines = block_lines
     # 变换 A:标签重命名(<init>/<clinit> 跳过)
@@ -1017,27 +1281,25 @@ def _process_method_block(block_lines, rng, enable_f=False):
     if name not in _PIN_METHOD_NAMES:
         # 只处理方法体(去掉 .method 行与 .end method 行)
         body = lines[1:-1]
+        # 方法级 try 门槛:含 try-catch 的方法一律不做 E/C(标签重命名 A
+        # 仍做,它不增删指令、不改偏移)。真实包抽样:含 try 方法占相当
+        # 比例,R8 优化后的 catch 块边界与寄存器状态耦合,保守跳过。
+        has_try = bool(_TRY_RE.search('\n'.join(body)))
         new_body, n = _rename_labels(body, rng)
         if n:
             lines = [lines[0]] + new_body + [lines[-1]]
             changes += n
-        # 变换 D/F:零字节改写,不受 try-catch 门槛限制。
-        # ⚠️ 2026-10-20 重构:E(条件反折)+ C+(return 前插桩)已整体删除——
-        #    实测它们合计贡献 +20.8KB dex 体积,而 D 单独即可产生 51.7 万行
-        #    归一化差异(回编→再反编译往返实测,同一样本),且零字节。
-        #    体积与强度不再绑定,E/C 的投入产出比不成立。
-        #    D 只改寄存器编号,不增删指令、不改变量生命周期,try-catch 边界
-        #    对它无风险;此前它与 E/C 共用一道 has_try 门槛,purely 因为
-        #    E/C 不敢碰 catch 块边界 —— 白扔了大量覆盖面。现已解放。
-        if not _method_is_native(lines):
-            # 变换 C0:.locals < 4 提升到 4(为 D 扩大覆盖面;.locals 0/1
-            # 的方法在真实包占 54%,提升后才有局部寄存器可置换)
+        if not has_try and not _method_is_native(lines):
+            # 变换 C0:.locals < 4 提升到 4(为 C/D 扩大覆盖面;.locals 0/1
+            # 的方法在真实包占 54%,提升后才有局部寄存器可插垃圾/可置换)
             body = lines[1:-1]
             new_body, nb = _bump_locals(body, lines[0])
             if nb:
                 lines = [lines[0]] + new_body + [lines[-1]]
                 changes += 1
-            # 变换 D:局部寄存器重编号
+            # 变换 D:局部寄存器重编号(在 E/C 之前:E/C 插入的垃圾指令
+            # 用 v0..v3 局部寄存器,若在 D 之后再插,v0..v3 依然指向局部区,
+            # 安全;D 先做能让 E/C 的新指令也落在置换后的坐标系,增加噪声)
             body = lines[1:-1]
             new_body, nd = _permute_registers(body, rng)
             if nd:
@@ -1053,6 +1315,21 @@ def _process_method_block(block_lines, rng, enable_f=False):
                 if nf:
                     lines = [lines[0]] + new_body + [lines[-1]]
                     changes += nf
+            # 变换 E:条件反折(在标签改名之后做:新标签不在 mapping 里,
+            # 原目标标签引用已同步改写;fall-through 判定基于新标签名,一致)
+            body = lines[1:-1]
+            new_body, ne = _invert_conditionals(body, rng, max_cond_flip)
+            if ne:
+                lines = [lines[0]] + new_body + [lines[-1]]
+                changes += ne
+            # 变换 C 强化:return 前插垃圾指令(固定 1 条,用户拍板 2026-09:
+            # "返回前插一条就可以了"——原 1~max_per_method 随机上限砍到 1,
+            # 体积收益优先;返回寄存器 ban 名单/纯写池安全模型不变)
+            body = lines[1:-1]
+            new_body, nr = _insert_before_returns(body, rng, 1)
+            if nr:
+                lines = [lines[0]] + new_body + [lines[-1]]
+                changes += nr
             # 变换 C:入口垃圾指令(已下线,用户拍板 2026-09:"方法开头插
             # 1~3 条没什么必要"——return 前插桩已打破"只插方法开头"的可
             # 识别模式(README 变换 C+ 的动机),入口桩删去不影响全红效果,
@@ -1065,9 +1342,10 @@ def _process_method_block(block_lines, rng, enable_f=False):
             #     changes += n2
     return lines, changes
 
+
 # ── 类文件级处理 ───────────────────────────────────────────────────
 
-def process_file(path, rng, enable_f=False):
+def process_file(path, rng, max_per_method, max_cond_flip=3, enable_f=False):
     with open(path, 'r', encoding='utf-8') as f:
         text = f.read()
     if CLASS_MARK in text:
@@ -1080,7 +1358,8 @@ def process_file(path, rng, enable_f=False):
     new_blocks = []
     for kind, blk in blocks:
         if kind == 'method':
-            new_blk, ch = _process_method_block(blk, rng, enable_f)
+            new_blk, ch = _process_method_block(blk, rng, max_per_method,
+                                                max_cond_flip, enable_f)
             # 拆分 A/C 计数由 _process_method_block 内部合并,这里只记总
             new_blocks.append((kind, new_blk))
             total_a += ch  # 合并计数(标签数+垃圾指令数),报告用
@@ -1103,6 +1382,7 @@ def process_file(path, rng, enable_f=False):
             f.write(new_text)
     return total_a, 0, n_moved, False
 
+
 # ── 种子 ──────────────────────────────────────────────────────────
 
 def derive_seed(root):
@@ -1122,6 +1402,7 @@ def derive_seed(root):
             h.update(b'\0')
     return h.digest()[:16]
 
+
 def collect_smali_files(root):
     files = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -1134,12 +1415,17 @@ def collect_smali_files(root):
                 files.append(os.path.join(dirpath, fn))
     return files
 
+
 def main(argv):
     ap = argparse.ArgumentParser(description='anti-diff 防对比混淆(MVP)')
     ap.add_argument('decompiled', help='apktool 解包目录')
     ap.add_argument('--seed-hex', default='', help='固定随机种子(hex)')
     ap.add_argument('--level', type=int, default=1, choices=[1],
                     help='变换等级(目前只有 1 = MVP)')
+    ap.add_argument('--max-per-method', type=int, default=3,
+                    help='变换 C 单方法/单 return 最多插入条数(默认 3)')
+    ap.add_argument('--max-cond-flip', type=int, default=3,
+                    help='变换 E 单方法最多反折条件分支数(默认 3,阶段 2)')
     ap.add_argument('--enable-f', action='store_true', default=False,
                     help='启用变换 F(shl⇄mul 恒等重编码;流水线已固定传入——'
                          '原 antidiff.reencode 子复选框已下线,变换 F 并入模块本体;'
@@ -1172,7 +1458,8 @@ def main(argv):
         if _is_skip_class(rel):
             n_excluded += 1
             continue
-        a, c, moved, skipped = process_file(p, rng, args.enable_f)
+        a, c, moved, skipped = process_file(p, rng, args.max_per_method,
+                                            args.max_cond_flip, args.enable_f)
         if skipped:
             n_skipped += 1
             continue
@@ -1186,6 +1473,7 @@ def main(argv):
           f' 标签/垃圾指令/条件反折改动 {total_ac} 处,'
           f' 块重排移动 {total_moved} 块')
     return 0
+
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1:]))
