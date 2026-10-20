@@ -232,8 +232,14 @@ static void siglog_c(int prio, lsg_id_t id, const char *detail) {
  * lsg_s 始终可见（宿主测试由 test-lsgs-strings.sh 生成真实的密文表，
  * 不是空壳）。此前误写了一个不存在的 SIGLOG_HAVE_LSGS 宏做 #ifdef，
  * 已删除——本仓库严禁臆造未定义的宏（AGENTS.md 边界条款）。 */
-static const unsigned char *sig_block_magic(unsigned char buf[16]) {
-    return (const unsigned char *)lsg_s(LSGS_BLK_MAGIC2, (char *)buf, 16);
+/* ⚠️ buf 必须 ≥ 17 字节（16 字节 magic + 1 字节 NUL）。
+ *   2026-10-20 曾传 16 → lsg_decode 判 "m->len+1 > buflen" 永远失败
+ *   → 返回 NULL → 所有正常包被判"无签名块" → 全量误杀闪退
+ *   （真机 tombstone 2026-10-21 实锤：apksigner verify v2/v3 全过、
+ *   我们的解析器 100% 失败）。教训：lsg_s 的语义是"C 字符串"，
+ *   缓冲必须按 len+1 给——与 snprintf 的 NUL 语义同款。 */
+static const unsigned char *sig_block_magic(unsigned char buf[17]) {
+    return (const unsigned char *)lsg_s(LSGS_BLK_MAGIC2, (char *)buf, 17);
 }
 #define V2_BLOCK_ID  0x7109871au
 #define V3_BLOCK_ID  0xf05368c0au
@@ -633,7 +639,7 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
      * strings 一条命令即中 "APK Sig Block 42"）。缓冲区开在栈上、
      * 每次比较现解——本函数只在构造期跑一次，成本可忽略。 */
     {
-        unsigned char want[16];
+        unsigned char want[17];   /* 16 magic + 1 NUL（lsg_s 是 C 字符串语义，见上） */
         const unsigned char *wm = sig_block_magic(want);
         if (wm == NULL || memcmp(magic, wm, 16) != 0) return -1; /* 无 v2/v3 签名 */
     }
