@@ -71,8 +71,9 @@ fi
 # sig_check.c 一并编入全家桶(实际流水线组合),外围串零泄漏一体验证
 if $CC -shared -fPIC -O2 -DSIGCHECK_HOST_TEST -DNCLINK_HOST_TEST -I"$T" \
       "$T/sig_check.c" "$T/env_check.c" -o "$T/libtest.so" -llog -fvisibility=hidden \
-      -ffunction-sections -fdata-sections -Wl,--gc-sections 2>"$T/c.log"; then
-    ok "sig_check+env_check 全家桶严格模式编译通过(-O2 --gc-sections)"
+      -ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,--strip-all \
+      2>"$T/c.log"; then
+    ok "sig_check+env_check 全家桶严格模式编译通过(-O2 --gc-sections --strip-all，与生产同款)"
     leak=0
     for s in "frida-agent" "frida-gadget" "frida-inject" "gadget_frida" \
              ":69A2" ":69A3" "libxposed" "lspd" "lsposed" "edxposed" \
@@ -87,6 +88,46 @@ if $CC -shared -fPIC -O2 -DSIGCHECK_HOST_TEST -DNCLINK_HOST_TEST -I"$T" \
     done
     if [[ $leak -eq 0 ]]; then
         ok "明文零泄漏:26 个特征/外围串在 so 里全部零命中(strings 扫描视角)"
+    fi
+
+    # ⑥ 未登记的敏感串扫描（2026-10-20 加）
+    # 为什么单列：上面的断言只查【已登记】的 26 条——它保证"登记过的没漏"，
+    # 但保证不了"没登记的敏感串不泄露"。实例：sig_check.c 的
+    # SIG_BLOCK_MAGIC 是 16 字节【数据数组】而非字符串字面量，LSGS 扫描
+    # 扫不到它，于是 "APK Sig Block 42" 在 .rodata 明文躺到本轮才被发现
+    # （复测报告 §2.2 的泄底项之一）。同类风险还有：日志格式串、路径常量。
+    #
+    # 做法：列一批"只要出现就等于暴露防御意图"的词，命中即红。
+    # ⚠️ 只收【真敏感】词：base.apk / /proc/self 这类是 Android 标准文件名，
+    #    任何读 APK 的代码都有，收了会误报（已实测：6 处，全是 snprintf
+    #    路径常量，不暴露意图），故不入清单。
+    sens_re='APK Sig Block|Xposed|frida|Frida|magisk|Magisk|zygisk|substrate|TracerPid|memfault'
+    # ⚠️ 必须加 `|| true`：本脚本 set -euo pipefail，而 grep 无命中返回 1，
+    #    不加会让【赋值语句本身】失败并终止整个脚本 —— 两个分支都跑不到，
+    #    这条断言变成"从不执行的死代码"（2026-10-20 实测踩过：
+    #    第一次加完后整个脚本在赋值行静默退出，后面什么都不打印）。
+    # ⚠️ 必须用二进制精确搜，不能用 strings：
+    #   2026-10-20 实测，"APK Sig Block 42" 在 .rodata 里明明连续存在，
+    #   但 strings -n 4 因相邻数据的分词边界不同而【漏报】——
+    #   我用 strings 做"修复前/修复后"对比时两边都显示 0，差点误判修复无效。
+    #   改为 python 按原始字节序列搜，不受分词影响。
+    # ⚠️ 同样必须加 `|| true`：set -euo pipefail 下 grep 无命中返回 1，
+    #    会让赋值语句本身失败并终止整个脚本，两个分支都跑不到。
+    hits=$(python3 - "$T/libtest.so" <<'PYSENS' || true
+import sys
+pats = [b'APK Sig Block', b'Xposed', b'xposed', b'frida', b'Frida',
+        b'magisk', b'Magisk', b'zygisk', b'substrate', b'TracerPid',
+        b'memfault']
+d = open(sys.argv[1], 'rb').read()
+found = sorted({p.decode() for p in pats if p in d})
+print('\n'.join(found))
+PYSENS
+)
+    if [ -z "$hits" ]; then
+        ok "未登记敏感串零命中（APK Sig Block / frida / xposed / magisk / TracerPid 等）"
+    else
+        bad "未登记敏感串泄露（这些词不在 LSGS 清单里，故上面的断言查不到）:"
+        echo "$hits" | sed 's/^/        /' >&2
     fi
 else
     bad "so 编译失败"; head -10 "$T/c.log"

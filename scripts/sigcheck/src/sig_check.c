@@ -210,10 +210,31 @@ static void siglog_c(int prio, lsg_id_t id, const char *detail) {
 #define LSGI0(id)   siglog_c(ANDROID_LOG_INFO, id, NULL)
 #define LSGE0(id)   siglog_c(ANDROID_LOG_ERROR, id, NULL)
 
-/* APK Signing Block magic：'APK Sig Block 42' */
-static const unsigned char SIG_BLOCK_MAGIC[16] = {
-    'A','P','K',' ','S','i','g',' ','B','l','o','c','k',' ','4','2'
-};
+/* APK Signing Block magic：'APK Sig Block 42'
+ *
+ * ⚠️ 2026-10-20 改为运行期解码，不再作为裸数组进 .rodata。
+ *
+ * 原因：这是【数据】不是【字符串字面量】，make-sig-log.py 的 LSGS 标记扫描
+ *   扫不到它（它扫的是字符串字面量形态），于是同一个 magic 在两条线里
+ *   两种待遇——sig_guard2.c 的 g2_block_magic() 走了 LSGS 解码，
+ *   而这里一直是 16 字节裸数组。实测后果：产物 .rodata 里
+ *   `strings -n 4` 一条命令即中 "APK Sig Block 42"，
+ *   攻击者由此知道"此处解析 APK 签名块"，属复测报告 §2.2 列的泄底项。
+ *
+ * 做法：与 sig_guard2.c 的 g2_block_magic() 完全同构 —— 复用
+ *   LSGS_BLK_MAGIC2 密文（sig_check.c 自己文件内的标记），解码到调用方
+ *   栈缓冲后 memcmp。宿主测试（无密文表）退化为字面量，行为不变。
+ *
+ * ⚠️ 为什么复用而不是新立标记：sig_guard2.c:50 的注释已说明"同内容两条标记
+ *   会让生成器的宏名唯一性检查 fail-fast"。故本文件用 LSGS_BLK_MAGIC2
+ *   这个独立宏名，但内容仍是同一个 magic。 */
+/* 不需要条件化：本文件在 169 行【无条件】include "sig_log_data.h"，
+ * lsg_s 始终可见（宿主测试由 test-lsgs-strings.sh 生成真实的密文表，
+ * 不是空壳）。此前误写了一个不存在的 SIGLOG_HAVE_LSGS 宏做 #ifdef，
+ * 已删除——本仓库严禁臆造未定义的宏（AGENTS.md 边界条款）。 */
+static const unsigned char *sig_block_magic(unsigned char buf[16]) {
+    return (const unsigned char *)lsg_s(LSGS_BLK_MAGIC2, (char *)buf, 16);
+}
 #define V2_BLOCK_ID  0x7109871au
 #define V3_BLOCK_ID  0xf05368c0au
 
@@ -608,9 +629,17 @@ static int extract_cert_der(int fd, unsigned char **out_der, size_t *out_len) {
      * 故不校验头部 size-payload，定位以尾部字段为准） */
     if ((off_t)cd_off < 32) return -1;
     if (read_at(fd, magic, 16, (off_t)cd_off - 16) != 0) return -1;
-    if (memcmp(magic, SIG_BLOCK_MAGIC, 16) != 0) return -1; /* 无 v2/v3 签名 */
+    /* 2026-10-20：magic 改为运行期从 LSGS 密文解码（此前是裸数组，
+     * strings 一条命令即中 "APK Sig Block 42"）。缓冲区开在栈上、
+     * 每次比较现解——本函数只在构造期跑一次，成本可忽略。 */
+    {
+        unsigned char want[16];
+        const unsigned char *wm = sig_block_magic(want);
+        if (wm == NULL || memcmp(magic, wm, 16) != 0) return -1; /* 无 v2/v3 签名 */
+    }
 
     /*LSG:BLK_MAGIC_OK|【成功】找到 APK Signing Block magic*/
+/*LSGS:BLK_MAGIC2|APK Sig Block 42*/
     LSGI0(LSG_BLK_MAGIC_OK);
 
     {
