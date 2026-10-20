@@ -27,8 +27,18 @@ APP_STL := c++_static
 # 为什么是显式宏而不是 __ANDROID__ 自动判断：宿主端任何一次"想验证段布局"
 # 的编译都会因为"标了段却没人解锁"而读到密文 → 假红。见 nc_link.c 的注释。
 APP_CPPFLAGS += -fvisibility=hidden -fno-ident -Oz -ffunction-sections -fdata-sections
+# ⚠️ 2026-10-21 加固 flag 补齐（白嫖清单）：
+#   · -fstack-protector-strong：NDK 默认弱版（只护含 char 数组的函数），
+#     strong 版把取用栈地址的函数全护上——密钥处理函数全是 uint8_t[]
+#     栈缓冲，恰是溢出靶面。
+#   · -mbranch-protection=standard（arm64 专用，见下方 TARGET 条件）：
+#     ARM64 PAC/BTI 硬件防御（armv8.3+/Android 12+）。PAC=返回地址签名
+#     （ROP 直接崩），BTI=分支目标认证（跳函数中间=SIGILL）。
+#     实测编入 54 条 paciasp/bti 指令，解锁链全通过。
 APP_CFLAGS   := -fvisibility=hidden -fno-ident -Oz -ffunction-sections -fdata-sections \
+                -fstack-protector-strong \
                 -DNC_GUARD_SECTIONED
+APP_CFLAGS.arm64 += -mbranch-protection=standard
 APP_PLATFORM := android-21
 APP_ABI := armeabi-v7a arm64-v8a
 EOF
@@ -75,7 +85,8 @@ EOF
 
 # so 加固(lib-ndk.sh 2026-10):丢弃未引用段 + 去符号表
 LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none \\
-                 -Wl,--strip-all
+                 -Wl,--strip-all \
+                 -Wl,-z,separate-code
 EOF
 
   # ── JNI 符号隐藏（2026-10-19，修实测报告 §1/§7.1）────────────────

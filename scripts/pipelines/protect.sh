@@ -495,6 +495,22 @@ repack_unpack "$WORK/decompiled" "$STEP5_APK"
 if [[ -d "$WORK/project/libs" ]]; then
   for so in "$WORK"/project/libs/*/libnc.so; do
     [[ -f "$so" ]] || continue
+    # ── .comment 段移除（2026-10-21，白嫖清单 #2——实为还债）──────
+    # -fno-ident 只去 C 编译器指纹（__FILE__ 等），管不住链接器/工具链
+    # 写进 .comment 的版本串（实测：两版 clang 精确版本号明文躺着）。
+    # 攻击者据此查该版本已知优化与漏洞行为——情报直接送上门。
+    # strip-all 不删 .comment（只删符号表），必须显式移除。
+    # ⚠️ 必须在锁箱【之前】：objcopy 重排段布局，锁箱后跑会破坏
+    #    slot 里已写好的链接期地址（sh_addr 失配 → 运行期基址计算崩）。
+    if command -v objcopy >/dev/null 2>&1; then
+      if objcopy --remove-section=.comment "$so" "$so" 2>/dev/null; then
+        echo "  [strip] .comment 已移除（工具链指纹归零）"
+      else
+        echo "  [strip] ⚠️ .comment 移除失败（objcopy 异常）——继续但不阻塞" >&2
+      fi
+    else
+      echo "  [strip] ⚠️ 无 objcopy，.comment 残留（工具链版本泄露）" >&2
+    fi
     # 一级锁箱：.ncx 代码段 + .ncxr 常量表段（共用 k_so/同一个 MAC）
     #
     # 2026-10-19 为什么是两段（实测报告 §8.1 的核心缺陷）：
