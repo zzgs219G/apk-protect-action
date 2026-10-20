@@ -33,6 +33,7 @@
 #   T20 C↔Python 契约常数跨语言对拍（段名/尺寸/偏移/magic seed）★ 2026-10-20
 #   T21 全仓段名字面量登记检测（防拼错/防新增未登记段名）★ 2026-10-20
 #   T22 二进制等价性（固定 sig_hash.h 后，改动不得改变产物字节）★ 2026-10-20
+#   T23 strip 真生效 + strip 后锁箱/开箱仍通（.symtab 归零）★ 2026-10-20
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -772,6 +773,61 @@ else
     skip "T22 未提供 NC_BASELINE_SO（基线产物），跳过"
 fi
 
+
+# ── T23 strip 真生效 + strip 后锁箱/开箱仍通 ─────────────────────
+# 背景（2026-10-20 实测的防御缺口）：
+#   lib-ndk.sh 的注释一直写着"strip 符号表"，但 LOCAL_LDFLAGS 里从来没有
+#   对应参数。后果：产物 .symtab 24KB / 957 个符号，ncg_frag_a/b/c/d
+#   （XOR_KEY 四碎片）与 NCG_XOR_FRAG（重组查表）的名字都在里面，
+#   攻击者 nm 一条命令即知"哪个是碎片、哪个是表"，15 行 Python 即可
+#   静态重组出完整 XOR_KEY → slot^XOR_KEY 得 k_stub → 解 .ncxh → 解 .ncx。
+#   碎片化把连续 8 字节从 .rodata 消掉了，但每个碎片都贴着名字，
+#   "提高重组成本"并未兑现。
+#
+# 本项断言两件事：
+#   ① lib-ndk.sh 里确实有 --strip-all（防"注释承诺了没做"再次发生）
+#   ② 用 --strip-all 重编后，两级锁箱仍成功 —— 证明锁箱器不依赖 .symtab
+#      （它只用 section header table，见 so-section-lock.py:853-859）
+if grep -q -- "--strip-all" "$ROOT/scripts/lib/lib-ndk.sh"; then
+    ok "T23 lib-ndk.sh 含 --strip-all（符号表真的会被去掉）"
+else
+    bad "T23 lib-ndk.sh 缺 --strip-all —— 注释承诺 strip 但参数不在，产物 .symtab 会泄露碎片符号名"
+fi
+
+# ⚠️ 必须先 cd 回 $WORK：T4/T5/T8 那段有 `cd "fake/$PKG"` 且未 cd 回来。
+#    若在此目录判断 `[ -f libnc.so ]` 会恒假 → 本项被静默跳过
+#    （"关键断言被静默跳过比失败更糟"——与文件头 T10 的教训同向）。
+cd "$WORK" || { echo "cd 回 WORK 失败" >&2; exit 2; }
+
+if [ -f libnc.so ] && [ -n "${APK:-}" ] && [ -f "$APK" ]; then
+    CF="-fPIC -shared -fvisibility=hidden -fno-ident -Oz \
+        -ffunction-sections -fdata-sections -DNC_GUARD_SECTIONED"
+    if clang $CF -I. nc_guard_boot.c nc_guard_probe.c nc_guard_jni.c \
+            nc_guard_key.c nc_link.c env_check.c sig_check.c \
+            -Wl,--gc-sections -Wl,--build-id=none -Wl,--strip-all \
+            -o libnc_stripped.so 2>strip.log; then
+        # ① strip 后 .symtab/.strtab 应归零
+        if [ "$(readelf -S libnc_stripped.so 2>/dev/null | grep -cE '\.symtab|\.strtab')" = "0" ]; then
+            ok "T23 strip 后 .symtab/.strtab 归零（碎片符号名不再可 nm）"
+        else
+            bad "T23 strip 后仍有符号表 —— --strip-all 未生效？"
+        fi
+        # ② strip 后两级锁箱仍成功（证明锁箱器不依赖 .symtab）
+        if python3 "$LOCK" libnc_stripped.so libnc_stripped.so \
+                --section ".ncx,.ncxr" --from-apk "$APK" >/dev/null 2>&1 \
+           && python3 "$LOCK" libnc_stripped.so libnc_stripped.so \
+                --lock-head >/dev/null 2>&1; then
+            ok "T23 strip 后两级锁箱仍成功（锁箱器只用段表，不依赖 .symtab）"
+        else
+            bad "T23 strip 后锁箱失败 —— 锁箱器疑似依赖 .symtab，strip 会破坏构建"
+        fi
+    else
+        skip "T23 strip 编译失败"; head -5 strip.log >&2
+    fi
+    rm -f libnc_stripped.so
+else
+    skip "T23 无 libnc.so 或缺 APK，跳过"
+fi
 
 echo
 echo "=== 结果: $PASS 通过, $FAIL 失败 ==="

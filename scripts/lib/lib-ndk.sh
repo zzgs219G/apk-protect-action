@@ -50,10 +50,32 @@ LOCAL_C_INCLUDES := \$(LOCAL_PATH) \$(LOCAL_PATH)/nc
 LOCAL_SRC_FILES := \$(SOURCES:\$(LOCAL_PATH)/%=%)
 EOF
   # so 加固:链接期丢弃未引用段(-ffunction/data-sections 配套),并 strip 符号表
+  #
+  # ⚠️⚠️ 2026-10-20：--strip-all 是【本次才真正加上的】。
+  #   本注释与下方 mk 注释一直都写着"strip 符号表"，但 LOCAL_LDFLAGS 里
+  #   从来没有对应参数——注释承诺了一件没做的事。后果（已实测复现）：
+  #     产物 .symtab 24KB / 957 个符号，`ncg_frag_a/b/c/d`（XOR_KEY 四碎片）
+  #     与 `NCG_XOR_FRAG`（重组查表）的名字都在里面。
+  #     攻击者 `nm` 一条命令即知"哪个是碎片、哪个是表"，15 行 Python 就能
+  #     静态重组出完整 XOR_KEY（7e31a50dc8924bf6），进而
+  #       slot[8:24] ^ XOR_KEY → k_stub → 解 .ncxh → unlock 本体 → 解 .ncx
+  #     全程不需要运行、不需要真机、不需要证书。
+  #   也就是说：碎片化确实把连续 8 字节密钥从 .rodata 里消掉了，但每个
+  #   碎片都贴着名字，"提高重组成本"这一点并未兑现。
+  #
+  # 为什么可以放心 strip：锁箱器（so-section-lock.py 的 lock/lock_head）
+  # 全程只用 section header table 的 sh_addr/sh_size，不碰 .symtab
+  # （见该文件 853-859 行注释）。strip 只删 .symtab/.strtab，
+  # 段名表 .shstrtab 与段表本身不动，锁箱/开箱契约不受影响。
+  #
+  # 反向纪律：绝不能为了"保留符号方便排查"而去掉 --strip-all ——
+  # 那会把 frida_port_probe / xposed_maps_probe 等探针名暴露进符号表，
+  # 等于免费送检测意图清单（protect.sh:519 与历史教训同向）。
   cat >> "$jni/Android.mk" <<EOF
 
 # so 加固(lib-ndk.sh 2026-10):丢弃未引用段 + 去符号表
-LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none
+LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none \\
+                 -Wl,--strip-all
 EOF
 
   # ── JNI 符号隐藏（2026-10-19，修实测报告 §1/§7.1）────────────────
