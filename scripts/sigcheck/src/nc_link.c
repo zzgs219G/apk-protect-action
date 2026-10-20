@@ -120,16 +120,36 @@ void nc_heartbeat_touch(void)
 
 /* watchdog 检查端(env_check.c 调用):
  * 返回 0 = 正常(未武装/宽限期内/保活窗口内),非 0 = 超时(该杀)。
- * 首喂宽限 90s(Xop 同款:冷启动重活),之后保活窗 25s
- * (≥ env_watchdog 的 20s 轮询周期,宁可稍宽不误杀)。 */
-/* 调试参数(2026-10-16 用户要求"5 秒附近闪退方便调试"):
- * ⚠️ 发布前必须改回正式值 GRACE=90000 / KEEPALIVE=25000——调试值意味着
- * 正常冷启动超过 5 秒的设备(低端机/加载重活)会被误杀。
  * 语义(2026-10-16 修复):武装点移到 so constructor——so 加载即倒计时,
  * N 秒内 Java 必须开始喂,否则视为 Java 壳被删 → 杀。
- * (旧版 armed 由首喂置位 → 删喂食调用 = 永久沉默,真机实证为盲区。) */
-#define NC_HB_FIRST_GRACE_MS   5000LL
-#define NC_HB_KEEPALIVE_MS     5000LL
+ * (旧版 armed 由首喂置位 → 删喂食调用 = 永久沉默,真机实证为盲区。)
+ *
+ * ── 参数(2026-10-21 改为构建期开关,根治"发布前忘记改回")──────────
+ *
+ * 历史教训:2026-10-16 为调试改成了 5s/5s,注释写"发布前必须改回
+ * GRACE=90000/KEEPALIVE=25000",但这个"必须"靠人记——一直停在调试值
+ * 没改回。5s 宽限意味着【冷启动超过 5 秒的设备(低端机/加载重活)会被
+ * 误杀】,且 5s 保活窗与 Guard.java 的 5s 喂食周期零余量(一次 GC 停顿
+ * 就死)。这类"参数忘了改回"靠注释提醒拦不住,只能靠结构。
+ *
+ * 现行结构:
+ *   默认(不带宏)     = 发布值 GRACE=90s / KEEPALIVE=25s
+ *                      90s 承接低端机冷启动;25s ≥ watchdog 的 20s 轮询
+ *                      周期(env_check.c env_watchdog),宁可稍宽不误杀,
+ *                      且相对 5s 喂食周期留了 5 倍余量。
+ *   -DNC_HB_DEBUG_FAST = 调试值 5s/5s("5 秒附近闪退方便调试")
+ *
+ * 【默认即发布值】是刻意的:CI 走 protect.sh → ndk_write_mk,不定义
+ * 该宏 → 物理上不可能再把调试值带进发布包。要快闪退,本地加宏,
+ * 忘了加宏的后果是"调试时死得慢",而不是"用户包误杀"——
+ * 把犯错成本从用户侧挪回开发者侧。 */
+#ifdef NC_HB_DEBUG_FAST
+#  define NC_HB_FIRST_GRACE_MS   5000LL
+#  define NC_HB_KEEPALIVE_MS     5000LL
+#else
+#  define NC_HB_FIRST_GRACE_MS  90000LL
+#  define NC_HB_KEEPALIVE_MS    25000LL
+#endif
 
 __attribute__((noinline))
 int nc_heartbeat_expired(void)
