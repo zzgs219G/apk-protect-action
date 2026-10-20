@@ -143,18 +143,39 @@ void nc_heartbeat_touch(void)
  * 该宏 → 物理上不可能再把调试值带进发布包。要快闪退,本地加宏,
  * 忘了加宏的后果是"调试时死得慢",而不是"用户包误杀"——
  * 把犯错成本从用户侧挪回开发者侧。 */
+/* ⚠️ 参数选型（2026-10-21 第二版，推翻 ca3fce1 的"发布 25s/调试 5s"方案）：
+ *
+ * 用户指出关键盲点：本项目的调试方式就是【拿 CI 发布包做逆向实验】
+ * （原始需求即"让 AI 静态分析消耗上去"，验证手段是重打包实测），
+ * 不存在"发布包/调试包"两种产物——宏开关对真实工作流无效。
+ *
+ * 重新推导后确认：保活窗【不需要为攻击者收紧】。
+ *   心跳超时是状态检测("喂食停了没")，不是一次性定时炸弹——
+ *   攻击者 patch 喂食后，早 5s 发现与晚 25s 发现，他没有可利用的
+ *   时间窗（发现即杀，杀前他干不了任何事）。延迟的真实成本全部
+ *   落在开发者调试体验上。
+ *   真正必须大的只有 FIRST_GRACE：那是防误杀（低端机冷启动慢），
+ *   与检测无关，只在"启动后第一次喂食前"生效。
+ *
+ * 故现行发布值（不再分调试/发布两套，一套走天下）：
+ *   FIRST_GRACE 90s —— 防误杀低端机冷启动，唯一必须大的
+ *   KEEPALIVE    8s  —— 对 Guard.java 的 5s 喂食周期留 1.6 倍余量
+ *                       （一次 GC 停顿/线程调度延迟不致死），
+ *                       调试时删喂食 ~8s 内 expired() 置位
+ *   -DNC_HB_DEBUG_FAST 仍保留：本地编 so 验证时可用 5s/5s，
+ *   但【不再必要】——发布包本身已达 ~13s 调试体感（见下）。
+ *
+ * 实际死期构成（配 env_check.c 的 watchdog 轮询 5s，见彼处注释）：
+ *   删喂食后到进程死 ≈ KEEPALIVE(8s) 内某刻 expired() 置位，
+ *   下一轮轮询(≤5s)读到 → 最坏 ~13s，典型 ~8-10s。
+ *   与旧调试配置(2s+5s=7s)接近，远好于 ca3fce1 的 25s+20s=45s。 */
 #ifdef NC_HB_DEBUG_FAST
 #  define NC_HB_FIRST_GRACE_MS   5000LL
 #  define NC_HB_KEEPALIVE_MS     5000LL
 #else
 #  define NC_HB_FIRST_GRACE_MS  90000LL
-#  define NC_HB_KEEPALIVE_MS    25000LL
+#  define NC_HB_KEEPALIVE_MS     8000LL
 #endif
-/* ⚠️ 调试延迟的真实构成（2026-10-21 补，此前只看了保活窗这一半）：
- *   实际"改签名/删喂食后到进程死"= watchdog 轮询周期 + 保活窗。
- *   watchdog 周期在 env_check.c（20s 发布 / 2s 调试），与本文件是两个参数。
- *   故调试提速必须【两处同时】用 NC_HB_DEBUG_FAST——本宏同时控制
- *   nc_link.c 的宽限/保活与 env_check.c 的轮询间隔，见下方说明。 */
 
 __attribute__((noinline))
 int nc_heartbeat_expired(void)
