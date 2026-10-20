@@ -48,6 +48,23 @@
 # 前置依赖（由 workflow 安装）: python3 + dex2c requirements、JDK 17、Android NDK、apktool
 set -euo pipefail
 
+# ── set -e 静默退出的诊断（2026-10-20 加，源自一次难查的 CI 红）─────────
+# 问题：protect.sh 里 set -e 让某条命令非零时【静默退出】，日志里没有任何
+#   Error/Traceback，只是凭空停在某行之后。实例：dex2c+sigcheck 组合下
+#   inject-javacheck.py 返回 2（native 壳跳过调用点，设计内行为），
+#   当时 529 行无保护 → set -e 直接杀掉流水线 → 日志停在"自适应命名"后，
+#   无任何线索，只能靠复现才定位到。
+# 修法：trap ERR 打出行号 + 命令 + 退出码，让"死在哪"始终可读。
+# ⚠️ 不改变任何执行逻辑，只加可观测性；且 ERR trap 只在 set -e 生效时触发，
+#    不会捕获 `if ! cmd` / `cmd || true` 这类显式处理过的失败。
+_guard_err() {
+    local rc=$? line=${1:-?}
+    echo "❌ protect.sh 异常退出: rc=$rc 行号=$line 命令=${BASH_COMMAND:-<unknown>}" >&2
+    echo "   （set -e 触发。若这是预期内的非致命返回，请用 'cmd || true' 或" >&2
+    echo "    'if ! cmd; then ...' 显式处理，别让它冒到 set -e）" >&2
+}
+trap '_guard_err $LINENO' ERR
+
 # ── 解析勾选（勾选顺序无关，执行顺序由下面 STEP 区硬编码） ────────────
 usage() {
   # 打印文件头部的注释块(第 2 行起、到第一条非注释行/代码前为止),
