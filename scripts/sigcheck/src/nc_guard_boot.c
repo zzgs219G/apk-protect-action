@@ -49,13 +49,15 @@
  *
  * 三级结构（攻击面从外到内）：
  *   ① 明文 stub（.text）
- *       只做：读 slot → 验 magic → 恢复 k_stub → mprotect → XOR → 跳转
- *       ⚠️ 实测口径（2026-10-18，别照设计文档想象）：`ncg_stub_recover` 被
- *       -O2 内联进 `ncguard_unlock`，连同 `ncg_eq8`/`ncg_rd32`/XOR 循环一起，
- *       明文侧合计约 200 行反汇编 / 736 字节。我最初写"约 30 行一个分支"是
- *       乐观估计，实测达不到——内联把它撑大了。
+ *       只做：算 CRC → 读 slot → 验 magic → 恢复 k_stub → mprotect → XOR → 跳转
+ *       ⚠️ 实测口径（别照设计文档想象）：`ncg_stub_recover` 被 -O2
+ *       【整个内联进 `ncguard_unlock`】（连同 `ncg_rd32`/`ncg_xor_key`/
+ *       XOR 循环），无独立符号 —— `nm boot.o` 只剩 `.recovered` 静态变量。
+ *       体积口径：2026-10-18 实测约 200 行 / 736B；2026-10-20 复测
+ *       **225 行**（阶段3 加 CRC32 自绑定后变大）。
+ *       我最初写"约 30 行一个分支"是乐观估计，实测达不到——内联把它撑大了。
  *       但内容仍是"无智力"的：没有 ELF 解析、没有 HMAC、没有 RC4 S 盒、
- *       没有 slot 布局解释。攻击者读完只知道"异或一段然后跳"。
+ *       没有 slot 布局解释。攻击者读完只知道"算个 CRC、异或一段然后跳"。
  *   ② 密文 unlock 本体（.ncxh，构建期锁箱）
  *       完整能力：ELF 段表解析、HMAC 校验、RC4 解密、页权限管理
  *       实测锁定后 objdump 对该段无有效输出（密文）
@@ -790,8 +792,9 @@ static uint32_t ncg_self_crc;   /* 由 ncguard_unlock() 在调用前算好 */
  *    （已删除的 ncg_eq8 是同一语义的前身，语义等价，勿再引入。）
  *
  * 历史：旧实现叫 ncg_eq8(got, "NCKEYLOCK")，-O2 下被内联进
- *       ncguard_unlock（连同 ncg_rd32/XOR 循环，实测约 200 行反汇编
- *       / 736 字节）。2026-10-19 改种子形式后 ncg_eq8 已无调用方，
+ *       ncguard_unlock（连同 ncg_rd32/XOR 循环，2026-10-18 实测约
+ *       200 行 / 736B，2026-10-20 复测 225 行）。2026-10-19 改种子形式后
+ *       ncg_eq8 已无调用方，
  *       2026-10-20 删除（-Wall 报 unused function；删除前后 .text
  *       section size 逐一相同，零字节影响）。 */
 static int ncg_magic_ok(const volatile unsigned char *got,
