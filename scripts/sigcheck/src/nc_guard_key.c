@@ -30,6 +30,7 @@
  */
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>   /* 2026-10-21:malloc/free（cert 读取缓冲由 static 改堆分配） */
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -328,12 +329,19 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
      * 旧实现每个偏移一次 syscall，最坏情况（EOCD 带 64KB 注释，合法且常见）
      * 要 65535 次 pread。实测 on-device 级存储上 92 ms —— 一旦 P1-a 上
      * 运行期，这就是可见的启动卡顿。改后同一最坏样本 74.8 us（1234x）。
-     * 内存需求 64KB 栈缓冲，冷启动一次性开销可忽略。 */
+     * 内存需求 64KB 缓冲。
+     *
+     * ⚠️ 2026-10-21 由 static 改为 malloc/free：static 让 64KB 常驻 .bss
+     * 至进程死亡（全进程 .bss 由此一项占掉近一半），而本函数只在
+     * constructor 跑一次，malloc 的开销（微秒级）与"一次性"语义完全匹配。
+     * 本函数为冻结模块，此改动经用户授权；16 条 return 路径中缓冲存活
+     * 区间内的 3 条均已补 free（下方三处）。 */
     {
-        static uint8_t tail[65557];
+        uint8_t *tail=(uint8_t*)malloc(65557);
+        if(!tail){close(fd);return -1;}
         uint64_t start=fsize>65557?fsize-65557:0;
         size_t len=(size_t)(fsize-start);
-        if(rd_at(fd,start,tail,len)!=0){close(fd);return -1;}
+        if(rd_at(fd,start,tail,len)!=0){free(tail);close(fd);return -1;}
         long eo=-1;
         if(len>=22){
             for(size_t i=len-22+1;i-->0;)
@@ -341,8 +349,9 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
                     eo=(long)i;break;
                 }
         }
-        if(eo<0){close(fd);return -1;}
+        if(eo<0){free(tail);close(fd);return -1;}
         memcpy(eocd,tail+eo,22);
+        free(tail);
     }
     uint64_t cd_off=le32(eocd+16);
     if(cd_off<32||cd_off>=fsize){close(fd);return -1;}
@@ -363,11 +372,18 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
     uint64_t total=block_size+8, block_off=cd_off-total;
     if(total>der_cap+4096){close(fd);return -1;}     /* 防御性上限 */
 
-    /* 3) 只把 block 读进栈缓冲，再在其中找 v3/v2 的 id-value 对 */
-    static uint8_t blk[65536];
-    if(total>sizeof blk){close(fd);return -1;}
-    if(rd_at(fd,block_off,blk,(size_t)total)!=0){close(fd);return -1;}
-    if(le64(blk)!=block_size){close(fd);return -1;}
+    /* 3) 只把 block 读进缓冲，再在其中找 v3/v2 的 id-value 对
+     *
+     * ⚠️ 2026-10-21 由 static 改为 malloc/free（理由同上方 tail 块）。
+     * ⚠️⚠️ free 必须放在【函数末尾、memcpy(der,cd,cl) 之后】：
+     *   v3/v2 是指向 blk 内部的指针（apk_first_cert_der_from_scheme
+     *   返回的 der 也指向 blk 内），提前 free = use-after-free。
+     *   下方每条提前 return 的路径都补了 free(blk)。 */
+    uint8_t *blk=(uint8_t*)malloc(65536);
+    if(!blk){close(fd);return -1;}
+    if(total>65536){free(blk);close(fd);return -1;}
+    if(rd_at(fd,block_off,blk,(size_t)total)!=0){free(blk);close(fd);return -1;}
+    if(le64(blk)!=block_size){free(blk);close(fd);return -1;}
 
     /* id-value 对遍历：APK Sig Block v2=0x7109871a, v3=0xf05368c0 */
     const uint8_t *v3=NULL,*v2=NULL; size_t v3n=0,v2n=0;
@@ -385,9 +401,10 @@ int ncg_apk_first_cert_der(const char *apk_path,uint8_t *der,size_t der_cap,size
     const uint8_t *cd=NULL; uint32_t cl=0;
     if(v3&&apk_first_cert_der_from_scheme(v3,v3n,&cd,&cl)==0) ;
     else if(v2&&apk_first_cert_der_from_scheme(v2,v2n,&cd,&cl)==0) ;
-    else {close(fd);return -1;}
-    if((size_t)cl>der_cap){close(fd);return -1;}
+    else {free(blk);close(fd);return -1;}
+    if((size_t)cl>der_cap){free(blk);close(fd);return -1;}
     memcpy(der,cd,cl); *der_len=cl;
+    free(blk);
     close(fd);
     return 0;
 }
