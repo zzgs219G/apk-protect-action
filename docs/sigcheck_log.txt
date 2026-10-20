@@ -1,0 +1,21 @@
+[1792525858292][I][pid 21316] 【流程】so 已加载,进入环境检测 env_check_run
+[1792525858293][I][pid 21316] 【数据】frida 端口探测结果 (clean)
+[1792525858296][I][pid 21316] 【数据】frida maps 特征探测结果 (clean)
+[1792525858296][I][pid 21316] 【数据】frida tcp LISTEN 探测结果 (clean)
+[1792525858299][I][pid 21316] 【数据】Xposed/LSPosed maps 特征探测结果 (clean)
+[1792525858299][I][pid 21316] 【数据】Xposed/LSPosed 文件痕迹探测结果 (clean)
+[1792525858299][I][pid 21316] 【数据】调试器 TracerPid 探测结果 (clean)
+[1792525858300][I][pid 21316] 【数据】frida 线程名探测结果 (clean)
+[1792525858300][I][pid 21316] 【数据】frida unix socket 探测结果 (clean)
+[1792525858308][I][pid 21316] 【数据】libc .text 内存完整性校验结果 (clean)
+[1792525858309][I][pid 21316] 【数据】本 so .text 内存完整性校验结果 (clean)
+[1792525858309][I][pid 21316] 【通过】六项探测全部干净,环境检测通过
+[1792525858310][I][pid 21316] 【流程】常驻复查线程已启动(每 20s 重检)
+[1792525858310][I][pid 21316] 【流程】so 已加载,进入签名校验 sig_verify
+[1792525858310][I][pid 21316] 【流程】开始定位 APK 文件 find_apk_path
+[1792525858310][I][pid 21316] apk path from maps: /data/app/~~0bTfI_Gt-idsljrQJypv_w==/com.xixin.box-fBYJSYCIIM4rGDqvlCnWPQ==/base.apk
+[1792525858310][I][pid 21316] 【成功】maps 直接定位到 APK (/data/app/~~0bTfI_Gt-idsljrQJypv_w==/com.xixin.box-fBYJSYCIIM4rGDqvlCnWPQ==/base.apk)
+[1792525858310][I][pid 21316] 【成功】APK 已打开 (/data/app/~~0bTfI_Gt-idsljrQJypv_w==/com.xixin.box-fBYJSYCIIM4rGDqvlCnWPQ==/base.apk)
+[1792525858310][D][pid 21316] 【流程】开始解析 APK Signing Block(找 EOCD) (fsize=5503438)
+[1792525858310][E][pid 21316] no v2/v3 signing block or parse failed: /data/app/~~0bTfI_Gt-idsljrQJypv_w==/com.xixin.box-fBYJSYCIIM4rGDqvlCnWPQ==/base.apk
+[1792525858310][E][pid 21316] 【失败】无 v2/v3 签名块或解析失败(重签工具须启用 v2) (/data/app/~~0bTfI_Gt-idsljrQJypv_w==/com.xixin.box-fBYJSYCIIM4rGDqvlCnWPQ==/base.apk)
