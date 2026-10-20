@@ -314,8 +314,13 @@ mkdir -p "$WORK/project"
 
 # 中文流程日志文案表(2026-11 用户需求):扫描 sig_check.c/env_check.c 的
 # LSG 标记注释生成 sig_log_data.h(XOR 密文,strings 不泄语义)。
-# 勾 sigcheck 或 envcheck 时需要;生成失败 fail-fast(文案缺失=编译必炸,早炸早定位)
-if [[ $WANT_SIGCHECK -eq 1 || $WANT_ENVCHECK -eq 1 ]]; then
+# ⚠️ 2026-10-21 扩条件：boot.c（锁箱设施，见下方拷贝条件）无条件 include
+#    本头文件（其 /proc 路径字面量走 LSGS），故只要编 so 就必须生成——
+#    原条件"sigcheck 或 envcheck"漏了 transpile-only 组合
+#    （dex2c+stringenc-stub 不勾 sigcheck）→ 编译期 file not found。
+#    生成器输入仍只扫 sig_check/env_check（boot.c 复用它们的标记，
+#    不另立——见 boot.c 头部注释）。
+if [[ $WANT_SIGCHECK -eq 1 || $WANT_ENVCHECK -eq 1 || $WANT_TRANSPILE -eq 1 ]]; then
   python3 "$ROOT/scripts/sigcheck/log/make-sig-log.py" \
     "$ROOT/scripts/sigcheck/src/sig_check.c" \
     "$ROOT/scripts/sigcheck/src/env_check.c" \
@@ -386,14 +391,25 @@ fi
 # ⚠️ nc_guard_layout.h 同理必拷（2026-10-20）：它是 so 加密契约的唯一真相源
 #    （段名/尺寸/偏移/magic seed），5 个 .c 都 include 它。漏拷 = 编译期
 #    "file not found" —— 比漏同步常量安全得多，那种要等到运行期 SIGILL。
-if [[ -d "$WORK/project/jni/nc" ]]; then
+# ⚠️⚠️ 2026-10-21 修真实缺口：锁箱设施的拷贝条件从"jni/nc 目录存在"扩为
+#    "jni/nc 存在 或 有转译产物"。
+#    原条件只由 sigcheck/envcheck 分支建立 jni/nc → 组合
+#    【--dex2c --stringenc --dex2c-stub 且不勾 sigcheck/envcheck】时：
+#      标记器（WANT_TRANSPILE 分支）照样把桩的 4 个 JNI 标进 .ncx，
+#      但 boot.c 没拷 → 无人解锁 → 桩永为密文 → Java 首次解字符串即
+#      踩密文 SIGILL → 包必闪退（且 sig_hash.h 也没人生成，锁箱器
+#      会先因缺证书路径失败——两层失败叠加，构建期未必拦得住）。
+#    有 .ncx 段就可能存在（转译产物会被标段）就必须有解锁设施——
+#    设施跟随【被保护资产】走，不跟随【最先勾了哪个防御模块】走。
+if [[ -d "$WORK/project/jni/nc" || $WANT_TRANSPILE -eq 1 ]]; then
+  mkdir -p "$WORK/project/jni/nc"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_boot.c"  "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c" "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.c"   "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_key.h"   "$WORK/project/jni/nc/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_layout.h" "$WORK/project/jni/nc/"
-else
+elif [[ -d "$WORK/project/jni" ]]; then
   cp "$ROOT/scripts/sigcheck/src/nc_guard_boot.c"  "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_probe.c" "$WORK/project/jni/"
   cp "$ROOT/scripts/sigcheck/src/nc_guard_jni.c"   "$WORK/project/jni/"
