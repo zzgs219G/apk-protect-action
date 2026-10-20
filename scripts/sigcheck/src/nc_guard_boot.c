@@ -141,85 +141,33 @@
 static const uint8_t NCG_MAGIC_SEED_SLOT[8] = NC_SEED_SLOT_INIT;
 static const uint8_t NCG_MAGIC_SEED_STUB[8] = NC_SEED_STUB_INIT;
 static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
-/* slot 80 → 96（2026-10-19 P1-a）：
- *   [80:88] pkg_sha8   SHA256(包名) 前 8 字节 —— 运行期证书派生的包名一致性校验
- *   [88:96] reserved   预留（对齐 + 将来加字段不必再动长度契约）
- * 为什么需要它：k_so = HKDF(master, SHA256(certDER), "nc-so-v1"+包名)，
- * 运行期必须拿到【构建期用的那个包名】，否则派生值不同、密文解不开。
- * 存明文包名会暴露"密钥与包名有关"，故只存指纹。 */
-/* stub slot 88 → 96（2026-10-19 阶段3 代码自绑定）：
- *   [ 0: 8) magic seed
- *   [ 8:24) wrapped k_stub
- *   [24:28) stub_sh_addr
- *   [28:32) head_sh_addr
- *   [32:36) head_size
- *   [36:40) code_addr      .text 段起始（自绑定 CRC 的区间起点）
- *   [40:44) code_len       .text 段长度
- *   [44:48) reserved
- *   [48:64) wrapped k_mac_head
- *   [64:96) expect_mac_head
- *   [96:100) head_ro_addr   .ncxhr 段链接期虚拟地址（master 所在）
- *   [100:104) head_ro_size  该段字节数
- * ⚠️ 原 [40:56) wrapped_k_mac_head / [56:88) expect_mac_head 已整体后移 8 字节。 */
-/* stub slot 96 → 104（2026-10-19 master 随机化）：
- *   新增 [96:104) 两个 u32，定位 .ncxhr（存 master）。
- *   为什么不复用 [44:48) 的原 reserved：[64:96) 已被 expect_mac_head 占满，
- *   4 字节装不下 addr+size 两个值；硬塞会与 MAC 字段重叠（静默破坏校验）。
- *   扩到 104 是最小改动，且 .ncks 段同步 +8 字节即可。 */
+/* ── slot 布局与尺寸：唯一真相源在 nc_guard_layout.h ──────────────
+ * 本文件不再画布局图。2026-10-20 删除的原因：此处原有【三份】slot 布局图
+ * （88 字节版 / 96 字节版 / 104 字节版），与 nc_guard_layout.h 的 NC_OFF_*
+ * 构成多权威——扩容时改宏不改图，图就变成错的，而"权威的错图"比没有图
+ * 更坏（AI/人会照着它改代码）。
+ * 现行：段名看 NC_SEC_*，.nck 尺寸看 NC_SLOT_SIZE，.ncks 尺寸看
+ * NC_STUB_SIZE，字段偏移看 NC_OFF_*。该头文件带 _Static_assert 挡偏移重叠，
+ * 且 so-section-lock.py 从中抽取、test-so-lock.sh T20/T21/T22 对拍。
+ *
+ * 保留两条 layout.h 里没有的历史信息（防止"当初为什么这么设计"失传）：
+ *   · .nck[80:88] 存 SHA256(包名) 前 8 字节而非明文包名：k_so 派生需要
+ *     构建期那个包名，但明文会暴露"密钥与包名有关"这条线索。
+ *   · .ncks 扩到 104 而非复用 [44:48) reserved：那里只有 4 字节，装不下
+ *     addr+size 两个 u32；硬塞会与 expect_mac_head 重叠——那种重叠是
+ *     【静默】破坏 MAC 校验的，编译期不报。 */
 
-/* ═══════════════════════════════════════════════════════════════════
- * ⚠️⚠️ 下方整段是【历史存档】，勿以此图为布局依据 ⚠️⚠️
- *
- * 记录的是 2026-10-18 P0-b 时的 88 字节版布局，其中
- *   [36:40) reserved
- *   [40:56) wrapped_k_mac_head
- *   [56:88) expect_mac_head
- * 与【当前】实际偏移（见 nc_guard_layout.h 的 NC_OFF_* 宏：36=code_addr、40=code_len、
- * 48=k_mac_head、64=expect_mac_head、96/100=head_ro）逐条矛盾。
- * 2026-10-19 阶段3（代码自绑定）与 master 随机化两次扩容后已是 104 字节版，
- * 此图未同步更新 —— 保留它是因为"过期图比没图更坏"（AI/人会照着改），
- * 所以用显式的存档横幅标死，而不是删掉了让人以为从没存在过。
- *
- * 【当前布局的唯一真相源 = nc_guard_layout.h 的 NC_OFF_* + NC_STUB_SIZE】，
- * 锁箱侧 = so-section-lock.py lock_head() 的 blob 组装 + assert len(blob)==104。
- * 两侧不一致时构建期 AssertionError，不会静默出错。
- *
- * 历史图（88 字节，2026-10-18 P0-b 起）：
- *   [ 0: 8) magic NCSTUBLK
- *   [ 8:24) wrapped k_stub      = k_stub ^ XOR_KEY
- *   [24:28) stub_sh_addr        .ncks 段自身链接期虚拟地址
- *   [28:32) head_sh_addr        .ncxh 链接期虚拟地址
- *   [32:36) head_size           .ncxh 字节数
- *   [36:40) reserved
- *   [40:56) wrapped k_mac_head  = k_mac_head ^ XOR_KEY   ← P0-b 新增
- *   [56:88) expect_mac_head     HMAC-SHA256(k_mac_head, head 密文) ← P0-b 新增
- *
- * 为什么 head 段也要 MAC（P0-b，补齐与 .ncx 不对等的保护）：
+/* 为什么 head 段也要算 MAC（P0-b，2026-10-18；安全设计理由，勿删）：
  *   在此之前 head 段只有简单 XOR。攻击者可以改 head 密文中对应"unlock 本体
  *   的 MAC 校验函数"的那几位 → 解密后 unlock 本体还在，但它对 .ncx 的校验
  *   被改成恒真 → .ncx 的 HMAC 保护被绕过。这是具体路径，不是理论风险。
  *   加 MAC 后：改任何一位 → HMAC 不符 → 不解密 → head 保持密文 →
  *   调用即 SIGILL（与 .ncx 的 -11 语义完全对等）。
+ *   MAC 对【密文】算，与 .ncx 一致：解密前就能验，验不过就不装明文。
  *
- * MAC 对【密文】算，与 .ncx 一致：解密前就能验，验不过就不装明文。
- * ═══════════════════════════════════════════════════════════════════ */
+ * （原此处还有一份 88 字节旧版布局图作"历史存档"，2026-10-20 删除——
+ *  它构成了第二份布局描述，与 nc_guard_layout.h 形成双权威。） */
 
-/* ── 当前 .ncks stub slot 偏移表（NC_STUB_SIZE=104 字节）─────────
- * 顺序即内存顺序，每个字段与锁箱侧 blob 组装处一一对应。
- * ⚠️ 改任何偏移或尺寸，必须同步 so-section-lock.py 的两条 assert：
- *      assert len(blob) == 104
- *      assert len(blob) == slot['size']
- *    漏同步的症状是运行期 SIGILL（不是编译错误），极难定位。 */
-
-/* .nck slot 的包名指纹（P1-a，2026-10-19）：SHA256(包名)[:8]。
- * 放这里而不是 §319 附近，因为它被 ncg_pkg_matches() 在更早处引用。 */
-/* master 数据段（.ncxhr）的定位（2026-10-19）：
- * 复用原 reserved 区与其后的 4 字节，slot 仍 96 字节。
- * [44:48) 原 reserved → head_ro_addr
- * [88:92) 原 reserved 尾 → head_ro_size（避开 expect_mac_head 的 [64:96)？）
- * ⚠️ [64:96) 已被 expect_mac_head 占用，故 head_ro_size 只能放在 [44:48)
- *    之后的空位。实际：[40:44) 是 code_len，[44:48) 是原 reserved。
- *    两个 u32 需要 8 字节，而 [44:48) 只有 4 字节 —— 见下方 slot 扩容说明。 */
 
 /* ⚠️ 2026-10-18 与 LSGS 彻底分离（原值与 make-sig-log.py 的 key 相同，
  * 注释还写"与 LSGS 同源"——那是错的）：同一把 8 字节密钥此前同时护三处
@@ -901,8 +849,8 @@ static void ncg_stub_recover(void) {
 
     /* ── 顺带解开 master 数据段（2026-10-19）──────────────────────
      * 与 head 用同一把 k_stub、同一次遍历：master 只有解开这段才能读到，
-     * 而这段的定位信息在 slot[44:48)（head_ro_size）与 slot[48:52)
-     * （head_ro_addr）。两个额外 u32 塞进原 reserved 区，slot 仍 96 字节。
+     * 而这段的定位信息在 slot 的 NC_OFF_HEADRO_ADDR(96) 与
+     * NC_OFF_HEADRO_SIZE(100) 两个 u32 里（.ncks 扩容到 104 时装它们）。
      *
      * 为什么必须在这里解、而不是在 ncg_head_unlock 里：
      *   ncg_master 是 head 段【外面】的另一个段，head 本体解完之后才能

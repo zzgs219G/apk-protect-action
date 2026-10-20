@@ -28,8 +28,9 @@
     .nckey            → .nck     一级密钥槽
     .nckey_stub       → .ncks    二级 stub 密钥槽
 
-  ⚠️ 源码里的 nc_guard_unlock.c 是历史存档，【刻意保留旧名】——
-  读到 .ncguard 说明那是旧版实现，不要照着改。
+  ⚠️ scripts/sigcheck/archive/nc_guard_unlock.c 是历史存档（2026-10-20
+  已移出 src/），【刻意保留旧名】—— 读到 .ncguard 说明那是旧版实现，
+  不要照着改。它不参与任何构建。
 
   .nck slot 布局（96 字节，2026-10-19 P1-a 起；原 80 字节版见历史记录）：
     [0:16]  magic        seed + 8 个 0（seed 见 SLOT_MAGIC_SEED）

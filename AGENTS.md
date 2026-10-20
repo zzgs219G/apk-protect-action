@@ -49,7 +49,7 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 | `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: 回归测试内嵌 |
 | `tools/dcc/`(解压产物;真源 `tools/dcc.zip`) | dcc 工具(**引擎已下架**,现仅为 apktool.jar + 内置 androguard 载体) | 严禁任何改动(历史: 报错三/九);真源包 `tools/dcc.zip` 严禁改包/换版/**删除** |
 | `tools/dcc/tools/apktool.jar` | 解包/重打包工具(apktool 3.0.3,随 dcc.zip 解压) | 严禁替换版本(历史: 报错四/五);dcc 引擎下架后这是该 zip 的唯一存在理由 |
-| `scripts/sigcheck/src/nc_guard_unlock.c` | `.ncx` 段运行期自解密(**2026-10-18 起已退出 NDK 工程**,保留为历史存档;现行入口是 `nc_guard_boot.c`) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化;改动前必读 `docs/流程文档.md` §3.12 的 8 条审查点 |
+| `scripts/sigcheck/archive/nc_guard_unlock.c` | `.ncx` 段运行期自解密(**2026-10-18 起已退出 NDK 工程**;**2026-10-20 已移出 src/ 到 archive/**,因其契约逐条过期——slot 80 字节/旧 XOR_KEY/`slot^XOR_KEY` 取钥——留在真相源旁会误导人与 AI) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化。**它不再进 NDK 工程、不再参与任何构建**;仅作历史查阅。现行入口是 `nc_guard_boot.c` |
 | `scripts/sigcheck/src/nc_guard_boot.c` | 自解谜设施:明文 stub(`.text`)+ unlock 本体(`.ncxh` 密文) | 真机链路已验证: 两级锁箱后 dlopen → add/mul/selftest 全对;**绝不可把 `ncg_head_unlock` 标进 `.ncxh`**(它得先被 stub 解出来);stub 用简单 XOR 而非 RC4,`lock_head()` 必须同算法 |
 | `scripts/sigcheck/src/nc_guard_boot.c` 补充 | **2026-10-19 master 随机化**:master 藏在 `.ncxhr`(AWR,32B),用 **`k_stub`** 加密——用 `k_so` 会死循环(k_so 派生正需要 master)。slot 96→104。**stub 只能调 `.text` 里的函数**(用 head 段里的 `ncg_rc4` 会执行密文 → 卡死);**mprotect 粒度是页**,head_ro 与 `.data`/`.bss` 同页,解完必须恢复 `RW` 而非 `R`(否则 .bss 变只读 → SIGSEGV) | `test-so-lock.sh` T11/T12 |
 | `scripts/sigcheck/src/nc_jni_register.c` | JNI 动态注册 + `JNI_OnLoad`（2026-10-19） | `.dynsym` 只导出 `JNI_OnLoad`。**JNIEXPORT 自带 default 可见性，`-fvisibility=hidden` 对它无效**；实现函数用 `visibility("hidden")`（不能用 `static`——`RegisterNatives` 需要函数指针）。签名以 `compiled_methods.txt` 为权威（C 参数推导会把 jobject 变成 Object）| `test-so-lock.sh` T14 |
@@ -73,9 +73,9 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 改名的理由:旧名自解释(`ncguard`/`nckey` 一眼看出机制),`readelf -S`
 即可列举出全部加固结构。现行名无语义,仅缩短。
 
-⚠️ 例外:`scripts/sigcheck/src/nc_guard_unlock.c` 是历史存档(已退出 NDK
-工程),**刻意保留旧段名**——读到 `.ncguard` 说明那是旧版实现,不要照着改。
-现行实现是 `nc_guard_boot.c`(用 `.ncxh`/`.ncxhr`)。
+⚠️ 例外:`scripts/sigcheck/archive/nc_guard_unlock.c` 是历史存档(2026-10-20
+已移出 src/),**刻意保留旧段名**——读到 `.ncguard` 说明那是旧版实现,不要照着改。
+现行实现是 `scripts/sigcheck/src/nc_guard_boot.c`(用 `.ncxh`/`.ncxhr`)。
 
 **2026-10-20 起,契约常数的单一真相源是 `scripts/sigcheck/src/nc_guard_layout.h`**：
 段名(6)、slot 尺寸(96/104)、偏移(8)、magic seed(2)、XOR 碎片表(1)全在那里,

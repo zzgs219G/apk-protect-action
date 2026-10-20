@@ -689,7 +689,7 @@ if boot:
 # C 侧副本扫描：5 个消费者 .c 里不得出现裸段名字面量。
 # 为什么必须查：手写 section(".ncx") 编译链接全过、T21 也绿（.ncx 是已登记名），
 # 只有运行期 SIGILL 才暴露——那种 bug 排查成本是半天量级。
-# 豁免：nc_guard_unlock.c（历史存档，刻意保留旧名，见 AGENTS.md 例外条款）。
+# （历史存档 nc_guard_unlock.c 已于 2026-10-20 移入 archive/，不在此扫描范围。）
 import os
 SRC = os.path.join(os.path.dirname(os.path.abspath(lockpy)), '..', 'sigcheck', 'src')
 SRC = os.path.normpath(SRC)
@@ -741,12 +741,12 @@ if [ -f "$LAYOUT_H" ]; then
                     "$ROOT/scripts/sigcheck/src" "$ROOT/scripts/lib" \
                     "$ROOT/scripts/pipelines" "$ROOT/scripts/sigcheck/hash" \
                     2>/dev/null | tr -d '"' | sort -u)
-        # nc_guard_unlock.c 是历史存档，刻意保留旧名（.ncguard/.nckey）
-        # —— 在 T21 里显式豁免，否则它永远让这一项红。
-        hist=$(grep -rhoE '"(\.ncguard[a-z_]*|\.nckey[a-z_]*)"' \
-                    "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" 2>/dev/null | tr -d '"' | sort -u)
-        if [ -n "$hist" ]; then
-            skip "T21 历史存档豁免: $(echo $hist | tr '\n' ' ')（nc_guard_unlock.c 刻意保留旧名）"
+        # 2026-10-20：nc_guard_unlock.c（历史存档，刻意保留旧段名）已从
+        # src/ 移到 scripts/sigcheck/archive/，不再参与 NDK 工程。
+        # 故此处【不再需要豁免】—— archive/ 本就不该被 T21 扫。
+        # 若哪天它又回到 src/，下面这行会立刻红，提醒"历史存档不该躺在真相源旁"。
+        if [ -f "$ROOT/scripts/sigcheck/src/nc_guard_unlock.c" ]; then
+            bad "T21 历史存档 nc_guard_unlock.c 又回到了 src/ —— 它不参与 NDK 工程，应留在 archive/"
         fi
         [ $bad_found -eq 0 ] && ok "T21 段名字面量全部已登记（$(echo $registered | wc -w) 个）"
     else

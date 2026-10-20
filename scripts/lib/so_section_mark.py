@@ -7,7 +7,7 @@
 
     使用者（第3层）只管声明"我要保护长这样的函数"，不用管段名、不用管
     加密算法、不用管密钥、不用管解锁——那些全在第1层设施里
-    （nc_guard_unlock.c + so-section-lock.py + nc_guard_key.c）。
+    （nc_guard_boot.c + so-section-lock.py + nc_guard_key.c）。
 
     为什么要单独一层：
         sigcheck 的探针是手写 attribute 的（env_check.c，冻结文件，只追加）；

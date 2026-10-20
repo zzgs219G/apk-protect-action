@@ -242,7 +242,7 @@ def render_bridge(so_name):
 .end method
 
 # .ncx 段自解密自检(2026-12):59=完整链路通过,-100=已自检过重入,
-# 负数=解锁失败(见 nc_guard_unlock.c)。纯观测,不参与防御判定。
+# 负数=解锁失败(码表见 nc_guard_boot.c 的 ncg_head_unlock)。纯观测,不参与防御判定。
 # ⚠️ 挂靠 NcLink(与 ncVerify/heartbeat 同源),不要另造类——
 # 2026-10-17 曾独立造 Lcom/nc/guard/NcGuard; 却只加调用不生成类,
 # selftest() 抛 UnsatisfiedLinkError 被主 catch 吞掉并跳过 heartbeat,
@@ -298,7 +298,7 @@ def render_guard(wrapper_desc):
     :try_start_0
     invoke-static {{}}, {BRIDGE_DESC}->ensureLoaded()V
     # .ncx 段自解密自检(2026-12):so 已加载即触发一次性解锁。
-    # 59 = 完整链路通过;-100 = 已自检过;负数 = 解锁失败(见 nc_guard_unlock.c)。
+    # 59 = 完整链路通过;-100 = 已自检过;负数 = 解锁失败(码表见 nc_guard_boot.c)。
     # ⚠️ 必须用【独立的 try/catch】包住:2026-10-17 曾把 selftest 直接放在
     # 主 try 里,而当它抛 UnsatisfiedLinkError 时会被主 catch(Throwable)
     # 吞掉并【连带跳过后面的 heartbeat()/startHeartbeat()】→ 心跳停喂 →
