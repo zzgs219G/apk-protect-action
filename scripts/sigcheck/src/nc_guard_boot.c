@@ -451,6 +451,10 @@ static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
 }
 
 
+/* 用后即毁交接区（定义在第二部分，stub 解密后写、此处读）——前向声明 */
+static volatile uint8_t *ncg_head_live;
+static volatile uint32_t ncg_head_live_len;
+
 /* ── unlock 本体主流程：解出 .ncx 业务段 ──────────────────────
  * 由明文 stub 解密后才可调用（此前它是密文）。
  * 返回 0 成功；负值含义与 nc_guard_unlock.c 的码表一致。 */
@@ -673,6 +677,10 @@ int ncg_head_unlock(void) {
     memset(key, 0, sizeof(key));
     memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */
     ncg_unlocked = 1;
+
+    /* 用后即毁已挪至 ncguard_unlock（.text 侧）——第一版放在这里
+     * （ncg_head_unlock 尾部）是错的：PC 还在本段执行时把自己置零
+     * → SIGSEGV（T4 实测 CRASH(139)）。见 ncguard_unlock 内大注释。 */
     return 0;
 }
 
@@ -726,6 +734,10 @@ static uint32_t ncg_crc32(const uint8_t *p, size_t n) {
  * 该区间无重定位（readelf -r 全部落在 0x71d0 之后），文件字节与内存
  * 字节一致，所以锁箱期算的值与运行期算的值天然相同。 */
 static uint32_t ncg_self_crc;   /* 由 ncguard_unlock() 在调用前算好 */
+
+/* 用后即毁交接区：定义/前向声明见 ncg_head_unlock 上方。
+ * stub（ncg_stub_recover）解出 .ncxh 后把明文区间写这里，
+ * ncg_head_unlock 完成使命后按它自毁。 */
 
 /* 生成式 magic 比较（2026-10-19）：字面量不进二进制。
  * want 由 NC_SEED_* 与碎片密钥运行期异或得出，不落在 .rodata。
@@ -911,6 +923,11 @@ static void ncg_stub_recover(void) {
     }
 
     __builtin___clear_cache((char *) start, (char *)(start + head_size));
+    /* 用后即毁的交接：把明文区间交给 .text 全局（head 自毁时读）。
+     * volatile 写：该值跨"函数返回"被另一个 TU 段的代码读取，
+     * 且时机在攻击者可见的窗口内，编译器不得缓存/重排。 */
+    ncg_head_live = start;
+    ncg_head_live_len = head_size;
     memset(k, 0, sizeof(k));
     recovered = 1;
 }
@@ -947,7 +964,59 @@ int ncguard_unlock(void) {
 
     ncg_stub_recover();          /* 先确保 head 本体是明文 */
     int rc = ncg_head_unlock();  /* 再调本体解 .ncx */
-    if (rc == 0) done = 1;
+    if (rc == 0) {
+        done = 1;
+        /* ══ 用后即毁（2026-10-21，针对破解复盘 §5"最致命破绽"）════
+         *
+         * 攻击面（破解复盘实测）：stub XOR 解出 .ncxh 明文 → 攻击者在
+         * SIGILL handler 里抢 dump → 调度器全知。此前明文从解密起
+         * 【直到进程死】一直驻留——全部防御里实际被攻破的一环。
+         *
+         * ⚠️⚠️ 抹除必须在【本函数】（.text）里做，绝不能放在
+         * ncg_head_unlock（.ncxh 内）尾部——第一版犯了这个错：
+         * PC 还在 .ncxh 里执行时把自己置零 → 取到半新半旧指令流
+         * → SIGSEGV（T4 实测 CRASH(139)）。现在 head 返回后 PC 已
+         * 回到 .text，抹 .ncxh 是安全的。
+         *
+         * 为什么此刻抹是安全的：
+         *   ① .ncx 已解密，head 的使命（解业务段）完成；
+         *   ② done=1 后 ncguard_unlock 对后续所有调用直接返回，
+         *      ncg_head_unlock 不会再被执行——抹掉的代码没有未来调用者；
+         *   ③ .ncxh 独占页（CI 实测 0x4b000-0x4d000，不与 .text 共页）；
+         *   ④ stub 幂等靠 recovered 标志，与本段内容无关。
+         *
+         * 原设计还想一并抹 .ncxh 代码区——两轮实测均 SIGSEGV（见下块
+         * 注释），已放弃。密钥材料（master）抹除后，代码区驻留的代价
+         * 降为"逻辑可读但无密钥可用"——复盘报告的攻击者正是拿到了
+         * 调度器代码仍卡死在密钥上，这是有实证支撑的边界。 */
+        {
+            volatile uint8_t *self = (volatile uint8_t *)ncg_head_live;
+            uint32_t n = ncg_head_live_len;
+            /* ⚠️ .ncxh 代码区【不抹】——2026-10-21 两轮实测：
+             *   第一版在 ncg_head_unlock 尾部自抹：PC 在本段内执行时
+             *   自毁 → SIGSEGV（CRASH(139)）。
+             *   第二版挪到本函数（.text 侧，PC 已离开 .ncxh）仍 SIGSEGV
+             *   （诊断A 对照实验定位）：抹除+clear_cache 会破坏
+             *   .ncxh 段内的链接器常量池/veneer（ARM64 ldr-literal 池
+             *   就在函数尾同 section），I-cache 失效后 PC 相关取指
+             *   落在已毁数据 → 崩。安全边距不可靠（veneer 位置随
+             *   链接器版本变），故放弃抹代码区。
+             *
+             * 剩余防线（本块保留的 master 抹除）已断掉"离线重算 k_so"：
+             *   攻击者 dump 全内存 → master 全零 → 有调度器代码也
+             *   推不出密钥（复盘报告正是卡在这一点）。代码区驻留的
+             *   代价降为"逻辑可读但无密钥可用"，由 hook 探针 +
+             *   anti-diff 继续把守动态路径。 */
+            (void)self; (void)n;
+            /* master 一并抹：只在派生 k_so/k_mac 时读一次，此后无用。
+             * .ncxhr 与 .data 同页不能动权限，但 memset 32B 自身安全。
+             * 抹掉后攻击者即使 dump 全内存，master 也是全零。 */
+            {
+                volatile uint8_t *m = ncg_master;
+                for (int i = 0; i < 32; i++) m[i] = 0;
+            }
+        }
+    }
     return rc;
 }
 
