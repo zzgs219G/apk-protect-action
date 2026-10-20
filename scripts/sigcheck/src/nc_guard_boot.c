@@ -7,7 +7,7 @@
  * 与 nc_guard_unlock.c 的关系（零冻结改动路线）：
  *   nc_guard_unlock.c  保留在仓库、仍是冻结资产，但【不再进 NDK 工程】。
  *   nc_guard_boot.c    本文件 = 新的运行期入口，内含 unlock 本体的一份
- *                      实现（放在 .ncguard_head 段，构建期被锁成密文）。
+ *                      实现（放在 .ncxh 段，构建期被锁成密文）。
  *   两份并存是刻意取舍：动 unlock.c 要破冻结纪律，而它已被真机验证过；
  *   本文件承接"可继续演进"的部分。unlock.c 自此是历史存档，不再维护。
  *
@@ -20,10 +20,10 @@
  *       乐观估计，实测达不到——内联把它撑大了。
  *       但内容仍是"无智力"的：没有 ELF 解析、没有 HMAC、没有 RC4 S 盒、
  *       没有 slot 布局解释。攻击者读完只知道"异或一段然后跳"。
- *   ② 密文 unlock 本体（.ncguard_head，构建期锁箱）
+ *   ② 密文 unlock 本体（.ncxh，构建期锁箱）
  *       完整能力：ELF 段表解析、HMAC 校验、RC4 解密、页权限管理
  *       实测锁定后 objdump 对该段无有效输出（密文）
- *   ③ 密文业务段（.ncguard，由 ② 负责解）
+ *   ③ 密文业务段（.ncx，由 ② 负责解）
  *       dex2c 转译产物 + 12 个 env_check 探针
  *
  * 为什么 stub 不需要读盘 / 不需要 dladdr / 不需要段表：
@@ -34,7 +34,7 @@
  *
  * 未锁状态（锁箱器没跑过）也必须正常：
  *   slot magic 不匹配 → stub 直接返回，段是明文 → 本体照常执行 →
- *   本体发现 .nckey 无 magic → 返回 0。开发期不锁箱也能跑。
+ *   本体发现 .nck 无 magic → 返回 0。开发期不锁箱也能跑。
  */
 #include <elf.h>
 #include <dlfcn.h>
@@ -55,7 +55,7 @@
  *    sig_check.c 与 env_check.c，扫不到本文件。同内容复用同一条密文，
  *    既省体积也避免两条标记内容漂移。
  *
- * ⚠️ 为什么必须加密：这两个字面量所在函数虽标进 .ncguard_head，
+ * ⚠️ 为什么必须加密：这两个字面量所在函数虽标进 .ncxh，
  *    但 **C 的字符串字面量永远进 .rodata，不会跟着函数进自定义段**。
  *    实测确认：锁箱后 /proc/self/cmdline 仍在 .rodata 明文可搜。 */
 #include "sig_log_data.h"
@@ -63,9 +63,9 @@
 /* ── 契约常量：与 so-section-lock.py 共享，改一处必须同步另一侧 ── */
 #define NCG_SECTION      ".ncx"
 /* 常量表专用段（2026-10-19）：签名表的 salt/期望值放这里。
- * 为什么不能放 .ncguard：那是 AXR（可执行）段，clang 拒绝让 const 数据
+ * 为什么不能放 .ncx：那是 AXR（可执行）段，clang 拒绝让 const 数据
  * 进去（'causes a section type conflict'）。本段是 AWR，不可执行。
- * 与 .ncguard 共用同一把 k_so 和同一个 MAC —— 逻辑上是同一份资产。 */
+ * 与 .ncx 共用同一把 k_so 和同一个 MAC —— 逻辑上是同一份资产。 */
 #define NCG_SECTION_RO   ".ncxr"
 #define NCG_SLOT         ".nck"
 #define NCG_HEAD         ".ncxh"
@@ -79,10 +79,26 @@
  *
  * 现在：锁箱器往 slot 写的是 8 字节【随机种子】，不是可识别字符串；
  * 运行期把落盘字节与代码里的同名种子逐字节比较（ncg_magic_ok）。
- * 因 seed ^ xor_key == "NCKEYLOC"，攻击者即使 dump 到种子也需先拿到
- * 碎片密钥才能看出它是 magic——多一层理解成本，且 strings 归零。
- * 语义不变：仍然"匹配 = 已锁，不匹配 = 未锁放行"，开发期照常能跑。 */
-/* magic 生成：magic[i] = NCG_MAGIC_SEED[i] ^ (碎片重组出的字节) */
+ *
+ * ⚠️⚠️ 2026-10-20 修正一处夸大表述（原注释是错的，别信）：
+ *   原注释写"因 seed ^ xor_key == NCKEYLOC，攻击者即使 dump 到种子
+ *   也需先拿到碎片密钥才能看出它是 magic"——【不成立】。
+ *   事实：ncg_magic_ok() 只做 `diff |= got[i] ^ seed[i]` 累或，
+ *   【碎片密钥完全不参与 magic 比较】（它只在 ncg_xor_key() 里用于
+ *   恢复 k_stub / k_mac_head）。攻击者 dump 到 slot 前 8 字节即可
+ *   直接与本文件的 NCG_MAGIC_SEED_* 比对，零额外成本。
+ *
+ *   本机制的真实收益【只有一条】：strings 搜不到 "NCKEYLOCK" /
+ *   "NCSTUBLK" 字面量。它买的是"自动扫描失效"，不是"人工逆向成本"。
+ *   写清楚这条，是为了防止后人（或 AI）据此高估防御强度、少做别的加固。
+ *
+ * 语义不变：仍"匹配 = 已锁，不匹配 = 未锁放行"，开发期照常能跑。
+ * 两侧契约：本文件的 NCG_MAGIC_SEED_* 与 so-section-lock.py 的
+ * SLOT_MAGIC_SEED / STUB_MAGIC_SEED 必须逐字节一致（该文件头部有
+ * `assert seed ^ XOR_KEY == b'NCKEYLOC'` 自校验，但它只验 Python
+ * 自我一致，不校验 C 侧——所以 test-so-lock.sh T20 负责跨语言对拍）。 */
+/* magic 种子：落盘即此值，运行期与 slot 前 8 字节逐字节比。
+ * 不是 magic 本身（magic = seed ^ XOR_KEY，仅用于人类记忆）。 */
 static const uint8_t NCG_MAGIC_SEED_SLOT[8] =
         {0x30, 0x72, 0xEE, 0x48, 0x91, 0xDE, 0x04, 0xB5};   /* ^ xor_key → NCKEYLOCK */
 static const uint8_t NCG_MAGIC_SEED_STUB[8] =
@@ -106,42 +122,68 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  *   [44:48) reserved
  *   [48:64) wrapped k_mac_head
  *   [64:96) expect_mac_head
- *   [96:100) head_ro_addr   .ncguard_head_ro 段链接期虚拟地址（master 所在）
+ *   [96:100) head_ro_addr   .ncxhr 段链接期虚拟地址（master 所在）
  *   [100:104) head_ro_size  该段字节数
  * ⚠️ 原 [40:56) wrapped_k_mac_head / [56:88) expect_mac_head 已整体后移 8 字节。 */
 /* stub slot 96 → 104（2026-10-19 master 随机化）：
- *   新增 [96:104) 两个 u32，定位 .ncguard_head_ro（存 master）。
+ *   新增 [96:104) 两个 u32，定位 .ncxhr（存 master）。
  *   为什么不复用 [44:48) 的原 reserved：[64:96) 已被 expect_mac_head 占满，
  *   4 字节装不下 addr+size 两个值；硬塞会与 MAC 字段重叠（静默破坏校验）。
- *   扩到 104 是最小改动，且 .nckey_stub 段同步 +8 字节即可。 */
+ *   扩到 104 是最小改动，且 .ncks 段同步 +8 字节即可。 */
 #define NCG_STUB_SIZE    104
 
-/* .nckey_stub slot 布局（88 字节，2026-10-18 P0-b 起；原 40 字节版见下方说明）：
+/* ═══════════════════════════════════════════════════════════════════
+ * ⚠️⚠️ 下方整段是【历史存档】，勿以此图为布局依据 ⚠️⚠️
+ *
+ * 记录的是 2026-10-18 P0-b 时的 88 字节版布局，其中
+ *   [36:40) reserved
+ *   [40:56) wrapped_k_mac_head
+ *   [56:88) expect_mac_head
+ * 与【当前】实际偏移（见下方 NCG_OFF_* 宏：36=code_addr、40=code_len、
+ * 48=k_mac_head、64=expect_mac_head、96/100=head_ro）逐条矛盾。
+ * 2026-10-19 阶段3（代码自绑定）与 master 随机化两次扩容后已是 104 字节版，
+ * 此图未同步更新 —— 保留它是因为"过期图比没图更坏"（AI/人会照着改），
+ * 所以用显式的存档横幅标死，而不是删掉了让人以为从没存在过。
+ *
+ * 【当前布局的唯一真相源 = 下方 NCG_OFF_* 宏 + NCG_STUB_SIZE】，
+ * 锁箱侧 = so-section-lock.py lock_head() 的 blob 组装 + assert len(blob)==104。
+ * 两侧不一致时构建期 AssertionError，不会静默出错。
+ *
+ * 历史图（88 字节，2026-10-18 P0-b 起）：
  *   [ 0: 8) magic NCSTUBLK
  *   [ 8:24) wrapped k_stub      = k_stub ^ XOR_KEY
- *   [24:28) stub_sh_addr        .nckey_stub 自身链接期虚拟地址
- *   [28:32) head_sh_addr        .ncguard_head 链接期虚拟地址
- *   [32:36) head_size           .ncguard_head 字节数
+ *   [24:28) stub_sh_addr        .ncks 段自身链接期虚拟地址
+ *   [28:32) head_sh_addr        .ncxh 链接期虚拟地址
+ *   [32:36) head_size           .ncxh 字节数
  *   [36:40) reserved
  *   [40:56) wrapped k_mac_head  = k_mac_head ^ XOR_KEY   ← P0-b 新增
  *   [56:88) expect_mac_head     HMAC-SHA256(k_mac_head, head 密文) ← P0-b 新增
  *
- * 为什么 head 段也要 MAC（P0-b，补齐与 .ncguard 不对等的保护）：
- *   在此之前 head 段只有简单 XOR。攻击者可以改 head 密文中对应"unlock 本体的
- *   MAC 校验函数"的那几位 → 解密后 unlock 本体还在，但它对 .ncguard 的校验
- *   被改成恒真 → .ncguard 的 HMAC 保护被绕过。这是具体路径，不是理论风险。
+ * 为什么 head 段也要 MAC（P0-b，补齐与 .ncx 不对等的保护）：
+ *   在此之前 head 段只有简单 XOR。攻击者可以改 head 密文中对应"unlock 本体
+ *   的 MAC 校验函数"的那几位 → 解密后 unlock 本体还在，但它对 .ncx 的校验
+ *   被改成恒真 → .ncx 的 HMAC 保护被绕过。这是具体路径，不是理论风险。
  *   加 MAC 后：改任何一位 → HMAC 不符 → 不解密 → head 保持密文 →
- *   调用即 SIGILL（与 .ncguard 的 -11 语义完全对等）。
+ *   调用即 SIGILL（与 .ncx 的 -11 语义完全对等）。
  *
- * MAC 对【密文】算，与 .ncguard 一致：解密前就能验，验不过就不装明文。 */
-/* .nckey slot 的包名指纹（P1-a，2026-10-19）：SHA256(包名)[:8]。
+ * MAC 对【密文】算，与 .ncx 一致：解密前就能验，验不过就不装明文。
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* ── 当前 .ncks stub slot 偏移表（NCG_STUB_SIZE=104 字节）─────────
+ * 顺序即内存顺序，每个字段与锁箱侧 blob 组装处一一对应。
+ * ⚠️ 改任何偏移或尺寸，必须同步 so-section-lock.py 的两条 assert：
+ *      assert len(blob) == 104
+ *      assert len(blob) == slot['size']
+ *    漏同步的症状是运行期 SIGILL（不是编译错误），极难定位。 */
+
+/* .nck slot 的包名指纹（P1-a，2026-10-19）：SHA256(包名)[:8]。
  * 放这里而不是 §319 附近，因为它被 ncg_pkg_matches() 在更早处引用。 */
 #define NCG_OFF_PKG_SHA      80
 #define NCG_OFF_CODE_ADDR    36
 #define NCG_OFF_CODE_LEN     40
 #define NCG_OFF_K_MAC_HEAD   48
 #define NCG_OFF_EXPMAC_HEAD  64
-/* master 数据段（.ncguard_head_ro）的定位（2026-10-19）：
+/* master 数据段（.ncxhr）的定位（2026-10-19）：
  * 复用原 reserved 区与其后的 4 字节，slot 仍 96 字节。
  * [44:48) 原 reserved → head_ro_addr
  * [88:92) 原 reserved 尾 → head_ro_size（避开 expect_mac_head 的 [64:96)？）
@@ -153,7 +195,7 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
 
 /* ⚠️ 2026-10-18 与 LSGS 彻底分离（原值与 make-sig-log.py 的 key 相同，
  * 注释还写"与 LSGS 同源"——那是错的）：同一把 8 字节密钥此前同时护三处
- * （.ncguard 的 wrapped_k_so/wrapped_k_mac、.ncguard_head 的 wrapped_k_stub、
+ * （.ncx 的 wrapped_k_so/wrapped_k_mac、.ncxh 的 wrapped_k_stub、
  * 以及 make-sig-log.py 的中文日志 XOR 密文）。而 LSGS 侧自己的注释就写着
  * "不抗人工逆向"——共用的后果是破掉最脆的那套，强的一起破。
  * 本常量只服务 nc_guard；LSGS 侧保持原值不动。两把钥匙互不相关。
@@ -207,7 +249,7 @@ static void ncg_xor_key(uint8_t out[8]) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * 第一部分：密文 unlock 本体（进 .ncguard_head，构建期被锁）
+ * 第一部分：密文 unlock 本体（进 .ncxh，构建期被锁）
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* ── master：HKDF 的 ikm，构建期随机化后藏进 head 密文段（2026-10-19）──
@@ -215,30 +257,30 @@ static void ncg_xor_key(uint8_t out[8]) {
  * 修的是实测报告静态部分 P1-1（报告排第二优先，本轮提前做，理由见下）：
  *   master[32] 原来是 `static const` 全 0x11 的占位符，躺在 .rodata。
  *   攻击者 `od` 一条命令读出，配合 APK 里的证书就能离线算出 k_so，
- *   8 分钟解开 .ncguard —— 这条链【完全不需要运行、不需要真机、不需要证书私钥】。
+ *   8 分钟解开 .ncx —— 这条链【完全不需要运行、不需要真机、不需要证书私钥】。
  *
  * 为什么"只换成随机数"不够（这是本轮最关键的设计判断）：
  *   随机数若仍是 .rodata 里的裸常量，攻击者 `od` 一样读出来，成本不变。
  *   必须【同时】解决"值随机"和"藏到读不到的地方"。
  *
  * 现在的位置与链路：
- *   本变量在 .ncguard_head 段内 → 构建期被整段 XOR 锁成密文
+ *   本变量在 .ncxh 段内 → 构建期被整段 XOR 锁成密文
  *   运行期必须【先解开 head】才能读到 master：
  *     碎片(4×uint16) → XOR_KEY → wrapped_k_stub → k_stub → 解 head → master → k_so
  *   攻击链从 2 步变 5 步，且中间任一步的产物都不是明文常量。
  *
  * ⚠️ 为什么 master 不用于解 head（避免循环依赖）：
  *   head 段用 k_stub 解（stub 只需碎片，零 I/O）；master 只用于派生
- *   k_so / k_mac 去解 .ncguard 业务段。若让 master 参与解 head，
+ *   k_so / k_mac 去解 .ncx 业务段。若让 master 参与解 head，
  *   就变成"要用 head 里的东西解 head 自己"——死循环。
  *   这也符合 Xop 的分层：引导密钥（stub）与业务密钥（master→k_so）分离。
  *
  * ⚠️ 未锁箱时（开发期）：master 保持全零，运行期检测到全零即视为未锁，
  *    不参与派生（与 magic 判"未锁"同语义）。全零不可能是合法 master，
  *    因为锁箱器强制写入随机值并断言非全零。 */
-/* ⚠️ 段名用 .ncguard_head_ro 而不是 .ncguard_head：后者是 AXR（可执行），
+/* ⚠️ 段名用 .ncxhr 而不是 .ncxh：后者是 AXR（可执行），
  * clang 拒绝让数据进去（'ncg_rc4' causes a section type conflict with
- * 'ncg_master'）——本文件上一轮给签名表用 .ncguard_ro 也是同一原因。
+ * 'ncg_master'）——本文件上一轮给签名表用 .ncxr 也是同一原因。
  *
  * 为什么它必须和 head 用【同一把 k_stub】加密、且在【同一次 lock_head】
  * 里一起锁：如果改用 k_so 加密，就成"k_so 的派生需要先解开 k_so 加密的
@@ -359,7 +401,7 @@ static int ncg_self_pkg(char *out, size_t cap) {
 
 /* 包名指纹校验：构建期把 SHA256(pkg) 前 8 字节写进 slot[NCG_OFF_PKG_SHA]。
  * 为什么要指纹而不是直接存明文包名：明文包名会让攻击者一眼看出
- * "密钥与包名有关"，且 slot 是明文段（.nckey 只有内部字段被 XOR）。
+ * "密钥与包名有关"，且 slot 是明文段（.nck 只有内部字段被 XOR）。
  * 指纹长度 8 字节 = 64 bit，碰撞概率对本用途可忽略。 */
 __attribute__((section(NCG_HEAD), used, retain, noinline))
 static int ncg_pkg_matches(const uint8_t *slotdata, const char *pkg) {
@@ -436,7 +478,7 @@ static int ncg_find_apk_path(const char *so_path, char *out, size_t cap) {
 #define NCG_OFF_K_MAC   32
 #define NCG_OFF_EXPMAC  48
 
-/* ── unlock 本体主流程：解出 .ncguard 业务段 ──────────────────────
+/* ── unlock 本体主流程：解出 .ncx 业务段 ──────────────────────
  * 由明文 stub 解密后才可调用（此前它是密文）。
  * 返回 0 成功；负值含义与 nc_guard_unlock.c 的码表一致。 */
 __attribute__((section(NCG_HEAD), used, retain, noinline))
@@ -505,7 +547,7 @@ int ncg_head_unlock(void) {
      * 依附于"head 是否已解开"。
      *
      * 全零 = 未锁箱（开发期）：此时不应派生任何真密钥。用全零 master 走
-     * 一遍 HKDF 也能算出结果，但那种产物本就未加密（.ncguard 明文），
+     * 一遍 HKDF 也能算出结果，但那种产物本就未加密（.ncx 明文），
      * 所以行为等价于"没加锁"，不构成安全降级。
      * 锁箱器强制：master 必须非全零，否则 fail-fast。 */
     const uint8_t *master = ncg_master;
@@ -513,7 +555,7 @@ int ncg_head_unlock(void) {
         uint8_t acc = 0;
         for (int i = 0; i < 32; i++) acc |= master[i];
         if (acc == 0) {
-            /* 未锁箱：走原来的路径（.ncguard 本就是明文，不需要解密密钥），
+            /* 未锁箱：走原来的路径（.ncx 本就是明文，不需要解密密钥），
              * 但也不应把全零 master 当成"有效派生源"去算 —— 直接返回 0
              * 让上层走"未锁"分支（magic 不匹配时本就返回 0）。 */
             return 0;
@@ -559,12 +601,12 @@ int ncg_head_unlock(void) {
      * ncVerify 这个转发壳，核心留在明文中——"锁很好，钥匙挂门上"。
      *
      * 现在拆成两段，共用一把 k_so、一个 MAC：
-     *   .ncguard     代码（AXR）—— nc_verify_t1 等
-     *   .ncguard_ro  常量表（AWR，不可执行）—— SIG_SALT / SIG_HASH_STORED
+     *   .ncx     代码（AXR）—— nc_verify_t1 等
+     *   .ncxr  常量表（AWR，不可执行）—— SIG_SALT / SIG_HASH_STORED
      * 为什么必须分两段：clang 拒绝 let const 数据进 AXR 段
      * （'causes a section type conflict'），见 nc_link.c 的注释。
      *
-     * 向后兼容：老产物只有 .ncguard、没有 .ncguard_ro，此时 nseg=1，
+     * 向后兼容：老产物只有 .ncx、没有 .ncxr，此时 nseg=1，
      * MAC 与解密行为与历史版本逐字节一致（单段时 MAC 输入 == 该段密文）。 */
     Elf64_Shdr segs[2];
     int nseg = 0;
@@ -625,7 +667,7 @@ int ncg_head_unlock(void) {
     /* ── 解密：逐段处理，权限各自最小 ──────────────────────────────
      * 代码段解完是 RX（可执行不可写），常量表段解完是 R（只读不可执行）。
      * 给数据段加 X 是没有必要的权限扩大——它从来不需要执行。
-     * 页对齐：目标段可能与相邻段同页（历史报错五十：.ncguard 与 .text 尾部
+     * 页对齐：目标段可能与相邻段同页（历史报错五十：.ncx 与 .text 尾部
      * 同页导致 pwrite 写坏代码）。这里是 mprotect 而非 pwrite，同页只会
      * 让权限短暂放宽，不会破坏内容；但 mprotect 粒度是页，所以范围必须
      * 按页对齐，否则会失败。 */
@@ -679,13 +721,6 @@ int ncg_head_unlock(void) {
 __attribute__((section(NCG_STUB_SLOT), used, aligned(1), retain))
 static const volatile unsigned char ncg_stub_slot[NCG_STUB_SIZE] = {0};
 
-/* 手写 memcmp/memcpy：遵守"stub 不依赖 libc"的约束（-O2 下虽会内联，
- * 但写明意图，防止有人日后改成调用形式又把依赖引回来） */
-static int ncg_eq8(const volatile unsigned char *a, const char *b) {
-    for (int i = 0; i < 8; i++) if (a[i] != (unsigned char) b[i]) return 0;
-    return 1;
-}
-
 /* CRC32（IEEE 802.3，多项式 0xEDB88320）。软件实现——不用 __crc32d：
  * 那需要 -march=armv8-a+crc，而 armeabi-v7a 根本没有该指令，arms 上编译
  * 直接失败。实测软件版对 1.4KB（stub 区）耗时 8.4 us，可接受。
@@ -714,16 +749,28 @@ static uint32_t ncg_crc32(const uint8_t *p, size_t n) {
  *     （而 seed 在锁箱期才生成，不随 so 分发）
  *
  * 代价实测：CRC32 对 stub 区（约 1.4KB）8.4 us，每次进程一次。
- * 区间取 .text 段中 [ncguard_unlock 起始, .ncguard_head 起始) ——
+ * 区间取 .text 段中 [ncguard_unlock 起始, .ncxh 起始) ——
  * 该区间无重定位（readelf -r 全部落在 0x71d0 之后），文件字节与内存
  * 字节一致，所以锁箱期算的值与运行期算的值天然相同。 */
 static uint32_t ncg_self_crc;   /* 由 ncguard_unlock() 在调用前算好 */
 
 /* 生成式 magic 比较（2026-10-19）：字面量不进二进制。
  * want 由 NCG_MAGIC_SEED_* 与碎片密钥运行期异或得出，不落在 .rodata。
- * 与旧 ncg_eq8 语义完全等价（逐字节全等才算匹配）。
  * ⚠️ 恒定时间不受影响：magic 不是秘密（攻击者能从密文段反推），
- *    这里求的是"没有明文字面量可搜"，不是防时序侧信道。 */
+ *    这里求的是"没有明文字面量可搜"，不是防时序侧信道。
+ *
+ * ⚠️ 2026-10-20 修正口径：碎片密钥【不参与】本比较。
+ *    早期注释写"攻击者需先拿到碎片密钥才能看出它是 magic"——那是错的。
+ *    本函数只做 got[i] ^ seed[i] 累或，碎片密钥只在 ncg_xor_key() 里
+ *    用于恢复 k_stub/k_mac。真实收益仅一条：strings 搜不到 "NCKEYLOCK"/
+ *    "NCSTUBLK" 字面量。攻击者 dump 到 slot 前 8 字节即可直接比对。
+ *    （已删除的 ncg_eq8 是同一语义的前身，语义等价，勿再引入。）
+ *
+ * 历史：旧实现叫 ncg_eq8(got, "NCKEYLOCK")，-O2 下被内联进
+ *       ncguard_unlock（连同 ncg_rd32/XOR 循环，实测约 200 行反汇编
+ *       / 736 字节）。2026-10-19 改种子形式后 ncg_eq8 已无调用方，
+ *       2026-10-20 删除（-Wall 报 unused function；删除前后 .text
+ *       section size 逐一相同，零字节影响）。 */
 static int ncg_magic_ok(const volatile unsigned char *got,
                         const uint8_t seed[8]) {
     uint8_t diff = 0;
@@ -736,7 +783,7 @@ static uint32_t ncg_rd32(const volatile unsigned char *p) {
     return v;
 }
 
-/* 明文 stub：把 .ncguard_head 还原成明文。
+/* 明文 stub：把 .ncxh 还原成明文。
  * 全程无循环展开以外的分支、无 libc 调用、无磁盘 I/O。
  * 未锁（slot magic 不匹配）时直接返回——段本就是明文。 */
 static void ncg_stub_recover(void) {
@@ -788,9 +835,9 @@ static void ncg_stub_recover(void) {
     /* ── P0-b：先验 MAC 再解密（2026-10-18）──────────────────────
      * 对【密文】算 HMAC-SHA256，与 slot 里的期望值恒定时间比较。
      * 位置刻意在 mprotect/解密【之前】：一旦不符，head 一个字都不改 → 段保持
-     * 密文 → 后续调用踩密文 = SIGILL（fail-closed，与 .ncguard 的 -11 语义
+     * 密文 → 后续调用踩密文 = SIGILL（fail-closed，与 .ncx 的 -11 语义
      * 完全对等）。此前 head 只有 XOR，攻击者可改"unlock 本体里的 MAC 校验
-     * 函数"那几位，把 .ncguard 的 HMAC 保护改成恒真从而绕过。
+     * 函数"那几位，把 .ncx 的 HMAC 保护改成恒真从而绕过。
      *
      * k_mac_head 的恢复与 k_stub 同源：都是 wrapped ^ NCG_XOR_KEY。
      * 调用 khmac_sha256 不破坏"stub 无智力"约束——它只是复用 .text 里
@@ -838,7 +885,7 @@ static void ncg_stub_recover(void) {
      *
      * 失败处理：段缺失或大小异常 → 不解，master 保持全零 →
      *   ncg_head_unlock 检测到全零即判定"未锁"直接返回 0。
-     *   这是 fail-safe 而非 fail-open：未锁状态下 .ncguard 本就是明文。 */
+     *   这是 fail-safe 而非 fail-open：未锁状态下 .ncx 本就是明文。 */
     {
         uint32_t ro_addr = ncg_rd32(slot + NCG_OFF_HEADRO_ADDR);
         uint32_t ro_size = ncg_rd32(slot + NCG_OFF_HEADRO_SIZE);
@@ -849,7 +896,7 @@ static void ncg_stub_recover(void) {
             uintptr_t re = ((uintptr_t) ro + ro_size - 1 & ~(ps2 - 1)) + ps2;
             if (mprotect((void *) rs, re - rs, PROT_READ | PROT_WRITE) == 0) {
                 /* ⚠️ 必须用【简单循环 XOR】，不能调 ncg_rc4 ——
-                 * ncg_rc4 本身就在 .ncguard_head 段里，此刻还是密文，
+                 * ncg_rc4 本身就在 .ncxh 段里，此刻还是密文，
                  * 调用它会踩密文（实测卡死/SIGILL）。这是本文件第二次
                  * 踩同一个坑（head 段锁箱也不能用 rc4，见 lock_head 注释）
                  * ——规矩是：**stub 能碰到的函数只能是 .text 里的**。
@@ -857,7 +904,7 @@ static void ncg_stub_recover(void) {
                 for (uint32_t i = 0; i < ro_size; i++)
                     ro[i] ^= k[i & 15];
                 /* ⚠️ 恢复成 RW 而不是 R —— 实测踩过：
-                 * .ncguard_head_ro 与 .data / .bss 【同页】
+                 * .ncxhr 与 .data / .bss 【同页】
                  * （实测 arm64：.data 0x13ca8、head_ro 0x13cd0、
                  *   .bss 0x13cf0，全在页 0x13000 内）。
                  * mprotect 粒度是页，设成 READ 会把 .bss 也变只读 →
@@ -905,7 +952,7 @@ int ncguard_unlock(void) {
     }
 
     ncg_stub_recover();          /* 先确保 head 本体是明文 */
-    int rc = ncg_head_unlock();  /* 再调本体解 .ncguard */
+    int rc = ncg_head_unlock();  /* 再调本体解 .ncx */
     if (rc == 0) done = 1;
     return rc;
 }

@@ -1,4 +1,4 @@
-/* nc_guard_key.c — .ncguard 密钥派生（证书绑定）
+/* nc_guard_key.c — .ncx 密钥派生（证书绑定）
  *
  * 照抄 XopProtector 的 key ladder（crypto/key_ladder.cpp + crypto/sha256.cpp
  * 的 hkdf_sha256 + crypto/apk_sign.cpp 的定点读证书），剥离其对
@@ -13,6 +13,14 @@
  *   派生逻辑公开 → 攻击者自己跑一遍脚本就能解出密钥，4012 字节密文秒变明文。
  *   证书绑定后 K_so = HKDF(master, SHA256(certDER), pkg)：换 key 重打包 →
  *   cert 变 → K_so 变 → 密文解不开。这是 Xop 的原设计，我们照抄。
+ *
+ * 2026-10-20 更正一处过期表述：早期注释写本文件"没有调用方，是 HKDF 契约的
+ * 可执行证明"。那是 P1-a 之前的口径。现行链路（P1-a，运行期证书派生）：
+ *   nc_guard_boot.c:533  ncg_derive_k_so_from_der()  ─┐
+ *   nc_guard_boot.c:591  ncg_derive_k_mac_from_der()  ─┼─→ 本文件的
+ *   nc_guard_boot.c:368  ksha256()                    ─┘   ncg_derive_k_so /
+ *                                                     ncg_derive_k_mac / khkdf
+ * 三者都真实参与解锁，不是契约证明。
  *
  * 与 so-section-lock.py 的契约（两侧必须逐字节一致）：
  *   label = "nc-so-v1" + package          （Xop 用 "xop-so-v1"+package）
@@ -147,7 +155,7 @@ void khmac_sha256(const uint8_t *key,size_t key_len,
 }
 
 /* ── 增量 HMAC（2026-10-19）─────────────────────────────────────────
- * 动机：.ncguard 与 .ncguard_ro 是两段不连续内存，一次性算 HMAC 需要
+ * 动机：.ncx 与 .ncxr 是两段不连续内存，一次性算 HMAC 需要
  * 先把两段拼接进临时缓冲（最多几十 KB）。增量式零额外内存、零拷贝。
  *
  * 完整性：与 khmac_sha256(key, m1||m2) 逐字节等价 —— 由
@@ -433,7 +441,7 @@ int ncg_derive_k_mac_from_der(const uint8_t master[32],
 
 /* ── 派生 K_mac（与 so-section-lock.py 的 derive_app_keys['mac'] 一致）──
  * k_mac = HKDF-SHA256(ikm=master, salt=SHA256(certDER), info="nc-so-mac-v1"+pkg, 16)
- * 2026-12 完整性校验专用：只参与 .ncguard 密文的 HMAC 计算，绝不与 so 域复用
+ * 2026-12 完整性校验专用：只参与 .ncx 密文的 HMAC 计算，绝不与 so 域复用
  * 同一把钥匙（复用 = 知道 RC4 密钥即可伪造 MAC，校验形同虚设）。 */
 int ncg_derive_k_mac(const uint8_t master[32],const uint8_t cert_sha256[32],
                      const char *pkg,uint8_t out[16]){

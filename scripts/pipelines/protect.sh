@@ -353,7 +353,7 @@ fi
 #
 # ⚠️ 本轮改动：nc_guard_unlock.c → nc_guard_boot.c（零冻结路线）
 #   unlock.c 仍是冻结资产、保留在仓库，但【不再进 NDK 工程】。
-#   boot.c 承接运行期职责：明文 stub(.text) + unlock 本体(.ncguard_head 密文)。
+#   boot.c 承接运行期职责：明文 stub(.text) + unlock 本体(.ncxh 密文)。
 #   理由：把"开锁器"也锁进箱子，否则 unlock.c 整份逻辑在 .text 明文可读
 #   （外部逆向报告 docs/so层防御/简盒-06 §6.2 的实测结论）。
 #   不改 unlock.c 本身 = 不动冻结纪律；它以历史存档形式留存。
@@ -441,10 +441,10 @@ fi
 log_step 5 6 "解包注入重打包"
 repack_unpack "$WORK/decompiled" "$STEP5_APK"
 
-# ── so 静态加固(2026-12):把 .ncguard 段锁成密文（构建期"锁箱"）──────
+# ── so 静态加固(2026-12):把 .ncx 段锁成密文（构建期"锁箱"）────────
 # 位置在 STEP5 解包后：so 已编译完但【还没进 APK】→ 锁的是即将打包的产物。
 # 运行期由 nc_guard_boot.c 的明文 stub 解出 unlock 本体，再由本体解
-# .ncguard；磁盘上 IDA 读到的 .ncguard 是 RC4 密文（现为 4012/2750 字节的
+# .ncx；磁盘上 IDA 读到的 .ncx 是 RC4 密文（现为 4012/2750 字节的
 # 12 个 env_check 探针 + dex2c 转译产物）。
 # 抄自 XopProtector 的 .bitcode 自解密机制。
 # cert 与 package 都由 so-section-lock.py 从 $IN_APK 自己提（定点读 Signing
@@ -453,15 +453,15 @@ repack_unpack "$WORK/decompiled" "$STEP5_APK"
 if [[ -d "$WORK/project/libs" ]]; then
   for so in "$WORK"/project/libs/*/libnc.so; do
     [[ -f "$so" ]] || continue
-    # 一级锁箱：.ncguard 代码段 + .ncguard_ro 常量表段（共用 k_so/同一个 MAC）
+    # 一级锁箱：.ncx 代码段 + .ncxr 常量表段（共用 k_so/同一个 MAC）
     #
     # 2026-10-19 为什么是两段（实测报告 §8.1 的核心缺陷）：
-    #   此前只锁 .ncguard，而真正的签名判定函数 nc_verify_t1 与两张表
+    #   此前只锁 .ncx，而真正的签名判定函数 nc_verify_t1 与两张表
     #   SIG_SALT/SIG_HASH_STORED 全在明文——加密只保护了 ncVerify 转发壳，
     #   核心留在 .rodata，`od` 一条命令就能读出并反推通过凭据。
-    #   现在判定函数进 .ncguard（AXR），表进 .ncguard_ro（AWR，不可执行）——
+    #   现在判定函数进 .ncx（AXR），表进 .ncxr（AWR，不可执行）——
     #   分两段是 clang 的硬约束：const 数据不能进可执行段。
-    # ⚠️ 老产物若没有 .ncguard_ro（未定义 NC_GUARD_SECTIONED），锁箱器会
+    # ⚠️ 老产物若没有 .ncxr（未定义 NC_GUARD_SECTIONED），锁箱器会
     #   在 --section 列表里找不到它而报错。故此处先探测段是否存在，
     #   不存在则退回单段（向前兼容，且不会静默降级——会打印明确提示）。
     # ⚠️ 段名必须与 nc_guard_boot.c 的宏 / so-section-lock.py 的常量一致。
@@ -480,9 +480,9 @@ if [[ -d "$WORK/project/libs" ]]; then
       echo "❌ .ncx 锁箱失败（段未标记？cert/包名提取失败？）——so 静态加固未生效" >&2
       exit 1
     }
-    # 二级锁箱（2026-10-18 自解谜）：把 unlock 本体也锁进 .ncguard_head。
-    # ⚠️ 顺序有依赖：必须先跑一级再跑二级。原因是一级会改 .ncguard 内容，
-    #    而二级要锁的 .ncguard_head 是另一个段，本无先后；但若二级先跑，
+    # 二级锁箱（2026-10-18 自解谜）：把 unlock 本体也锁进 .ncxh。
+    # ⚠️ 顺序有依赖：必须先跑一级再跑二级。原因是一级会改 .ncx 内容，
+    #    而二级要锁的 .ncxh 是另一个段，本无先后；但若二级先跑，
     #    unlock 本体已变密文，此时一级锁箱器本身不依赖 unlock（纯 Python
     #    读盘），所以其实可交换 —— 但保持"先业务后本体"更易读。
     # ⚠️ 二级失败必须 fail-fast：stub 见 slot 无 magic 会静默放行，

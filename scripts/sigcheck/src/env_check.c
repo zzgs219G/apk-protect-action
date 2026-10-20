@@ -28,7 +28,7 @@
 #include <pthread.h>
 #include <errno.h>
 
-/* .ncguard 段解锁(2026-12)：本文件 12 个探针已标进加密段，constructor 里
+/* .ncx 段解锁(2026-12)：本文件 12 个探针已标进加密段，constructor 里
  * 必须先解锁再跑探针，否则调用的是密文 → SIGILL。实现见 nc_guard_unlock.c
  * （与 so-section-lock.py 配套的"开箱"半边）。 */
 extern int ncguard_unlock(void);
@@ -207,12 +207,12 @@ static inline long env_raw_syscall(long n, long a0, long a1, long a2,
  *   380 个调用点全部失效 —— 攻击者 30 秒拿到可在真机常驻运行的绕过包。
  *
  * 本方案不是"改成静默污染"（那需要业务语义知识，无法对任意 APK 通用），
- * 而是让攻击者【找不到】kill 逻辑：把真正的处置函数标进 .ncguard 密文段。
+ * 而是让攻击者【找不到】kill 逻辑：把真正的处置函数标进 .ncx 密文段。
  * 未解锁时它是密文，`strings`/`objdump` 都看不到；静态搜 `abort@plt`
  * 的引用也只能看到"某处 bl 进了一段解不开的东西"。
  *
  * ⚠️ 三条纪律（违反任一即死锁或崩溃）：
- *   ① env_fail()【绝不能】进 .ncguard —— 它是本函数的调用方，且被
+ *   ① env_fail()【绝不能】进 .ncx —— 它是本函数的调用方，且被
  *      env_check_run() 在构造期调用。锁进去 = 开锁器锁进箱子 = 死锁。
  *      本处只标【被调用】的 env_delayed_kill。
  *   ② 必须条件化 NC_GUARD_SECTIONED（同 nc_link.c 的理由：宿主编译没有
@@ -221,11 +221,11 @@ static inline long env_raw_syscall(long n, long a0, long a1, long a2,
  *      ncguard_unlock()，所以 env_fail → 线程 → env_delayed_kill
  *      这条链上，段必定已是明文。
  *
- * 为什么放在 .ncguard 而不是 .ncguard_ro：这是【代码】不是常量表，
- * 需要执行权限，.ncguard_ro 是 AWR 不可执行段。
+ * 为什么放在 .ncx 而不是 .ncxr：这是【代码】不是常量表，
+ * 需要执行权限，.ncxr 是 AWR 不可执行段。
  *
  * 效果边界（如实）：它提高的是【发现成本】，不是【patch 成本】。
- * 攻击者若能离线解开 .ncguard（当前 master 仍是占位符，报告实测 8 分钟），
+ * 攻击者若能离线解开 .ncx（当前 master 仍是占位符，报告实测 8 分钟），
  * 就又能看到这段代码。真正断绝这条路要靠 master 随机化（P1-1，未做）
  * 与内联 svc 打散出口（方案2，未做）。本方案是纵深的一层，不是终点。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(ENVCHECK_HOST_TEST)
@@ -500,7 +500,7 @@ static void safe_lines_close(safe_lines_t *it) {
 /* ─────────────────────────── a. Frida 检测 ─────────────────────────── */
 
 /* a1. frida 默认端口 27042 / 27043 是否有监听者(127.0.0.1 回环快扫,50ms 超时) */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int frida_port_probe(void) {
@@ -559,7 +559,7 @@ static int frida_port_probe(void) {
  * 解码失败(NULL)按"未检出"处理,与全文件宁漏勿误伤纪律一致。
  * ⚠️ 本注释及全文件任何注释中禁止书写 LSGS 标记的字面形态(嵌套注释会
  *    提前终结注释块,编译炸 top level declarator;报错速查已留档)。 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int frida_maps_probe(void) {
@@ -593,7 +593,7 @@ static int frida_maps_probe(void) {
 
 /* a3. /proc/net/tcp(及 tcp6) 里 27042/27043 的十六进制端口是否处于 LISTEN(0A)
  * 端口特征串( ":69A2"/":69A3" )同样走 LSGS 密文,不明文进 so。 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int frida_tcp_table_probe(void) {
@@ -642,7 +642,7 @@ static int frida_tcp_table_probe(void) {
 
 /* b1. 已加载库特征(读 maps,比文件存在性可靠——hook 框架必然注入自身库)
  * 6 个特征串全走 LSGS 密文(不明文进 so),解码失败按"未检出"。 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int xposed_maps_probe(void) {
@@ -675,7 +675,7 @@ static int xposed_maps_probe(void) {
 /* b2. 已加载类特征:Xposed 环境 Java 栈里常有 XposedBridge(读自身进程 oatatmp 不可靠,
  * 改为探测 Xposed 安装痕迹文件——仅命中高置信路径)
  * 5 个路径全走 LSGS 密文(路径本身也是检测特征,不明文进 so)。 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int xposed_file_probe(void) {
@@ -719,7 +719,7 @@ static int xposed_file_probe(void) {
 
 /* /proc/self/status 的 TracerPid:被 ptrace 附着(调试器/memfault 工具)时非 0
  * "TracerPid:" 前缀走 LSGS 密文(它是调试检测的最直接路标词)。 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int tracer_probe(void) {
@@ -789,7 +789,7 @@ static uint32_t env_crc32_hw(const uint8_t *buf, size_t len) {
 }
 
 /* 探测只做一次:硬件能力在进程生命周期内恒定 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int env_hw_crc_ok(void) {
@@ -987,7 +987,7 @@ static int env_pvm_read_u32(const void *addr, uint32_t *out) {
                         (long)&local, 1L, (long)&remote, 1L, 0L) == (long)sizeof(uint32_t);
 }
 
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 #define NC_HOOK_PROBE_N 8
@@ -1023,7 +1023,7 @@ static int libc_hook_probe(void) {
 }
 
 /* d5. libc .text 内存 vs 磁盘 CRC 比对;不等=内存被改写。任一步异常→放行(未检出) */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int libc_text_crc_probe(void) {
@@ -1089,7 +1089,7 @@ static int libc_text_crc_probe(void) {
  * 误报兜底(与全文件纪律一致):任一步 I/O/解析/内存权限异常 → 视为"未检出",
  *   宁漏勿误伤。特别注意:若 .text 所在页在内存中不可读(某些加固/只读映射),
  *   直接放行而不是误判。 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int self_text_crc_probe(void) {
@@ -1140,7 +1140,7 @@ static int self_text_crc_probe(void) {
 /* e. Frida 线程名检测(读 /proc/self/task/<tid>/comm)
  * 5 个线程名全走 LSGS 密文(线程名是最直接的 Frida 指纹之一)。
  * 注意:gum 判定改为比对解码后的 k1,不再硬编码字面量。 */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int frida_thread_probe(void) {
@@ -1187,7 +1187,7 @@ static int frida_thread_probe(void) {
 }
 
 /* f. Frida unix socket 检测(读 /proc/net/unix 的路径字段) */
-/* .ncguard(2026-12):本探针进加密段,IDA 读到密文。
+/* .ncx(2026-12):本探针进加密段,IDA 读到密文。
  * retain 同探针文件——防 lib-ndk.sh 的 --gc-sections 回收。 */
 __attribute__((section(".ncx"), retain))
 static int frida_unix_probe(void) {
@@ -1358,10 +1358,10 @@ static void env_check_run(void) {
 
 /* dlopen 后最先执行的入口(与 sig_check_entry 并存,顺序不定,互不依赖) */
 __attribute__((constructor)) static void env_check_entry(void) {
-    /* .ncguard 解锁(2026-12)：必须排在【所有探针之前】——本文件的 12 个探针
+    /* .ncx 解锁(2026-12)：必须排在【所有探针之前】——本文件的 12 个探针
      * 已用 __attribute__((section(".ncx"))) 标进加密段，未解锁时它们是密文，
      * 提前调用会执行密文 → SIGILL。
-     * 幂等：ncguard_unlock() 内部以 .nckey 槽的 magic 判重，未锁/已解锁都返回 0；
+     * 幂等：ncguard_unlock() 内部以 .nck 槽的 magic 判重，未锁/已解锁都返回 0；
      * 失败(负数)不阻断——解密失败时下面调探针会崩，但那正是要暴露的问题，
      * 且 selftest 入口已能从 Java 侧读到失败码。
      * 注：本段是新追加的逻辑行，不改动下面任何既有行（AGENTS.md §2.4）。 */

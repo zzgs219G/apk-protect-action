@@ -23,7 +23,7 @@ ndk_write_mk() {
   local jni="$1" mod="${2:-nc}"
   cat > "$jni/Application.mk" <<'EOF'
 APP_STL := c++_static
-# NC_GUARD_SECTIONED: 让判决核心（nc_verify_t1）与签名表进 .ncguard 加密段。
+# NC_GUARD_SECTIONED: 让判决核心（nc_verify_t1）与签名表进 .ncx 加密段。
 # 为什么是显式宏而不是 __ANDROID__ 自动判断：宿主端任何一次"想验证段布局"
 # 的编译都会因为"标了段却没人解锁"而读到密文 → 假红。见 nc_link.c 的注释。
 APP_CPPFLAGS += -fvisibility=hidden -fno-ident -Oz -ffunction-sections -fdata-sections

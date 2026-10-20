@@ -42,13 +42,13 @@ void nc_heartbeat_arm_constructor(void);
  *   全在 .rodata，攻击者 `od` 一条命令就能读出来，反问出通过值。
  *   实测代价：报告作者据此 5 分钟反推出 32 字节通过凭据。
  *
- * 本处修复把【判定函数 + 两张表】一并标进 .ncguard 段，运行期由
+ * 本处修复把【判定函数 + 两张表】一并标进 .ncx 段，运行期由
  * nc_guard_boot.c 解锁后才可执行/可读：
  *   - 未解锁时它们是密文 → objdump 读到 <unknown>，od 读到随机字节
  *   - 解锁后才参与判定（触发点：NcLink.selftest → ncguard_unlock）
  *
  * ⚠️ 三条纪律（违反任一即死锁或崩溃）：
- *   ① ncVerify / heartbeat 这两个 JNI 入口【绝不能】进 .ncguard——
+ *   ① ncVerify / heartbeat 这两个 JNI 入口【绝不能】进 .ncx——
  *      它们是 unlock 的调用方，锁进去 = 开锁器被锁进箱子 = 死锁。
  *      本文件只标判决核心，不标 JNI 入口。
  *   ② 宿主测试（NCLINK_HOST_TEST）下必须【不标段】：宿主 clang 没有
@@ -73,9 +73,9 @@ void nc_heartbeat_arm_constructor(void);
  *
  * ⚠️ 2026-10-19 实测踩坑（必须记住）：表【不能】与函数放同一个段。
  *    clang 报 `'nc_verify_t1' causes a section type conflict with 'SIG_SALT'`
- *    —— 因为 .ncguard 是 AXR（可执行）段，而 SIG_SALT 是 const 数据，
+ *    —— 因为 .ncx 是 AXR（可执行）段，而 SIG_SALT 是 const 数据，
  *    LLVM 拒绝让同一段既装代码又装只读数据。
- *    解法：数据单独进 .ncguard_ro（AWR，不可执行），由锁箱器一并加密。
+ *    解法：数据单独进 .ncxr（AWR，不可执行），由锁箱器一并加密。
  *    这也更合理——代码段解出来是 RX，数据段解出来是 R，权限各自最小。 */
 #if defined(NC_GUARD_SECTIONED) && !defined(NCLINK_HOST_TEST)
 #  define NC_VERIFY_TABLE_SECTION \
@@ -150,7 +150,7 @@ int nc_heartbeat_expired(void)
  * 非静态:由 -fvisibility=hidden 收敛符号面,JNI 入口是唯一导出面。
  * 返回 1 = 判定通过(或调试模式跳过),0 = 判定不过(Java 侧执行杀)。
  *
- * ⚠️ NC_VERIFY_SECTION（2026-10-19）：生产构建下本函数进 .ncguard 密文段。
+ * ⚠️ NC_VERIFY_SECTION（2026-10-19）：生产构建下本函数进 .ncx 密文段。
  *    它【不是】unlock 的调用方，是纯被调方，所以可以安全上锁。
  *    调用方 ncVerify（JNI 入口）刻意不标——那会造成解锁死锁。
  */

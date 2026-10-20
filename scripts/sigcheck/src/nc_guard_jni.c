@@ -1,8 +1,8 @@
-/* nc_guard_jni.c — .ncguard 机制的 JNI 自检入口（非冻结，可随时删）
+/* nc_guard_jni.c — .ncx 机制的 JNI 自检入口（非冻结，可随时删）
  *
  * 为什么需要它：e97a761 落地后，真机跑加固包【没有任何现象】可观测——
  *   -fvisibility=hidden 把 ncguard_unlock/ncguard_probe 全藏了，Java 侧
- *   native 侧都找不到入口；.nckey 密钥槽在产物里是满的（未擦 = 没跑过）。
+ *   native 侧都找不到入口；.nck 密钥槽在产物里是满的（未擦 = 没跑过）。
  *   "不闪退"因此什么都证明不了（那段密文根本没被执行）。
  *
  * 本文件给一个显式入口，让 CI/真机能拿到【可判读的回执】：
@@ -15,16 +15,16 @@
  * NcLink 上,与 ncVerify/heartbeat 同源。
  *
  *   返回值语义（Android 上才能测出的部分）：
- *     59     ✅ 完整链路通过：解锁 → 解密 → 执行 .ncguard 代码
+ *     59     ✅ 完整链路通过：解锁 → 解密 → 执行 .ncx 代码
  *     -1     dladdr 失败（拿不到 so 基址）
- *     -2     .ncguard 段定位失败
- *     -3     .nckey 段定位失败
+ *     -2     .ncx 段定位失败
+ *     -3     .nck 段定位失败
  *     -7/-8  mprotect 失败（Android 对 SHF_EXECINSTR 页的限制比 Linux 严）
  *     -9     内存分配失败
  *     -10    恢复 PROT_EXEC 失败
  *     其它   见 ncguard_unlock() 内部注释
  *
- *   ⚠️ 调用本函数即触发【一次性】解锁；解锁后 .nckey 槽被擦除，再次调用
+ *   ⚠️ 调用本函数即触发【一次性】解锁；解锁后 .nck 槽被擦除，再次调用
  *      会因"槽已空"走幂等分支返回 0（不再是 59）。故自检只调一次。
  *
  * 名字里的 com/nc/guard 由 protect.sh 的 Java 侧注入保持同包；若 Java 侧
@@ -39,7 +39,7 @@ extern int ncguard_probe(int token);
 
 /* ── 一次性守门 ─────────────────────────────────────────────────────
  * 为什么必须挡第二次：ncguard_unlock() 在槽已擦（磁盘 magic 清零）时走
- * 幂等分支返回 0，此时 .ncguard 虽在内存里是明文，但 selftest() 无法区分
+ * 幂等分支返回 0，此时 .ncx 虽在内存里是明文，但 selftest() 无法区分
  * "首次解锁成功"(rc=0) 与"槽已空故跳过"(rc 同样 0) → 会再走一次
  * probe() → 而首次解锁尾部的 mprotect(RX)/clear_cache 时序会让第二次取指
  * 命中 I-cache 不一致 → SIGILL（2026-10-17 实测：第一次 59 成功，第二次
@@ -67,6 +67,6 @@ NC_SELFTEST_DECL {
     if (rc != 0) {
         return (jint) rc;        /* 解锁失败：把失败码透传，别吞 */
     }
-    /* 解密成功后才可执行 .ncguard 里的代码；契约值见 nc_guard_probe.c */
+    /* 解密成功后才可执行 .ncx 里的代码；契约值见 nc_guard_probe.c */
     return (jint) ncguard_probe(0);
 }

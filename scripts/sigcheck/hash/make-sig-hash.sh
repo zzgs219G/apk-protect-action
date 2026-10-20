@@ -102,7 +102,7 @@ fi
 
 # 生成 C 头文件（每行 8 字节;SIG_SALT 随机、SIG_HASH_STORED 为派生形态,均非明文指纹）
 #
-# 2026-10-19 段标记：两张表在生产构建下进 .ncguard 加密段。
+# 2026-10-19 段标记：两张表在生产构建下进 .ncxr 加密段（段名已中性化）。
 #   实测报告 §3.6/§8.1 指出：判定算法与这两张表原先全在 .rodata，
 #   攻击者 `od` 一条命令读出 salt + stored，5 分钟反推出 32 字节通过凭据。
 #   加了段属性后，未解锁时 od 读到的是随机密文。
@@ -114,7 +114,7 @@ fi
 {
   echo "/* 由流水线自动生成: $(basename "$APK") 证书指纹的双轮派生形态 */"
   echo "/* 攻防说明: 明文指纹不落盘。攻击面分析见 docs/流程文档.md §9(2026-10 存储混淆) */"
-  echo "/* 2026-10-19: 生产构建下两张表进 .ncguard 加密段(NC_GUARD_SECTIONED)。 */"
+  echo "/* 2026-10-19: 生产构建下两张表进 .ncxr 加密段(NC_GUARD_SECTIONED)。 */"
   echo "#ifndef _SIG_HASH_H_"
   echo "#define _SIG_HASH_H_"
   echo ""

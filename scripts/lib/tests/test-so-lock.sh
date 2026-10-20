@@ -9,10 +9,11 @@
 #   ③ magic 落盘仍是明文（以为改了其实没改）
 # 这三个都是"改完不跑就发现不了"的类型。
 #
-# 覆盖 6 项：
-#   T1 编译（同 NDK flags）→ 四段齐全
+# 覆盖 22 项（编号按落地顺序，非执行顺序——T4/T5/T8 依赖真机运行，
+# 排在末尾；用 APK=... bash $0 指定已签名 APK 才跑，缺 APK 时跳过）：
+#   T1 编译（同 NDK flags）→ 六段齐全
 #   T2 一级锁箱 → .nck 96 字节
-#   T3 二级锁箱 → .ncks 96 字节
+#   T3 二级锁箱 → .ncks 104 字节
 #   T4 未改代码 → selftest == 59
 #   T5 改 .text 1 位 → 自绑定生效 → 非 59（SIGILL/崩溃）
 #   T6 明文路标归零（NCKEYLOCK / NCSTUBLK 不可 strings 搜到）
@@ -26,6 +27,12 @@
 #   T14 JNI 符号面收缩（.dynsym 只剩 JNI_OnLoad）★ P2-1
 #   T15 .rodata 路径密文化（/proc/* 等明文零命中）★ P2-2
 #   T16 段名中性化（不再有自解释的 ncguard/nckey）★ P2-3
+#   T17 诱饵真随机（两次构建 wrapped_k_so 不同，diff 手法失效）★ 2026-10-19
+#   T18 CRC 自绑定覆盖整个 .text（不是只覆盖 stub 函数）★ 2026-10-19
+#   T19 hook 探针覆盖 mprotect/mmap/dlopen/pvm_readv（解密链关键点）★
+#   T20 C↔Python 契约常数跨语言对拍（段名/尺寸/偏移/magic seed）★ 2026-10-20
+#   T21 全仓段名字面量登记检测（防拼错/防新增未登记段名）★ 2026-10-20
+#   T22 二进制等价性（固定 sig_hash.h 后，改动不得改变产物字节）★ 2026-10-20
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail

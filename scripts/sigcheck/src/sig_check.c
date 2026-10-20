@@ -726,7 +726,7 @@ static void derive_expected(const unsigned char actual[32], unsigned char out[32
 /* ── kill 链进加密段（2026-10-19 方案4）────────────────────────────
  *
  * 与 env_check.c 的 env_delayed_kill 同一策略：把真正的处置逻辑标进
- * .ncguard 密文段，让攻击者【找不到】它，而不是改成静默污染
+ * .ncx 密文段，让攻击者【找不到】它，而不是改成静默污染
  * （那需要业务语义知识，无法对任意 APK 通用）。
  *
  * 实测报告 §12.1 的绕过路径是"改 3 个 PLT 桩废掉 380 个调用点"。
@@ -826,7 +826,7 @@ SIG_KILL_SECTION
  * ⚠️ 为什么不共用一个函数加参数：共用函数 = 一处 patch 全废，
  *    参数化只改变量不改控制流，攻击者改一条比较就能让三个变体都走
  *    最轻的路径。必须是【三个独立函数体】才有意义。
- * ⚠️ 三个都标进 .ncguard（ENV_KILL_SECTION 同款），未解锁时都是密文。 */
+ * ⚠️ 三个都标进 .ncx（ENV_KILL_SECTION 同款），未解锁时都是密文。 */
 
 /* variant 0：环境异常类 —— 短延迟（这类失败多半是环境问题，快杀快排障） */
 SIG_KILL_SECTION

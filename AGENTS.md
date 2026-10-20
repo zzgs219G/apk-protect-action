@@ -42,21 +42,44 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 | 冻结模块 | 职责 | 钉死的回归测试 |
 |---|---|---|
 | `scripts/sigcheck/src/sig_check.c` | 签名校验 native 实现(maps 定位截断、Signing Block 解析、SHA-256) | `scripts/sigcheck/javalink/tests/test-javacheck.sh`(11 大项,host 编译+对拍) + `scripts/sigcheck/tests/test-lsgs-strings.sh`(密文零泄漏) |
-| `scripts/sigcheck/src/env_check.c` | 环境检测(10 探针/反调试抢占/so 自校验/心跳检查端) | 同上两套 + `scripts/sigcheck/tests/test-lsgs-strings.sh`。**2026-10-19**:`env_delayed_kill` 进 `.ncguard`;`safe_syscall` 改内联 `svc`(arm64 `x8`/armv7 `r7`)、新增 `env_raw_die`——**`syscall()` 本身也是 PLT 表项**,验收必查 `nm -D -u \| grep -wE "abort\|syscall\|_exit\|raise"` 为空。**kill 函数标段、调用方(`env_fail`)不标段**(后者是 unlock 使用者,标了即死锁) |
+| `scripts/sigcheck/src/env_check.c` | 环境检测(10 探针/反调试抢占/so 自校验/心跳检查端) | 同上两套 + `scripts/sigcheck/tests/test-lsgs-strings.sh`。**2026-10-19**:`env_delayed_kill` 进加密段(段名已中性化,见下方对照);`safe_syscall` 改内联 `svc`(arm64 `x8`/armv7 `r7`)、新增 `env_raw_die`——**`syscall()` 本身也是 PLT 表项**,验收必查 `nm -D -u \| grep -wE "abort\|syscall\|_exit\|raise"` 为空。**kill 函数标段、调用方(`env_fail`)不标段**(后者是 unlock 使用者,标了即死锁) |
 | `scripts/sigcheck/src/nc_link.c` | Java↔Native 桥接(ncVerify/heartbeat + 心跳武装) | test-javacheck.sh(判决对拍) + 心跳语义对拍(变更历史 10-16 条) |
 | `scripts/inject/inject-loadlib.py` | loadLibrary 插桩(幂等、多 dex、AXMLPrinter) | `tests/test_inject_loadlib.py`(冒烟,若存在) |
 | `scripts/sigcheck/hash/extract-cert-fp.py` | 证书指纹提取(纯 stdlib 解析 Signing Block) | `tests/test_cert_fp.py`(伪造 APK 双场景,若存在) |
 | `scripts/repack/mark-native.py` | native 壳替换 + 插桩 | 冒烟: 回归测试内嵌 |
 | `tools/dcc/`(解压产物;真源 `tools/dcc.zip`) | dcc 工具(**引擎已下架**,现仅为 apktool.jar + 内置 androguard 载体) | 严禁任何改动(历史: 报错三/九);真源包 `tools/dcc.zip` 严禁改包/换版/**删除** |
 | `tools/dcc/tools/apktool.jar` | 解包/重打包工具(apktool 3.0.3,随 dcc.zip 解压) | 严禁替换版本(历史: 报错四/五);dcc 引擎下架后这是该 zip 的唯一存在理由 |
-| `scripts/sigcheck/src/nc_guard_unlock.c` | `.ncguard` 段运行期自解密(**2026-10-18 起已退出 NDK 工程**,保留为历史存档;现行入口是 `nc_guard_boot.c`) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化;改动前必读 `docs/流程文档.md` §3.12 的 8 条审查点 |
-| `scripts/sigcheck/src/nc_guard_boot.c` | 自解谜设施:明文 stub(`.text`)+ unlock 本体(`.ncguard_head` 密文) | 真机链路已验证: 两级锁箱后 dlopen → add/mul/selftest 全对;**绝不可把 `ncg_head_unlock` 标进 `.ncguard`**(它得先被 stub 解出来);stub 用简单 XOR 而非 RC4,`lock_head()` 必须同算法 |
-| `scripts/sigcheck/src/nc_guard_boot.c` 补充 | **2026-10-19 master 随机化**:master 藏在 `.ncguard_head_ro`(AWR,32B),用 **`k_stub`** 加密——用 `k_so` 会死循环(k_so 派生正需要 master)。slot 96→104。**stub 只能调 `.text` 里的函数**(用 head 段里的 `ncg_rc4` 会执行密文 → 卡死);**mprotect 粒度是页**,head_ro 与 `.data`/`.bss` 同页,解完必须恢复 `RW` 而非 `R`(否则 .bss 变只读 → SIGSEGV) | `test-so-lock.sh` T11/T12 |
+| `scripts/sigcheck/src/nc_guard_unlock.c` | `.ncx` 段运行期自解密(**2026-10-18 起已退出 NDK 工程**,保留为历史存档;现行入口是 `nc_guard_boot.c`) | 真机已验证: 4012/2750B 密文、selftest=59、冷启动无可测劣化;改动前必读 `docs/流程文档.md` §3.12 的 8 条审查点 |
+| `scripts/sigcheck/src/nc_guard_boot.c` | 自解谜设施:明文 stub(`.text`)+ unlock 本体(`.ncxh` 密文) | 真机链路已验证: 两级锁箱后 dlopen → add/mul/selftest 全对;**绝不可把 `ncg_head_unlock` 标进 `.ncxh`**(它得先被 stub 解出来);stub 用简单 XOR 而非 RC4,`lock_head()` 必须同算法 |
+| `scripts/sigcheck/src/nc_guard_boot.c` 补充 | **2026-10-19 master 随机化**:master 藏在 `.ncxhr`(AWR,32B),用 **`k_stub`** 加密——用 `k_so` 会死循环(k_so 派生正需要 master)。slot 96→104。**stub 只能调 `.text` 里的函数**(用 head 段里的 `ncg_rc4` 会执行密文 → 卡死);**mprotect 粒度是页**,head_ro 与 `.data`/`.bss` 同页,解完必须恢复 `RW` 而非 `R`(否则 .bss 变只读 → SIGSEGV) | `test-so-lock.sh` T11/T12 |
 | `scripts/sigcheck/src/nc_jni_register.c` | JNI 动态注册 + `JNI_OnLoad`（2026-10-19） | `.dynsym` 只导出 `JNI_OnLoad`。**JNIEXPORT 自带 default 可见性，`-fvisibility=hidden` 对它无效**；实现函数用 `visibility("hidden")`（不能用 `static`——`RegisterNatives` 需要函数指针）。签名以 `compiled_methods.txt` 为权威（C 参数推导会把 jobject 变成 Object）| `test-so-lock.sh` T14 |
-| `scripts/sigcheck/src/nc_guard_key.c` | HKDF-SHA256 + 证书 DER 提取(`k_so = HKDF(master, SHA256(certDER), info)` ) | 无调用方,是"HKDF 契约的可执行证明";sha256/hmac/hkdf 三组测试向量对拍过,勿重写密码学原语 |
-| `scripts/sigcheck/src/nc_link.c` | Java↔Native 判决核心 `nc_verify_t1` + 心跳记录侧 | `test-javacheck.sh` 11 大项(判决对拍/心跳语义)。**2026-10-19**:`nc_verify_t1` 进 `.ncguard` 段,两张签名表进 `.ncguard_ro`——**`ncVerify`/`heartbeat` 两个 JNI 入口绝不能标段**(它们是 unlock 调用方,标了即死锁);段标记必须条件化 `NC_GUARD_SECTIONED && !NCLINK_HOST_TEST`(否则宿主测试读到密文假红) |
-| `scripts/sigcheck/src/nc_guard_probe.c` | `.ncguard`/`.nckey` 两段的**唯一定义处**(`ncg_key_slot[96]` 就是 `.nckey` 段全部内容) | 改数组长度必须同步 `so-section-lock.py` 的 `assert len(blob)==96` 与 `nc_guard_boot.c` 的 `NCG_SLOT_SIZE`——不一致在构建期即 AssertionError。**2026-10-19 P1-a 从 80 扩到 96**：新增 `pkg_sha8`(包名指纹)+reserved |
+| `scripts/sigcheck/src/nc_guard_key.c` | HKDF-SHA256 + 证书 DER 提取(`k_so = HKDF(master, SHA256(certDER), info)` ) | **2026-10-20 更正**:本文件【有调用方】——`ncg_derive_k_so_from_der`/`ncg_derive_k_mac_from_der` 由 `nc_guard_boot.c` 调(P1-a 运行期证书派生),它们内部再调本文件的 `ncg_derive_k_so`/`ncg_derive_k_mac`。sha256/hmac/hkdf 三组测试向量对拍过,勿重写密码学原语 |
+| `scripts/sigcheck/src/nc_link.c` | Java↔Native 判决核心 `nc_verify_t1` + 心跳记录侧 | `test-javacheck.sh` 11 大项(判决对拍/心跳语义)。**2026-10-19**:`nc_verify_t1` 进 `.ncx` 段,两张签名表进 `.ncxr`——**`ncVerify`/`heartbeat` 两个 JNI 入口绝不能标段**(它们是 unlock 调用方,标了即死锁);段标记必须条件化 `NC_GUARD_SECTIONED && !NCLINK_HOST_TEST`(否则宿主测试读到密文假红) |
+| `scripts/sigcheck/src/nc_guard_probe.c` | `.ncx`/`.nck` 两段的**唯一定义处**(`ncg_key_slot[96]` 就是 `.nck` 段全部内容) | 改数组长度必须同步 `so-section-lock.py` 的 `assert len(blob)==96` 与 `nc_guard_boot.c` 的 `NCG_SLOT_SIZE`——不一致在构建期即 AssertionError。**2026-10-19 P1-a 从 80 扩到 96**：新增 `pkg_sha8`(包名指纹)+reserved |
 | `scripts/lib/so_section_mark.py` | 通用段标记器(第2层设施):规则=函数头正则,零模块逻辑 | 新消费者接入前必读 `docs/流程文档.md` §3.12.1 的接入清单;改规则必须跑 `--check -v` 实测命中,不许只看正则可编译 |
+
+### 段名中性化对照表(2026-10-19 改名,2026-10-20 补表)
+
+| 旧名(2026-12 ~ 2026-10-18) | 现行名 | 用途 |
+|---|---|---|
+| `.ncguard` | `.ncx` | 加密代码段(AXR,可执行) |
+| `.ncguard_ro` | `.ncxr` | 加密常量表段(AWR,不可执行) |
+| `.ncguard_head` | `.ncxh` | unlock 本体(二级锁箱对象) |
+| `.ncguard_head_ro` | `.ncxhr` | master 数据段(AWR,32B) |
+| `.nckey` | `.nck` | 一级密钥槽 |
+| `.nckey_stub` | `.ncks` | 二级 stub 密钥槽 |
+
+改名的理由:旧名自解释(`ncguard`/`nckey` 一眼看出机制),`readelf -S`
+即可列举出全部加固结构。现行名无语义,仅缩短。
+
+⚠️ 例外:`scripts/sigcheck/src/nc_guard_unlock.c` 是历史存档(已退出 NDK
+工程),**刻意保留旧段名**——读到 `.ncguard` 说明那是旧版实现,不要照着改。
+现行实现是 `nc_guard_boot.c`(用 `.ncxh`/`.ncxhr`)。
+
+**2026-10-20 起,契约常数的单一真相源见 `test-so-lock.sh` 的 T20/T21/T22**:
+T20 把 C 侧宏与 `so-section-lock.py` 的 Python 常量跨语言对拍,T21 扫描全仓
+段名字面量(未登记即构建失败),T22 验证改动不改变产物字节。
+新增段名/偏移/尺寸时,先改 C 侧与 Python 侧,再跑这三项。
 
 ### LSGS 密文机制约束(2026-10 新增,改 sig_check.c/env_check.c 前必读)
 
@@ -88,7 +111,7 @@ AI 不得"顺手优化"、"重构"、"重命名"、"整理格式"。它们的正
 3. **修复冻结模块的真实 bug**: 必须满足——
    - 用户在当次对话明确报告了该模块的错误行为(附日志/复现);
    - 改动后回归测试全绿(若 `tests/` 目录存在);
-   - 在 `docs/流程文档.md` §9 变更历史追加一行(报错 N)记录根因。
+   - 在 `docs/变更历史.md` 追加一行(报错 N)记录根因。
 4. **扩展冻结模块**(加日志、加防御): 只允许**追加**,不允许改写已有逻辑行。
 
 ## 3. 改动后的必做动作(任何改动,不论大小)
@@ -98,7 +121,12 @@ git diff                          # 自查: 只含预期改动
 ```
 
 (原 `tests/run-tests.sh` 与 module-guard.yml CI 守卫已移除;改动冻结模块
-仍需自查 diff,并在 docs/流程文档.md §9 留痕。)
+仍需自查 diff,并在 docs/变更历史.md 留痕。)
+
+> ⚠️ 2026-10-20 修正指向:本节原文写"`docs/流程文档.md` §9 变更历史"。
+> 该文件的 §9 早已不存在(变更历史整体迁到 `docs/变更历史.md`,按时间倒序),
+> 原指向会让"留痕"这一步按字面无法执行。现已改为指向实际文件。
+> 冻结表里的其它 `docs/流程文档.md §3.12.x` 引用经核对仍然有效,未改。
 
 ## 4. 模块化契约(新增模块时遵守)
 

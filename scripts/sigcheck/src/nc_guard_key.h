@@ -31,7 +31,7 @@ void khmac_sha256(const uint8_t *key, size_t key_len,
 
 /* 增量 HMAC（2026-10-19）：分段喂消息，用于 MAC 覆盖多个不连续段。
  *
- * 为什么需要它：.ncguard 与 .ncguard_ro 是两个不连续的 ELF 段，
+ * 为什么需要它：.ncx 与 .ncxr 是两个不连续的 ELF 段，
  * 一次性算 HMAC 得先把两段拼进临时缓冲（最多几十 KB malloc + memcpy）。
  * 增量式零额外内存、零拷贝。
  * 语义与 khmac_sha256(k,m1||m2) 完全等价（对拍测试钉死）。
@@ -78,10 +78,16 @@ int ncg_derive_k_mac_from_der(const uint8_t master[32],
                               const char *pkg, uint8_t out[16]);
 
 /* k_mac = HKDF-SHA256(..., info="nc-so-mac-v1"+pkg, 16)
- * 2026-12 完整性校验专用域，只参与 .ncguard 密文的 HMAC 计算。
+ * 2026-12 完整性校验专用域，只参与 .ncx 密文的 HMAC 计算。
  * ⚠️ 与 k_so 必须用不同 label —— 复用同一把钥匙等于"知道 RC4 密钥就能
  * 伪造 MAC"，校验形同虚设。改 label 必须同步 so-section-lock.py 的
  * derive_app_keys()（本轮已用真证书对拍验证两侧逐字节一致）。
- * 当前无调用方（unlock 走 slot 里的 wrapped_k_mac），它是契约证明。 */
+ *
+ * 2026-10-20 更正一处过期表述：本函数【有调用方】。早期注释写
+ * "当前无调用方（unlock 走 slot 里的 wrapped_k_mac），它是契约证明"，
+ * 那是在 P1-a 之前的口径。P1-a 起 k_mac 改为运行期从证书派生，
+ * nc_guard_boot.c:591 调 ncg_derive_k_mac_from_der()，它内部调本函数。
+ * 同理 ncg_derive_k_so() 由 ncg_derive_k_so_from_der() 调用
+ * （boot.c:533），也不是无调用方。 */
 int ncg_derive_k_mac(const uint8_t master[32], const uint8_t cert_sha256[32],
                      const char *pkg, uint8_t out[16]);

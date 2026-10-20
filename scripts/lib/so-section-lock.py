@@ -10,15 +10,36 @@
 编译瘦身，没有任何一层作用在【函数体可读性】上。XopProtector 的
 .bitcode 自解密段是业界成熟做法，本脚本是其"锁箱"半边的等价实现。
 
-2026-12 第二版追加 HMAC 完整性校验（.ncguard 从"改坏"升级为"检测到"）：
+2026-12 第二版追加 HMAC 完整性校验（加密段从"改坏"升级为"检测到"）：
   对【密文】算 HMAC-SHA256，密钥用独立的 mac 域（label "nc-so-mac-v1"，
   绝不复用 so 域——复用等于"知道 RC4 密钥就能伪造 MAC"，校验形同虚设）。
-  .nckey slot 布局（80 字节，改这里必须同步 C 侧 nc_guard_unlock.c）：
-    [0:16]  magic        'NCKEYLOCK' + 7 个 0
-    [16:32] wrapped_k_so   k_so ^ XOR_KEY
-    [32:48] wrapped_k_mac  k_mac ^ XOR_KEY
-    [48:80] expect_mac     HMAC-SHA256(k_mac, 密文)
-  前 32 字节布局与旧版完全一致 → 旧 C 侧开箱代码仍能解出 k_so。
+
+  ⚠️⚠️ 2026-10-20：本文件此前通篇使用 2026-10-19 改名前的旧段名
+  （.ncguard / .ncguard_ro / .ncguard_head / .ncguard_head_ro /
+   .nckey / .nckey_stub），与实际操作的常量（SECTION_NAME / SLOT_NAME /
+  HEAD_NAME / HEAD_RO_NAME / STUB_SLOT）名实不符 —— 读者按注释里的旧名
+  去搜代码会搜不到。现已全部改为现行名。
+
+  段名对照表（旧名 → 现行名，改段名前先查此表）：
+    .ncguard          → .ncx     加密代码段（AXR）
+    .ncguard_ro       → .ncxr    加密常量表（AWR）
+    .ncguard_head     → .ncxh    unlock 本体（二级锁箱对象）
+    .ncguard_head_ro  → .ncxhr   master 数据段（32B）
+    .nckey            → .nck     一级密钥槽
+    .nckey_stub       → .ncks    二级 stub 密钥槽
+
+  ⚠️ 源码里的 nc_guard_unlock.c 是历史存档，【刻意保留旧名】——
+  读到 .ncguard 说明那是旧版实现，不要照着改。
+
+  .nck slot 布局（96 字节，2026-10-19 P1-a 起；原 80 字节版见历史记录）：
+    [0:16]  magic        seed + 8 个 0（seed 见 SLOT_MAGIC_SEED）
+    [16:32] decoy        诱饵（P1-a 起非真密钥，真 k_so 由运行期证书派生）
+    [32:48] decoy_mac    诱饵（同上）
+    [48:80] expect_mac    HMAC-SHA256(k_mac, 密文)
+    [80:88] pkg_sha8      SHA256(包名) 前 8 字节
+    [88:96] reserved
+  两侧契约：本文件 blob 组装 + assert len(blob)==96，C 侧 nc_guard_probe.c
+  的 ncg_key_slot[96] 与 nc_guard_boot.c 的 NCG_SLOT_SIZE / NCG_OFF_*。
 
 与 XopProtector 的对应关系（照抄逻辑、改名以清晰）：
   Xop: PROTECTOR_ENCRYPT 宏 → SECTION(".bitcode")        本: __attribute__((section(SECTION_NAME)))
@@ -27,11 +48,11 @@
   Xop: section_decrypt.cpp decrypt_section()             本: 由运行期 C 代码负责（另行抄）
 
 用法：
-  so-section-lock.py <输入.so> <输出.so> [--section .ncguard] [--dry-run]
+  so-section-lock.py <输入.so> <输出.so> [--section .ncx] [--dry-run]
 
 设计约束：
   - size-preserving：加密后段长度不变（ELF 段大小固定，运行期原地解密）
-  - 只加密自定义段（默认 .ncguard），不动 .text/.rodata 等标准段
+  - 只加密自定义段（默认 .ncx），不动 .text/.rodata 等标准段
   - 幂等：重复锁同一文件 = 二次加密（会毁数据），故默认拒绝已锁文件，
     用 --force 才强制（仅调试用）
 """
@@ -46,7 +67,7 @@ import zlib
 # ── 常量契约（与运行期 C 代码共享，改这里必须同步改 C 侧）────────────
 SECTION_NAME = '.ncx'           # 加密代码段（Xop 用 .bitcode，改名避开指纹）
 SLOT_NAME = '.nck'                # 密钥槽段（Xop 用 .protwrap）
-# ⚠️ 2026-10-19：magic 不再以明文字面量落进 .nckey/.nckey_stub。
+# ⚠️ 2026-10-19：magic 不再以明文字面量落进 .nck/.ncks。
 # 原实现直接写 b'NCKEYLOCK' / b'NCSTUBLK'，攻击者 `strings -n 6` 就能扫出
 # 两条明确路标（实测旧产物可见 3 条）。现在改成 seed ^ XOR_KEY 的形式，
 # 二进制里不再有该字面量；运行期 C 侧由 ncg_magic_ok() 用同样的
@@ -67,8 +88,8 @@ assert bytes(a ^ b for a, b in zip(STUB_MAGIC_SEED, XOR_KEY)) == b'NCSTUBLK'
 # 旧的 SLOT_MAGIC/SLOT_MAGIC_SEED 双轨容易搞混，这里只保留 seed 一个真相源。
 SLOT_MAGIC = SLOT_MAGIC_SEED + b'\x00' * 8   # 16 字节，后 8 保留
 # ⚠️ 2026-10-18 与 LSGS 彻底分离（原注释写"与 LSGS 同源"，是错的）：
-# 同一把 8 字节密钥此前同时护三处 —— .ncguard 的 wrapped_k_so /
-# wrapped_k_mac、.ncguard_head 的 wrapped_k_stub、以及 make-sig-log.py 的
+# 同一把 8 字节密钥此前同时护三处 —— .ncx 的 wrapped_k_so /
+# wrapped_k_mac、.ncxh 的 wrapped_k_stub、以及 make-sig-log.py 的
 # 中文日志 XOR 密文。而 LSGS 侧自己的注释就写着"不抗人工逆向"（它只是
 # 打散 strings 扫描的纯 XOR）。共用的后果：破掉最脆的那套，强的一起破。
 # 现在 nc_guard 侧用本常量，LSGS 侧保持原值不动，两把钥匙互不相关。
@@ -81,9 +102,9 @@ SLOT_MAGIC = SLOT_MAGIC_SEED + b'\x00' * 8   # 16 字节，后 8 保留
 # slot 布局（40 字节，与 nc_guard_boot.c 的 stub 逐字节一致）：
 #   [ 0: 8) magic NCSTUBLK
 #   [ 8:24) wrapped k_stub = k_stub ^ XOR_KEY
-#   [24:28) stub_sh_addr —— .nckey_stub 段自身的链接期虚拟地址
-#   [28:32) head_sh_addr —— .ncguard_head 段的链接期虚拟地址
-#   [32:36) head_size    —— .ncguard_head 段字节数
+#   [24:28) stub_sh_addr —— .ncks 段自身的链接期虚拟地址
+#   [28:32) head_sh_addr —— .ncxh 段的链接期虚拟地址
+#   [32:36) head_size    —— .ncxh 段字节数
 #   [36:40) 预留（对齐与将来扩展）
 #
 # ⚠️ 2026-10-18 不存 entry_delta（入口符号 − 段起始偏移）：那需要从 .symtab
@@ -436,8 +457,8 @@ def _first_cert_der(scheme: bytes):
 def shannon_entropy(data: bytes) -> float:
     """香农熵（bits/byte）。用于验证"加密真的生效了"。
 
-    RC4 输出是伪随机流，熵必然接近 8.0（实测 .ncguard_head 约 7.4、
-    .ncguard 视内容在 7.9 以上）。普通代码段只有 6.6~6.9。
+    RC4 输出是伪随机流，熵必然接近 8.0（实测 .ncxh 约 7.4、
+    .ncx 视内容在 7.9 以上）。普通代码段只有 6.6~6.9。
     所以熵掉了只能说明一件事：那一段不是密文，是明文。
     """
     if not data:
@@ -459,7 +480,7 @@ def shannon_entropy(data: bytes) -> float:
 #
 # ⚠️ 但熵值统计需要足够样本才有效：N 字节的段最多只有 N 种不同取值，
 # 熵的理论上限是 min(8, log2(N))。24 字节的上限仅 log2(24)≈4.59 ——
-# 2026-10-18 实测踩过：拿 24 字节的 .ncguard 跑安检，熵 4.502 被判失败，
+# 2026-10-18 实测踩过：拿 24 字节的 .ncx 跑安检，熵 4.502 被判失败，
 # 但那其实是接近满值的随机数据（假阳性）。
 # 因此段长低于 ENTROPY_MIN_BYTES 时直接跳过安检，不做判断。
 ENTROPY_MIN = 7.0
@@ -500,7 +521,7 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     """锁一个或多个段。
 
     section 支持逗号分隔的多段名（2026-10-19 新增），例如
-    ".ncguard,.ncguard_ro"。多段共用同一把 k_so、同一个 MAC ——这是刻意的：
+    ".ncx,.ncxr"。多段共用同一把 k_so、同一个 MAC ——这是刻意的：
     它们逻辑上是同一份受保护资产（代码 + 它要用的常量表），拆成两把钥匙
     只会让运行期需要多解一次、多存一份 key，收益为零。
     为什么必须分两个 ELF 段：clang 不允许 const 数据进 AXR 段
@@ -556,10 +577,10 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
                        '密文可被公开脚本解开）')
     # ── master 随机化（2026-10-19）────────────────────────────────
     # 修实测报告静态 P1-1：master 原是全 0x11 占位符躺在 .rodata，
-    # `od` 一条命令读出 → 配合 APK 证书离线算 k_so → 8 分钟解开 .ncguard。
+    # `od` 一条命令读出 → 配合 APK 证书离线算 k_so → 8 分钟解开 .ncx。
     #
     # 这里生成随机 master，并用它派生 k_so / k_mac。
-    # master 本身【以明文写进 .ncguard_head_ro 段】——注意：这一步写的是
+    # master 本身【以明文写进 .ncxhr 段】——注意：这一步写的是
     # 明文，真正的保护来自随后的 --lock-head（用 k_stub 把它 XOR 成密文）。
     # 所以必须严格按「先一级锁箱、再二级锁箱」的顺序跑，中间产物不含明文
     # master 的窗口仅存在于构建机临时目录里。
@@ -580,7 +601,7 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     k_so = keys['so']
     k_mac = keys['mac']          # 2026-12 完整性校验专用，与 so 域硬分隔
 
-    # ── 多段加密（2026-10-19：.ncguard 代码 + .ncguard_ro 常量表）──────
+    # ── 多段加密（2026-10-19：.ncx 代码 + .ncxr 常量表）──────
     # 两段共用 k_so：逻辑上是同一份资产。MAC 覆盖【所有密文的拼接】，
     # 于是任何一段被改都会让整体验签失败（与单段语义完全一致）。
     segs = []                      # [(name, sec, plain, cipher)]
@@ -603,7 +624,7 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
     cipher = segs[0][3]
 
     # 期望 MAC 对【密文】算，不对明文算：密文在解密前就可读，于是可以
-    # "先验后解" —— 一旦被改过，根本不会把明文装进 .ncguard（fail-closed）。
+    # "先验后解" —— 一旦被改过，根本不会把明文装进 .ncx（fail-closed）。
     # 若对明文算，就必须先解密再验，篡改的明文已经落盘生效，晚一步。
     # 另一个理由是 RC4 是流密码：改密文 1 位恰好只翻明文 1 位，未必崩溃，
     # 攻击者可以"改一位→跑→看行为"做廉价 oracle；MAC 让这种试探第一次就暴露。
@@ -625,7 +646,7 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
 
     # 密钥槽：magic(16) + wrapped_k_so(16) + wrapped_k_mac(16) + expect_mac(32)
     #          + pkg_sha8(8) + reserved(8) = 96 字节
-    #          .nckey 段必须同步扩到 96（否则 assert 炸）
+    #          .nck 段必须同步扩到 96（否则 assert 炸）
     # ⚠️ 切片窗口必须与 blob 等长：elf.data[a:b] = blob 若 len(blob) > b-a，
     # Python 会【插入】而非覆盖，把后续字节（段表/相邻段）顶坏。本人踩过。
     # 布局保持 magic+wrapped_k_so 在前 32 字节【不变】——旧 C 侧开箱代码
@@ -667,7 +688,7 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
             + pkg_sha8 + b'\x00' * 8)
     assert len(blob) == 96, 'blob %d != 96' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nckey 段需扩到 96；改了一侧必须同步另一侧）' \
+        'blob %d != slot size %d（.nck 段需扩到 96；改了一侧必须同步另一侧）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
 
@@ -697,11 +718,11 @@ def lock(so_path: str, out_path: str, section: str, cert: bytes,
 
 # ── 二级锁箱：把 unlock 本体也锁进密文（自解谜）───────────────────
 def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
-    """锁 .ncguard_head 段，并给明文 stub 写它的密钥槽。
+    """锁 .ncxh 段，并给明文 stub 写它的密钥槽。
 
     这是"把开锁器锁进它开的那只箱子"的构建期半边：
-      .ncguard_head（unlock 本体）← 用 k_stub 锁
-      .nckey_stub（stub 的槽）    ← 写 magic + wrapped_k_stub + stub/head 段
+      .ncxh（unlock 本体）← 用 k_stub 锁
+      .ncks（stub 的槽）    ← 写 magic + wrapped_k_stub + stub/head 段
                                      链接期地址 + head_size，让明文 stub 能解它
 
     k_stub 与 k_so 必须是两把钥匙：stub 只负责解 head，head 才负责解
@@ -725,7 +746,7 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
         #
         # 为什么可以安全地 fail-fast：走到这里说明 protect.sh 已经进了
         # `if [[ -d "$WORK/project/libs" ]]` 分支，即本就要编译 libnc.so；
-        # 而只要编译了，nc_guard_boot.c 就在工程里、.ncguard_head 段就该在。
+        # 而只要编译了，nc_guard_boot.c 就在工程里、.ncxh 段就该在。
         # 段不在 = 拷贝漏了 / boot.c 没编入 / 段被 gc-sections 回收，
         # 三种都是真实配置错误，没有一种应该放行。
         # （纯 dex 组合如只勾 stringenc 时根本不调 lock_head，不受影响。）
@@ -779,7 +800,7 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # 为什么能自洽：.text 段 addr==offset 且整体无重定位
     # （实测 readelf -r 的重定位全部落在 0x71d0 之后，.text 结束于 0x2714），
     # 所以锁箱期按文件算的 CRC == 运行期按内存算的 CRC。
-    # 注意：CRC 覆盖 .text【锁箱前】的字节；二级锁箱只改 .ncguard_head，
+    # 注意：CRC 覆盖 .text【锁箱前】的字节；二级锁箱只改 .ncxh，
     # 不动 .text，所以运行期看到的 .text 与锁箱期完全一致。
     text_sec = elf.find('.text')
     if text_sec is None:
@@ -798,16 +819,16 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     k_mac_head = bytes([0x91, 0x4A, 0xD2, 0x08, 0x7B, 0xE3, 0x5F, 0xC6,
                         0x2D, 0xB8, 0x64, 0x17, 0xAF, 0x39, 0x8E, 0x51])
 
-    # ── master 随机化 + 藏进 .ncguard_head_ro（2026-10-19）──────────
+    # ── master 随机化 + 藏进 .ncxhr（2026-10-19）──────────
     #
     # 修实测报告静态 P1-1：master[32] 原是 static const 全 0x11 的占位符，
     # 躺在 .rodata，`od` 一条命令读出 → 配合 APK 证书离线算 k_so →
-    # 8 分钟解开 .ncguard。全程不需要运行、不需要真机、不需要私钥。
+    # 8 分钟解开 .ncx。全程不需要运行、不需要真机、不需要私钥。
     #
     # 只换成随机数不够：随机值若仍是 .rodata 裸常量，`od` 一样读，成本不变。
     # 必须【同时】做到：值随机 + 藏在读不到的地方。
     #
-    # 现在：master 写进 .ncguard_head_ro 段，用【k_stub】加密（不是 k_so！）。
+    # 现在：master 写进 .ncxhr 段，用【k_stub】加密（不是 k_so！）。
     #   · 用 k_stub：链路单向 —— 碎片 → XOR_KEY → k_stub → {解 head,
     #     解 head_ro → master} → k_so。没有循环依赖。
     #   · 用 k_so 会死循环：k_so 的派生正需要 master。
@@ -851,9 +872,9 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     elf.data[head['offset']: head['offset'] + head['size']] = cipher
 
     # P0-b：对【密文】算 HMAC-SHA256(k_mac_head, head 密文)。
-    # 与 .ncguard 的 expect_mac 完全同构——解密前就能验，验不过就不装明文。
+    # 与 .ncx 的 expect_mac 完全同构——解密前就能验，验不过就不装明文。
     # 在此之前 head 段只有 XOR，攻击者可改 head 密文中对应"unlock 本体的
-    # MAC 校验函数"那几位，把 .ncguard 的 HMAC 保护改成恒真从而绕过。
+    # MAC 校验函数"那几位，把 .ncx 的 HMAC 保护改成恒真从而绕过。
     expect_mac_head = hmac_sha256(k_mac_head, cipher)
 
     # stub 槽（96 字节，2026-10-19 阶段3）：magic(8) + wrapped_k_stub(16)
@@ -889,7 +910,7 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
             + _s.pack('<I', 32))
     assert len(blob) == 104, 'stub blob %d != 104' % len(blob)
     assert len(blob) == slot['size'], \
-        'blob %d != slot size %d（.nckey_stub 段需扩到 104 字节；' \
+        'blob %d != slot size %d（.ncks 段需扩到 104 字节；' \
         '改 nc_guard_boot.c 的 NCG_STUB_SIZE 必须同步这里）' \
         % (len(blob), slot['size'])
     elf.data[slot['offset']: slot['offset'] + len(blob)] = blob
