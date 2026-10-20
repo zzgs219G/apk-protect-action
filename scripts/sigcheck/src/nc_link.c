@@ -150,6 +150,11 @@ void nc_heartbeat_touch(void)
 #  define NC_HB_FIRST_GRACE_MS  90000LL
 #  define NC_HB_KEEPALIVE_MS    25000LL
 #endif
+/* ⚠️ 调试延迟的真实构成（2026-10-21 补，此前只看了保活窗这一半）：
+ *   实际"改签名/删喂食后到进程死"= watchdog 轮询周期 + 保活窗。
+ *   watchdog 周期在 env_check.c（20s 发布 / 2s 调试），与本文件是两个参数。
+ *   故调试提速必须【两处同时】用 NC_HB_DEBUG_FAST——本宏同时控制
+ *   nc_link.c 的宽限/保活与 env_check.c 的轮询间隔，见下方说明。 */
 
 __attribute__((noinline))
 int nc_heartbeat_expired(void)
