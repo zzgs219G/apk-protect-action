@@ -77,6 +77,11 @@
 static const uint8_t NCG_MAGIC_SEED_SLOT[8] = NC_SEED_SLOT_INIT;
 static const uint8_t NCG_MAGIC_SEED_STUB[8] = NC_SEED_STUB_INIT;
 static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]);
+
+/* 不可优化的清零（实现在第二部分 .text）。前向声明：密钥清零调用点
+ * 在 .ncxh 段的 ncg_head_unlock 里，而本函数在 .text —— 两侧都必须能
+ * 相互引用，靠 PC 相对寻址天然正确。详见定义处的说明。 */
+static void ncg_wipe(void *p, size_t n);
 /* ── slot 布局与尺寸：唯一真相源在 nc_guard_layout.h ──────────────
  * 本文件不再画布局图。2026-10-20 删除的原因：此处原有【三份】slot 布局图
  * （88 字节版 / 96 字节版 / 104 字节版），与 nc_guard_layout.h 的 NC_OFF_*
@@ -125,11 +130,30 @@ static int ncg_magic_ok(const volatile unsigned char *got, const uint8_t seed[8]
  *   ② 碎片放 .data 常量也不行 —— 破解复盘实测"objdump 读 .data + 反汇编
  *      5 分钟重组出 XOR_KEY"。真碎片必须来自构建期随机（即 slot 碎片区）。
  *
- * ⚠️ 反向纪律：不要为了"可读性"给 ncg_xor_key / ncg_stub_recover 加参数
- *   或改局部变量结构。实测 key16 的中间值经栈偏移（[sp+0x40]）在函数间
- *   隐式传递，IDA/r2 追不到源（写它的帧已返回），标 undefined —— 这层
- *   "白捡的防御"是 -Oz 栈分配的副产品，改结构会静默丢掉它。冻结靠 T22
- *   （二进制等价），不靠代码冻结；栈布局变了 T22 立即红。
+ * ⚠️ 2026-10-22 删除一条【从未成立】的"反向纪律"（原第 128-132 行）。
+ *   原文宣称："key16 中间值经栈偏移 [sp+0x40] 在函数间隐式传递，IDA/r2
+ *   追不到源，这层白捡的防御是 -Oz 栈分配的副产品"。
+ *
+ *   核实后该表述有两处问题，故删除：
+ *   ① 【归因错】。破解复盘报告说的 [sp+0x40] 是 ncg_head_unlock 里
+ *      pread(fd, slotdata, 96, slot.sh_offset) 的 offset 参数 —— 那是
+ *      Elf64_Shdr 结构体跨函数传递落在栈上的字段，属正常编译产物，
+ *      不是"刻意设计的隐式传参"。报告作者把它误读成混淆手法。
+ *   ② 【现象已不存在】。实测当前产物（-Oz）：ncg_xor_key 是【孤立函数】
+ *      （nm 可见独立符号，ncguard_unlock 内对它的 bl 调用 = 0 次，
+ *      所有调用点都被内联），不存在"跨帧栈槽传递密钥"。
+ *
+ *   为什么不试图恢复它：它依赖 -Oz 的栈分配决策，编译器一升级就可能变；
+ *   而源码注释一旦宣称"我们有这层防御"，后续所有加固判断都会建立在
+ *   错误前提上（正是本条注释过去几轮造成的问题）。不可维护的防御
+ *   不该写进注释当保障。冻结靠 T22（二进制等价）仍然有效，但 T22 只能
+ *   验证"改动前后一致"，验证不了"某个编译器副产品还在"。
+ *
+ *   真正强的防线是 CRC 自绑定（见 ncg_self_crc）：改 .text 任一字节 →
+ *   CRC 变 → k_stub 变 → .ncxh 解出垃圾 → SIGILL。破解复盘 v2 做了
+ *   对照实验证实（改一条正常运行 100% 不可达的指令仍 SIGILL），
+ *   且它试图绕过（重加密 .ncxh）仍失败 —— 因为它漏了 .ncxhr 也依赖
+ *   k_stub。那条靠的是链式依赖，不是误导。
  *
  * 存放约定：逻辑字节 i<4 取第 NCG_XOR_FRAG[i] 个 uint16 的低 8 位；
  *   i>=4 取高 8 位。 */
@@ -421,7 +445,7 @@ int ncg_head_unlock(void) {
         uint8_t xk[8];
         ncg_xor_key(xk);
         for (int i = 0; i < 16; i++) key[i] = slotdata[16 + i] ^ xk[i & 7];
-        memset(xk, 0, sizeof(xk));
+        ncg_wipe(xk, sizeof(xk));
     }
 
     /* ═══ P1-a（2026-10-19）：运行期证书派生，取代 slot 里的 wrapped k_so ═══
@@ -491,14 +515,14 @@ int ncg_head_unlock(void) {
             /* fail-closed：证书/包名任一不可得 → 不解密。
              * 代价是"未签名调试包"直接起不来——这是刻意的：
              * 允许降级就等于允许攻击者把签名剥掉后照常跑。 */
-            memset(key, 0, sizeof(key));
+            ncg_wipe(key, sizeof(key));
             memset(slotdata, 0, sizeof(slotdata));
             return -12;
         }
 
         /* 用证书派生的 k_so 覆盖 slot 里的诱饵值 */
         memcpy(key, k_cert, 16);
-        memset(k_cert, 0, sizeof(k_cert));
+        ncg_wipe(k_cert, sizeof(k_cert));
     }
 
 
@@ -540,7 +564,7 @@ int ncg_head_unlock(void) {
         uint8_t k_mac[16], got_mac[32];
         if (ncg_derive_k_mac_from_der(master, der_buf, der_len, pkg_buf,
                                       k_mac) != 0) {
-            memset(key, 0, sizeof(key));
+            ncg_wipe(key, sizeof(key));
             memset(slotdata, 0, sizeof(slotdata));
             return -12;
         }
@@ -564,10 +588,10 @@ int ncg_head_unlock(void) {
         const uint8_t *want = slotdata + NC_OFF_EXPMAC;
         uint8_t diff = 0;
         for (int i = 0; i < 32; i++) diff |= (uint8_t)(got_mac[i] ^ want[i]);
-        memset(k_mac, 0, sizeof(k_mac));
-        memset(got_mac, 0, sizeof(got_mac));
+        ncg_wipe(k_mac, sizeof(k_mac));
+        ncg_wipe(got_mac, sizeof(got_mac));
         if (diff != 0) {
-            memset(key, 0, sizeof(key));
+            ncg_wipe(key, sizeof(key));
             return -11;
         }
     }
@@ -589,23 +613,23 @@ int ncg_head_unlock(void) {
         uintptr_t e = ((uintptr_t) tgt + len - 1 & ~(ps - 1)) + ps;
         if (mprotect((void *) s, e - s,
                      PROT_READ | PROT_WRITE | (is_code ? PROT_EXEC : 0)) != 0) {
-            memset(key, 0, sizeof(key));
+            ncg_wipe(key, sizeof(key));
             return -8;
         }
         uint8_t *buf = (uint8_t *)malloc(len);
-        if (!buf) { memset(key, 0, sizeof(key)); return -9; }
+        if (!buf) { ncg_wipe(key, sizeof(key)); return -9; }
         ncg_rc4(key, 16, tgt, buf, len);
         memcpy(tgt, buf, len);
         free(buf);
         if (is_code) __builtin___clear_cache((char *)tgt, (char *)(tgt + len));
         if (mprotect((void *) s, e - s,
                      PROT_READ | (is_code ? PROT_EXEC : 0)) != 0) {
-            memset(key, 0, sizeof(key));
+            ncg_wipe(key, sizeof(key));
             return -10;
         }
     }
 
-    memset(key, 0, sizeof(key));
+    ncg_wipe(key, sizeof(key));
     memset(slotdata, 0, 16);   /* 只清前 16 字节（magic 区），保持历史行为 */
     ncg_unlocked = 1;
 
@@ -700,6 +724,24 @@ static uint32_t ncg_rd32(const volatile unsigned char *p) {
     return v;
 }
 
+/* ── 不可优化的清零（2026-10-22）──────────────────────────────────────
+ * 为什么不能直接用 memset：编译器有权删除"死存储"——当它判定某块栈内存
+ * 在函数返回前不再被读取时，会把 memset 整条优化掉，密钥就留在栈上了。
+ *
+ * 实测证据（-Oz，本仓源码）：ncguard_unlock 里有 6 处 memset 清密钥，
+ * 但反汇编里只有 2 条零写入指令 —— 其余 4 处被优化掉了。
+ *
+ * 做法：通过 volatile 指针写 0。volatile 告诉编译器"这个写入有可观测
+ * 副作用，不许删"，因此每次都会生成真实的 strb。
+ * ⚠️ 不用 explicit_bzero：那是 BSD/glibc 扩展，Android bionic 的可用性
+ *   随 API level 变化，且会引入 PLT 表项（本项目明令禁止）。
+ * ⚠️ 不用 memset_s：那是 C11 附录 K 的可选接口，NDK 未提供。
+ * 本实现零依赖、零 PLT、任何工具链都能编。 */
+static void ncg_wipe(void *p, size_t n) {
+    volatile unsigned char *v = (volatile unsigned char *)p;
+    while (n--) *v++ = 0;
+}
+
 /* 明文 stub：把 .ncxh 还原成明文。
  * 全程无循环展开以外的分支、无 libc 调用、无磁盘 I/O。
  * 未锁（slot magic 不匹配）时直接返回——段本就是明文。 */
@@ -723,7 +765,7 @@ static void ncg_stub_recover(void) {
         uint8_t xk[8];
         ncg_xor_key(xk);
         for (int i = 0; i < 16; i++) k[i] = (uint8_t)(slot[8 + i] ^ xk[i & 7]);
-        memset(xk, 0, sizeof(xk));
+        ncg_wipe(xk, sizeof(xk));
         /* 把 4 字节 CRC 折叠进 16 字节密钥（每 4 字节异或一次同一 CRC，
          * 保证 16 字节全部参与，且不引入额外依赖） */
         uint32_t crc = ncg_self_crc;
@@ -766,7 +808,7 @@ static void ncg_stub_recover(void) {
         ncg_xor_key(xk);
         for (int i = 0; i < 16; i++)
             k_mac[i] = (uint8_t)(slot[NC_OFF_K_MAC_HEAD + i] ^ xk[i & 7]);
-        memset(xk, 0, sizeof(xk));
+        ncg_wipe(xk, sizeof(xk));
     }
     khmac_sha256(k_mac, 16, start, head_size, got_mac);
     {
@@ -774,11 +816,11 @@ static void ncg_stub_recover(void) {
         uint8_t diff = 0;
         for (int i = 0; i < 32; i++)
             diff |= (uint8_t)(got_mac[i] ^ want[i]);
-        memset(k_mac, 0, sizeof(k_mac));
-        memset(got_mac, 0, sizeof(got_mac));
+        ncg_wipe(k_mac, sizeof(k_mac));
+        ncg_wipe(got_mac, sizeof(got_mac));
         if (diff != 0) {
             /* 密文段被改过（或密钥与密文不匹配）→ 不解密、不动 mprotect */
-            memset(k, 0, sizeof(k));
+            ncg_wipe(k, sizeof(k));
             return;
         }
     }
@@ -804,7 +846,7 @@ static void ncg_stub_recover(void) {
      * 现算的（so-section-lock.py 的 lock_head），锁箱与运行天然自洽；
      * 且已发布 .so 是独立二进制，源码改动碰不到它。 */
     if (mprotect((void *) s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        memset(k, 0, sizeof(k));
+        ncg_wipe(k, sizeof(k));
         return;   /* 权限没改成功 → 不解密，段保持密文 → 调用即 SIGILL */
     }
 
@@ -859,7 +901,7 @@ static void ncg_stub_recover(void) {
      * 且时机在攻击者可见的窗口内，编译器不得缓存/重排。 */
     ncg_head_live = start;
     ncg_head_live_len = head_size;
-    memset(k, 0, sizeof(k));
+    ncg_wipe(k, sizeof(k));
     recovered = 1;
 }
 

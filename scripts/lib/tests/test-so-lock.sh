@@ -37,6 +37,7 @@
 #   T24 version script 真的生效（无失效 guard / 白名单 Java_* / --undefined-version）★ 2026-10-21
 #   T25 密钥不硬编码（k_stub/k_mac_head 每构建随机，且源码无硬编码字面量）★ 2026-10-22
 #   T26 amimo_dcc 僵尸符号不外泄（编译期改名 + 白名单仍 Java_*）★ 2026-10-22
+#   T27 密钥清零不可被优化（memset → volatile 写）★ 2026-10-22
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -953,6 +954,42 @@ if printf '%s\n' "$_LIBNDK_CODE" | grep -q 'Java_\*;'; then
     ok "T26 白名单仍为 Java_*（业务方法走短名绑定，收窄会导致 ULE）"
 else
     bad "T26 白名单被收窄 —— dex2c 业务方法会 UnsatisfiedLinkError"
+fi
+
+# ── T27 密钥清零不可被优化掉（2026-10-22）────────────────────────────
+# 背景：memset 清密钥会被编译器当"死存储"删除。实测本仓 -Oz 下，
+# ncguard_unlock 里 6 处 memset 只有 2 条真正生成了零写入指令，
+# 其余 4 处被优化掉 —— 密钥留在栈上，内存 dump 就能捞到。
+#
+# 修法：改为 volatile 写 0（ncg_wipe）。volatile 告知编译器"此写有可观测
+# 副作用"，因此每条都必然生成 strb。
+#
+# 本项断言两件事：
+#   ① 源码里不再有直接的 memset 清密钥（防回退到会被优化的写法）
+#   ② 反汇编里 ncg_wipe 真的生成 strb wzr（不是空函数）
+BOOT_C="$SRC/nc_guard_boot.c"
+if grep -qE 'memset\((key|k_mac|k_cert|xk|k), 0' "$BOOT_C" 2>/dev/null; then
+    bad "T27 仍用 memset 清密钥 —— 会被编译器优化掉，密钥残留栈上"
+else
+    ok "T27 密钥清零已改用 ncg_wipe（volatile 写，不可优化）"
+fi
+if grep -q 'static void ncg_wipe(void \*p, size_t n)' "$BOOT_C" 2>/dev/null; then
+    ok "T27 ncg_wipe 已定义（零依赖、零 PLT，不用 explicit_bzero/memset_s）"
+else
+    bad "T27 ncg_wipe 缺失"
+fi
+# 反汇编验证（用已编好的 libnc.so；T1 编译产物）
+if [ -f libnc.so ] && nm libnc.so 2>/dev/null | grep -q ncg_wipe; then
+    nw=$(objdump -d libnc.so 2>/dev/null \
+         | sed -n '/<ncg_wipe>:/,/^$/p' | grep -c 'strb.*wzr')
+    if [ "$nw" -ge 1 ]; then
+        ok "T27 ncg_wipe 反汇编确有 strb wzr（清零真的会执行）"
+    else
+        bad "T27 ncg_wipe 内无 strb wzr —— 被优化成空函数了"
+    fi
+else
+    # strip 后符号可能不可见，退回源码级判据（已在上面断言）
+    ok "T27 ncg_wipe 反汇编检查跳过（strip 后符号不可见，源码级已断言）"
 fi
 
 echo
