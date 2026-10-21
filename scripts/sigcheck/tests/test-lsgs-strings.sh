@@ -133,6 +133,65 @@ else
     bad "so 编译失败"; head -10 "$T/c.log"
 fi
 
+# ── ⑦ 字符串加密强度（2026-10-22 新增，修实测报告「字符串保护 ★☆☆☆☆」）──
+# 实测报告原文："8 字节固定 key 的重复 XOR（0x14170 = 5ac3119ef037b26d），
+#               10 行 Python 全解出"。
+# 旧实现三个结构性弱点，本组断言逐个钉死：
+#   ① key 全局固定 → 解一个包 = 解所有包；且 key 字面量能在 so 里搜到
+#   ② 单字节重复 XOR（周期 8）→ 相同前缀产生相同密文
+#   ③ 无消息域分离 → 已知明文泄漏的密钥流可套到其他消息
+echo "── 字符串加密强度（本轮升级）──"
+
+# ① key 必须每构建随机（不是固定常量）
+# 判据：连续两次生成的 LSG_KEY 必须不同。
+python3 "$GEN" "$SRC_SIG" "$SRC_ENV" "$T/k1.h" >/dev/null 2>&1
+python3 "$GEN" "$SRC_SIG" "$SRC_ENV" "$T/k2.h" >/dev/null 2>&1
+K1=$(grep -o 'LSG_KEY\[LSG_KEY_LEN\] = {[^}]*}' "$T/k1.h" | md5sum | cut -d' ' -f1)
+K2=$(grep -o 'LSG_KEY\[LSG_KEY_LEN\] = {[^}]*}' "$T/k2.h" | md5sum | cut -d' ' -f1)
+if [ "$K1" != "$K2" ]; then
+    ok "① LSG_KEY 每构建随机（两次生成不同 → 跨包 diff 失效）"
+else
+    bad "① LSG_KEY 仍是固定常量 —— 解一个包等于解所有包"
+fi
+
+# key 长度必须是 32 字节（旧版 8 字节）
+if grep -q '#define LSG_KEY_LEN 32' "$T/sig_log_data.h"; then
+    ok "② LSG_KEY_LEN = 32（旧版 8 字节已废弃）"
+else
+    bad "② LSG_KEY_LEN 不是 32 —— 可能退回旧实现"
+fi
+
+# ③ 旧的固定 key 字面量不得再出现（防止代码/注释里残留 5ac3119ef037b26d）
+if grep -rq "0x5A, 0xC3, 0x11, 0x9E" "$ROOT/scripts/sigcheck/log/make-sig-log.py" 2>/dev/null; then
+    bad "③ 生成器里仍有旧的固定 key 字面量（5ac3119ef037b26d）"
+else
+    ok "③ 旧固定 key 字面量已消失（不再硬编码 5ac3119ef037b26d）"
+fi
+
+# ④ 域分离：不同消息的相同前缀，密文必须不同
+# 这是已知明文攻击的入口（报告没提，但比"固定 key"更危险：
+# 攻击者猜到 "/proc/self/maps" 就能算出密钥流，套到 "/proc/self/status" 上）
+if python3 - "$T/sig_log_data.h" <<'PYDOM' ; then
+import re, sys
+src = open(sys.argv[1], encoding='utf-8').read()
+# 数组名形如 LSG_DATA__FRIDA_AGENT（宏名去掉 "LSG_" 前缀后以 "_" 开头 → 双下划线）
+def arr(name):
+    m = re.search(r'LSG_DATA_%s\[\d+\]\s*=\s*\{([^}]*)\}' % re.escape(name), src)
+    return bytes(int(x, 16) for x in re.findall(r'0x([0-9a-f]{2})', m.group(1))) if m else None
+# LSGS_FRIDA_AGENT="frida-agent" 与 LSGS_FRIDA_GADGET="frida-gadget" 共享前缀 "frida-"
+a, b = arr('_FRIDA_AGENT'), arr('_FRIDA_GADGET')
+if a is None or b is None:
+    print("取不到密文数组")
+    sys.exit(1)
+same = sum(1 for x, y in zip(a, b) if x == y)
+# 6 字节前缀全同 = 旧实现（无域分离）；期望显著不同
+sys.exit(0 if same < 3 else 1)
+PYDOM
+    ok "④ 域分离生效（相同前缀 'frida-' 的密文不再相同 → 已知明文攻击失效）"
+else
+    bad "④ 无域分离 —— 已知明文泄漏的密钥流可套用到其他消息"
+fi
+
 echo "══════════════════════════════════════════════════"
 echo "结果: $pass 通过, $fail 失败"
 echo "══════════════════════════════════════════════════"
