@@ -59,7 +59,45 @@ if [ -z "${TEST_APK:-}" ] && [ -d "/storage/emulated/0/简盒" ]; then
     TEST_APK=$(ls -t /storage/emulated/0/简盒/*_sign.apk 2>/dev/null | head -1)
 fi
 APK=${TEST_APK:-}
-PKG=com.xixin.box
+# ── 包名必须从 APK 动态提取（2026-10-22 修 T4 假失败）───────────────
+# 曾硬编码 PKG=com.xixin.box，而锁箱器是用 --from-apk 从【实际传入的 APK】
+# 里提包名（so-section-lock.py:manifest_package），并把其指纹写进
+# .nck[80:88]。运行期 ncg_pkg_matches 用 /proc/self/cmdline 的进程名比对
+# 这个指纹，不一致就 fail-closed 返回 -12 → 不解密 → 探针踩密文 → SIGILL。
+#
+# 后果：只要测试 APK 不叫 com.xixin.box（本例 tc_signed_*.apk 实际是
+# com.xixin.tc），T4 就必然 CRASH(132)，且报错信息误导成"证书派生或
+# 解锁链路失败"——真实原因是【测试环境包名与产物不匹配】。
+# 这类假失败比真 bug 更耗时间：它指向错误的方向。
+#
+# 修法：与锁箱器同源（都从 APK 的 AXML 提取），谁换 APK 都自动一致。
+# 提取失败时回退到占位值并显式告警（不静默用错值）。
+PKG=""
+if [ -n "$APK" ] && [ -f "$APK" ]; then
+    # ⚠️ 复用 so-section-lock.py 里【已被生产验证】的 manifest_package()，
+    #    不要在这里另写一份 AXML 解析器：写错一次就是"提取到
+    #    androidx.core.app.CoreComponentFactory"这种假值（本轮实测踩过），
+    #    而假值与真包名同样"看起来像个包名"，极难察觉。
+    #    单一真相源 = 测试与锁箱器永远同源，谁换 APK 都自动一致。
+    PKG=$(python3 - "$ROOT/scripts/lib/so-section-lock.py" "$APK" <<'PYPKG' 2>/dev/null || true
+import sys, importlib.util
+spec = importlib.util.spec_from_file_location("lockmod", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(m)
+    print(m.manifest_package(sys.argv[2]))
+except Exception:
+    pass
+PYPKG
+)
+fi
+if [ -z "$PKG" ]; then
+    PKG=com.xixin.box
+    echo "  ⚠ 无法从 APK 提取包名，回退占位值 $PKG" >&2
+    echo "    —— 若 T4/T5/T8 失败且报 CRASH(132)，先怀疑这里（包名不匹配 → -12）" >&2
+else
+    echo "  ℹ APK 包名（从 AXML 提取，与锁箱器同源）: $PKG"
+fi
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $*"; }
