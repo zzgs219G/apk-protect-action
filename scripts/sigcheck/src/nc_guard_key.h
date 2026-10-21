@@ -78,16 +78,15 @@ int ncg_derive_k_mac_from_der(const uint8_t master[32],
                               const char *pkg, uint8_t out[16]);
 
 /* k_mac = HKDF-SHA256(..., info="nc-so-mac-v1"+pkg, 16)
- * 2026-12 完整性校验专用域，只参与 .ncx 密文的 HMAC 计算。
+ * 完整性校验专用域，只参与 .ncx 密文的 HMAC 计算。
  * ⚠️ 与 k_so 必须用不同 label —— 复用同一把钥匙等于"知道 RC4 密钥就能
  * 伪造 MAC"，校验形同虚设。改 label 必须同步 so-section-lock.py 的
- * derive_app_keys()（本轮已用真证书对拍验证两侧逐字节一致）。
+ * derive_app_keys()（已用真证书对拍验证两侧逐字节一致）。
  *
- * 2026-10-20 更正一处过期表述：本函数【有调用方】。早期注释写
- * "当前无调用方（unlock 走 slot 里的 wrapped_k_mac），它是契约证明"，
- * 那是在 P1-a 之前的口径。P1-a 起 k_mac 改为运行期从证书派生，
- * nc_guard_boot.c:591 调 ncg_derive_k_mac_from_der()，它内部调本函数。
- * 同理 ncg_derive_k_so() 由 ncg_derive_k_so_from_der() 调用
- * （boot.c:533），也不是无调用方。 */
+ * 调用关系：nc_guard_boot.c 的 ncg_head_unlock() 调
+ *   ncg_derive_k_mac_from_der()，后者内部调本函数。
+ *   （早期注释写"当前无调用方，只是契约的可执行证明"——那是 P1-a 之前
+ *   的口径，k_mac 改为运行期证书派生后本函数就真参与解锁了。
+ *   同理 ncg_derive_k_so() 由 ncg_derive_k_so_from_der() 调用。） */
 int ncg_derive_k_mac(const uint8_t master[32], const uint8_t cert_sha256[32],
                      const char *pkg, uint8_t out[16]);
