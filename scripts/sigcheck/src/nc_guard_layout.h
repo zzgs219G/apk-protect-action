@@ -1,45 +1,36 @@
 /* nc_guard_layout.h — so 段加密设施的【唯一契约真相源】
  *
- * 本文件不含任何逻辑，只有契约常数。存在的唯一目的：
- *   把"改一处必须同步另一处"从注释变成编译期/构建期强制。
+ * 本文件不含任何逻辑，只有契约常数。存在目的：把"改一处必须同步另一处"
+ * 从注释变成编译期/构建期强制。
  *
- * 为什么需要它（2026-10-20 立项背景）：
- *   契约常数此前散落 4 种语言、7 个文件、24 处副本。slot 已扩过两次
- *   （80→96、88→104），下次一定还会扩；漏同步任何一处的症状是
- *   【运行期 SIGILL】，Java 侧只看到 selftest != 59，没有任何线索
- *   指向"某个长度常量没同步"——这类问题排查成本是半天量级。
- *   仓库历史报错三/九/十一/十二全是同类根因。
+ * 背景：契约常数此前散落 4 种语言、7 个文件、24 处副本。slot 已扩过两次
+ * （80→96、88→104），漏同步的症状是【运行期 SIGILL】——Java 侧只看到
+ * selftest != 59，完全指不出"某个长度常量没同步"。历史报错三/九/十一/十二
+ * 全是同类根因。
  *
- * ⚠️ 纪律：改本文件任何常量，必须跑
- *      bash scripts/lib/tests/test-so-lock.sh
- *   其中 T20 用 Python 从本文件抽取，与 so-section-lock.py 的本地常量
- *   逐字节对拍；T21 扫描全仓段名字面量（未登记即失败）；T22 验证改动
- *   不改变产物字节。三项任一红 = 构建期 fail-fast，而不是运行期 SIGILL。
+ * ⚠️ 纪律：改本文件任何常量，必须跑 bash scripts/lib/tests/test-so-lock.sh
+ *   T20 与 so-section-lock.py 逐字节对拍；T21 扫描全仓段名字面量；
+ *   T22 验证不改变产物字节。任一红 = 构建期 fail-fast 而非运行期 SIGILL。
  *
- * ⚠️ 本文件会被拷进 NDK 工程（protect.sh 的拷贝清单），故不得 include
- *    仓库内其它头文件，保持零依赖、任何工具链都能编。
+ * ⚠️ 本文件会被拷进 NDK 工程，故不得 include 仓库内其它头文件
+ *    （零依赖，任何工具链都能编）。
  */
 #ifndef _NC_GUARD_LAYOUT_H_
 #define _NC_GUARD_LAYOUT_H_
 
-/* ═══════════════════════════════════════════════════════════════════
- * 一、段名（6 个）
- * ═══════════════════════════════════════════════════════════════════
- * 2026-10-19 中性化改名（旧名 → 新名）：
- *   .ncguard         → .ncx      .ncguard_ro      → .ncxr
- *   .ncguard_head    → .ncxh     .ncguard_head_ro → .ncxhr
- *   .nckey           → .nck      .nckey_stub      → .ncks
- * 改名理由：旧名自解释（ncguard/nckey 一眼看出机制），readelf -S
- * 即可列举出全部加固结构。
+/* ═══ 一、段名（6 个）═══════════════════════════════════════════════
+ * 2026-10-19 中性化改名（旧名自解释，readelf -S 即可列举加固结构）：
+ *   .ncguard     → .ncx     .ncguard_ro      → .ncxr
+ *   .ncguard_head→ .ncxh    .ncguard_head_ro → .ncxhr
+ *   .nckey       → .nck     .nckey_stub      → .ncks
  *
  * ⚠️ 段名是 so 的指纹特征。改名会让所有历史产物的锁箱/开箱契约失效，
  *    故 2026-10-19 之后不再变动。要加新段，先在 T21 登记。
  *
- * 消费方（改名前同步检查这些位置）：
- *   C:    nc_guard_boot.c / nc_link.c / env_check.c / sig_check.c /
- *         nc_guard_probe.c
- *   Py:   so-section-lock.py / so_section_mark.py
- *   Sh:   make-sig-hash.sh（生成 sig_hash.h 的段属性宏）/ protect.sh
+ * 消费方（改名前同步检查）：
+ *   C:  nc_guard_boot.c / nc_link.c / env_check.c / sig_check.c / nc_guard_probe.c
+ *   Py: so-section-lock.py / so_section_mark.py
+ *   Sh: make-sig-hash.sh / protect.sh
  */
 #define NC_SEC_CODE      ".ncx"    /* 加密代码段（AXR，可执行）*/
 #define NC_SEC_CONST     ".ncxr"   /* 加密常量表段（AWR，不可执行）*/
@@ -89,15 +80,12 @@
  * 开箱侧：nc_guard_boot.c 明文 stub（ncg_stub_recover / ncguard_unlock）
  * C 侧段本体：nc_guard_boot.c 的 ncg_stub_slot[NC_STUB_SIZE]
  */
-#define NC_STUB_SIZE        112   /* 2026-10-21 104→112：[104:112) 碎片区 */
-/* 碎片区（2026-10-21）：XOR_KEY 的 4 个 uint16，构建期随机生成。
- * 为什么挪进 slot：原放 .data（ncg_frag_a/b/c/d volatile 常量），
- * 攻击者 objdump 读 .data + 反汇编拼回逻辑即可重组（破解复盘实测
- * "5 分钟拿到 XOR_KEY"）。挪进 slot 后：
- *   · .data/.rodata 不再有真碎片（留诱饵，见 boot.c）
- *   · 碎片每次构建随机（diff 两个 so 无法识别碎片）
- *   · 与 wrapped_k_stub 同住 slot——攻击者必须先读懂 slot 布局
- *     （壳的核心格式）才有重组输入，把"读常量"变成"读格式" */
+#define NC_STUB_SIZE        112   /* [104:112) 为碎片区，见 NC_OFF_FRAGS */
+/* 碎片区：XOR_KEY 的 4 个 uint16，构建期随机生成后写进 slot。
+ * 为什么放这里而不放 .data：破解复盘实测"objdump 读 .data + 反汇编
+ * 5 分钟重组出 XOR_KEY"。挪进 slot 后攻击者必须先读懂 slot 布局
+ * （壳的核心格式）才有重组输入——把"读常量"变成"读格式"。
+ * 详细演进与反向纪律见 nc_guard_boot.c 的 XOR_KEY 碎片化注释。 */
 #define NC_OFF_FRAGS        104   /* [104:112) 4×uint16 碎片（随机）*/
 #define NC_OFF_CODE_ADDR    36   /* 代码自绑定 CRC 区间起始*/
 #define NC_OFF_CODE_LEN     40   /* 区间长度（字节）*/
