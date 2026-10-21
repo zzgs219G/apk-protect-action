@@ -89,71 +89,60 @@ LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none \\
                  -Wl,-z,separate-code
 EOF
 
-  # ── JNI 符号隐藏（2026-10-19，修实测报告 §1/§7.1）────────────────
-  # 实测报告用 `nm -D` 一条命令拿到 7 个 JNI 入口名 + 精确大小
-  # （`MainActivity.k` 21692 B），等于免费送业务复杂度地图。
+  # ── JNI 符号隐藏（2026-10-21 重建，修「从未生效」的静默失效）────────
   #
-  # 做法：version script 只导出 JNI_OnLoad，其余（含 dex2c 的 Java_xxx）
-  # 全部 local。配合 protect.sh 生成的 RegisterNatives 表 + 编译期改名宏，
-  # Java 侧仍能正常调用（走运行期注册，不靠符号名）。
+  # ⚠️⚠️ 本节此前的形态是一个【永不成立的 guard】：
+  #     if [ -f "$jni/nc_jni_gen.c" ]; then ... 整段 version script 全在它里面，
+  #   而 nc_jni_gen.c 的生成器 gen-jni-register.py 已在 a7d9cbc 删除
+  #   （动态注册真机会崩，回退短名绑定），protect.sh 里也再无任何生成点。
+  #   后果：version script 自 a7d9cbc 起从未生效过，.dynsym 一直导出全部
+  #   Java_* 业务符号。--strip-all 只删 .symtab/.strtab，删不掉 .dynsym，
+  #   所以补不上这个洞。实测报告（docs/so层防御/libnc_so_加密强度分析.md
+  #   §五「致命：符号表完全未处理」）给符号表打 0.0 分即由此而来。
   #
-  # ⚠️ 只在有注册表时才启用：没有 nc_jni_gen.c 就没有运行期注册，
-  #    隐藏符号会让 Java 侧 UnsatisfiedLinkError。
-  if [ -f "$jni/nc_jni_gen.c" ]; then
-    # 2026-10-19：这几行 echo 是加来防"静默跳过"的。
-    # CI 39174771703 的四个失败里，根因是 ndk_write_mk 在注册表生成之前
-    # 就跑完了，导致 `if [ -f nc_jni_gen.c ]` 恒假、flags 全没写。
-    # 而 ndk_write_mk 当时【一行日志都不打】—— 日志里只能看到
-    # "[jni-reg] 生成注册表" 在 "Compile nc_jni_gen.c" 之前，
-    # 看不出 mk 其实更早写完。现在把决策打出来，顺序问题一眼可见。
-    echo "  [mk] JNI 符号隐藏已启用（version-script + 动态注册）"
-    # ⚠️ 2026-10-19 两轮实证后的最终形态（这是第三次修正）：
-    #
-    #   第一轮 `local: *`（全隐藏）
-    #     → ART dlsym 找不到 Java_xxx → UnsatisfiedLinkError。错。
-    #
-    #   第二轮 `global: Java_*`（全保留）
-    #     → 能跑，但 dex2c 的业务方法名与精确大小照旧泄露
-    #       （`nm -D` 一条命令拿到 `MainActivity.k = 21692 B`）。对但不够。
-    #
-    #   第三轮 `global: Java_com_nc_*`（只保留手写入口）← 现在这版
-    #     → 依据：dex2c 产物【本来就是动态注册的】
-    #       （Dex2C.cpp 的 JNI_OnLoad 里调 dynamic_register_compile_methods），
-    #        不靠 dlsym 按名查找 → 隐藏它们不影响调用。
-    #       而我们手写的三个入口（NcLink.selftest/ncVerify/heartbeat）
-    #       走 JNI 短名绑定，ART 靠 dlsym 按名找 → 必须导出。
-    #
-    #   实测验证：t2.so 里 Java_com_x_MainActivity_k 被隐藏、
-    #   Java_com_nc_link_NcLink_selftest 保留，各得其所。
-    #
-    #   ⚠️ 动态注册手写入口这条路已试过并回退（a7d9cbc）：
-    #      constructor 里 FindClass 在 so 加载时机不安全，真机起不来。
-    #      所以手写入口只能短名绑定，只能保留符号名。
-    cat > "$jni/nc_hide.map" <<'MAPEOF'
+  # ── 白名单为什么是 Java_* 而不是 Java_com_nc_* ──────────────────
+  #   这里曾有一轮误判（e0e6bb2）：它断言「dex2c 产物本来就是动态注册的，
+  #   所以可以只保留 Java_com_nc_*」，实测证明【不成立】：
+  #     · protect.sh 调 dcc.py 时【不传】-d/--dynamic-register
+  #       （grep dynamic-register protect.sh = 0 命中）
+  #     · dcc.py 的 dynamic_register 默认 False（argparse default=False）
+  #     · writer.py:106 的 if/else → 走 else 分支，产出
+  #       `extern "C" JNIEXPORT ... JNICALL Java_xxx`（短名绑定！）
+  #   即 dex2c 产物靠 ART dlsym 按名查找，只保留 Java_com_nc_* 会让
+  #   全部业务方法 UnsatisfiedLinkError。实测对照（本机 clang + lld）：
+  #     hide.map  (Java_com_nc_*) → 只剩 NcLink_selftest，MainActivity_k 消失
+  #     hide2.map (Java_*)        → 两者都保留
+  #
+  # ── 必须带 --undefined-version ─────────────────────────────────
+  #   version script 声明了 JNI_OnLoad，但并非每个组合都定义它
+  #   （纯 sigcheck/envcheck 组合没有 dex2c 的 Dex2C.cpp；测试工程也没有）。
+  #   lld 对这种「声明了却不存在」的符号是【硬错误】而不是忽略：
+  #       ld.lld: error: version script assignment of 'global' to symbol
+  #               'JNI_OnLoad' failed: symbol not defined
+  #   实测：不加该 flag，无 JNI_OnLoad 的工程直接链接失败（CI 会红）。
+  #   加上后行为：存在的就按规则处理，不存在的不报错。
+  #
+  # ── 语义变化（如实记录）──────────────────────────────────────
+  #   Java_* 导出是 JNI 短名绑定的【硬要求】，隐藏它 = ULE。
+  #   所以本 map 的实际收益只有一条：把非 JNI 的内部符号（ncg_* /
+  #   dex2c 辅助函数 / nc_jni_*）挡在 .dynsym 外。这已是当前架构下
+  #   能做到的上限——想藏业务方法名只有动态注册，而动态注册在 so
+  #   加载时机（Application 初始化中）会崩（a7d9cbc 真机实证）。
+  #   「隐藏 JNI 符号」与「短名绑定」二者不可兼得，此处选了先能跑。
+  echo "  [mk] JNI 符号隐藏已启用（version-script：Java_* 导出，其余 local）"
+  cat > "$jni/nc_hide.map" <<'MAPEOF'
 {
   global:
     JNI_OnLoad;
-    Java_com_nc_*;
+    Java_*;
   local:
     *;
 };
 MAPEOF
-    cat >> "$jni/Android.mk" <<EOF
+  cat >> "$jni/Android.mk" <<EOF
 LOCAL_LDFLAGS += -Wl,--version-script=\$(LOCAL_PATH)/nc_hide.map
+LOCAL_LDFLAGS += -Wl,--undefined-version
 EOF
-    # 改名宏：把 Java_xxx 在编译期映射成 ncg_d2c_N（符号不出 .dynsym）
-    if [ -s "$jni/nc_jni_rename.mk" ]; then
-      cat >> "$jni/Android.mk" <<EOF
-LOCAL_CFLAGS += \$(shell cat \$(LOCAL_PATH)/nc_jni_rename.mk)
-LOCAL_CPPFLAGS += \$(shell cat \$(LOCAL_PATH)/nc_jni_rename.mk)
-EOF
-    fi
-  else
-    # 这条日志同样关键：说明"JNI 符号隐藏没启用"，以及为什么。
-    # 静默跳过是 CI 上最难查的一类问题（报错五十二的同型教训）。
-    echo "  [mk] ⚠️ 未发现 nc_jni_gen.c → JNI 符号隐藏未启用" \
-         "（注册表生成是否晚于 ndk_write_mk？）" >&2
-  fi
 
   # ⚠️ include $(BUILD_SHARED_LIBRARY) 必须放在【所有 LOCAL_* 赋值之后】。
   # 2026-10-19 CI 实证：此前 include 写在中间，后面追加的

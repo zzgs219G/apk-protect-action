@@ -34,6 +34,8 @@
 #   T21 全仓段名字面量登记检测（防拼错/防新增未登记段名）★ 2026-10-20
 #   T22 二进制等价性（固定 sig_hash.h 后，改动不得改变产物字节）★ 2026-10-20
 #   T23 strip 真生效 + strip 后锁箱/开箱仍通（.symtab 归零）★ 2026-10-20
+#   T24 version script 真的生效（无失效 guard / 白名单 Java_* / --undefined-version）★ 2026-10-21
+#   T25 密钥不硬编码（k_stub/k_mac_head 每构建随机，且源码无硬编码字面量）★ 2026-10-22
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -829,6 +831,67 @@ if [ -f libnc.so ] && [ -n "${APK:-}" ] && [ -f "$APK" ]; then
     rm -f libnc_stripped.so
 else
     skip "T23 无 libnc.so 或缺 APK，跳过"
+fi
+
+# ── T24 version script 真的生效（修 2026-10-21 的"永不成立 guard"）──
+# 背景（静默失效，比报错更危险）：
+#   lib-ndk.sh 的整段 version script 曾被包在
+#       if [ -f "$jni/nc_jni_gen.c" ]; then ...
+#   里面，而该文件的生成器 gen-jni-register.py 已在 a7d9cbc 删除
+#   （动态注册真机崩，回退短名绑定），protect.sh 也再无生成点。
+#   于是 condition 恒假 → map 从未生成 → .dynsym 一直导出全部 Java_*
+#   业务符号（实测报告 §五 给符号表 0.0 分即由此而来）。
+#   而 --strip-all 只删 .symtab/.strtab，删不掉 .dynsym，补不上这个洞。
+#
+# 本项断言三件事（⚠️ 只查【代码行】，不查注释——注释里会引用这些字符串
+# 来说明历史，裸 grep 会误报。2026-10-21 实测踩过）：
+#   ① lib-ndk.sh 里【不再】用 nc_jni_gen.c 做启用条件（防 guard 复活）
+#   ② map 的白名单是 Java_*（dex2c 走短名绑定，只留 Java_com_nc_* 会 ULE）
+#   ③ 带上 --undefined-version（否则无 JNI_OnLoad 的组合会链接失败）
+_LIBNDK_CODE=$(grep -v '^[[:space:]]*#' "$ROOT/scripts/lib/lib-ndk.sh")
+if printf '%s\n' "$_LIBNDK_CODE" | grep -q 'nc_jni_gen\.c'; then
+    bad "T24 lib-ndk.sh 仍以 nc_jni_gen.c 为启用条件 —— 该文件永不生成，version script 会再次失效"
+else
+    ok "T24 version script 无失效 guard（不再依赖已删除的 nc_jni_gen.c）"
+fi
+if printf '%s\n' "$_LIBNDK_CODE" | grep -q 'Java_com_nc_\*'; then
+    bad "T24 map 白名单写成 Java_com_nc_* —— dex2c 不传 --dynamic-register 走短名绑定，业务方法会 ULE"
+else
+    ok "T24 map 白名单为 Java_*（匹配短名绑定实际形态）"
+fi
+if printf '%s\n' "$_LIBNDK_CODE" | grep -q -- '--undefined-version'; then
+    ok "T24 带 --undefined-version（无 JNI_OnLoad 的组合不会链接失败）"
+else
+    bad "T24 缺 --undefined-version —— 纯 sigcheck/envcheck 组合会报 'symbol JNI_OnLoad not defined'"
+fi
+
+# ── T25 密钥不硬编码（2026-10-22，修「解密器全部明文 / 密钥表可读」）──
+# 背景：实测报告 §五 指出 k_stub / k_mac_head 是【硬编码在公开仓库里】的常量。
+#   原注释的理由是"真正的盐是证书指纹，占位值公开不影响换 key 重打包即失效"
+#   —— 那个理由对 k_so 成立（走 HKDF+证书），对 k_stub/k_mac_head 【不成立】：
+#     · k_stub 直接就是 .ncxh 的加密钥匙；
+#     · k_mac_head 直接就是 head 段 MAC 的密钥（知道它就能对任意篡改重算 MAC，
+#       P0-b 那层完整性校验形同虚设）。
+#   两者一旦硬编码在公开仓库，攻击者不必逆向——读脚本就知道钥匙。
+#
+# 本项断言两件事：
+#   ① 脚本里不再有那两串硬编码字面量（防回退）
+#   ② 两次运行 lock_head 产出的 wrapped_k_stub 不同（证明真的随机了）
+if grep -q "0x3B, 0x7C, 0x19, 0x5E" "$LOCK" 2>/dev/null; then
+    bad "T25 k_stub 仍是硬编码常量（公开仓库即钥匙，.ncxh 可静态解）"
+else
+    ok "T25 k_stub 无硬编码字面量（改为构建期随机）"
+fi
+if grep -q "0x91, 0x4A, 0xD2, 0x08" "$LOCK" 2>/dev/null; then
+    bad "T25 k_mac_head 仍是硬编码常量（知道它即可伪造 head MAC）"
+else
+    ok "T25 k_mac_head 无硬编码字面量（改为构建期随机）"
+fi
+if grep -q "k_stub = os.urandom(16)" "$LOCK" 2>/dev/null \
+   && grep -q "k_mac_head = os.urandom(16)" "$LOCK" 2>/dev/null; then
+    ok "T25 k_stub / k_mac_head 均为 os.urandom(16)"
+else
+    bad "T25 随机化写法缺失（应为 os.urandom(16)）"
 fi
 
 echo
