@@ -421,7 +421,8 @@ static int find_apk_path(char *out, size_t outlen) {
         const char *t = evn ? getenv(evn) : NULL;
         if (t && *t) {
             snprintf(out, outlen, "%s", t);
-            LOGI("apk path from test env: %s", out);
+            /*LSG:TESTAPK_PATH|【数据】宿主测试用环境变量指定的 APK 路径*/
+            LSGI(LSG_TESTAPK_PATH, "%s", out);
             return 0;
         }
     }
@@ -460,12 +461,10 @@ static int find_apk_path(char *out, size_t outlen) {
                     snprintf(out, outlen, "%s", sp + 1);
                     if (access(out, R_OK) == 0) {
                         fclose(fp);
-                        LOGI("apk path from maps: %s", out);
                         /*LSG:MAPS_OK|【成功】maps 直接定位到 APK*/
                         LSGI(LSG_MAPS_OK, "%s", out);
                         return 0;
                     }
-                    LOGE("maps candidate not accessible: %s errno=%d", out, errno);
                     /*LSG:MAPS_NG|【流程】maps 候选路径不可读,继续扫 maps 后续行*/
                     LSGE(LSG_MAPS_NG, "%s errno=%d", out, errno);
                 }
@@ -473,7 +472,6 @@ static int find_apk_path(char *out, size_t outlen) {
             }
         }
         fclose(fp);
-        LOGI("maps has no base.apk!/...so line, try lib-path fallback");
         /*LSG:MAPS_MISS|【流程】maps 无 base.apk 行,改由 libnc.so 路径反推*/
         LSGI0(LSG_MAPS_MISS);
     } else {
@@ -527,21 +525,17 @@ static int find_apk_path(char *out, size_t outlen) {
                 snprintf(candidate, sizeof(candidate), "/proc/self/root%s/base.apk", root);
                 if (access(candidate, R_OK) == 0) {
                     snprintf(out, outlen, "%s", candidate);
-                    LOGI("apk path from so dir: %s", out);
                     /*LSG:SODIR_OK|【成功】由 libnc.so 路径反推出 APK*/
                     LSGI(LSG_SODIR_OK, "%s", out);
                     return 0;
                 }
-                LOGE("so-dir candidate not accessible: %s errno=%d", candidate, errno);
                 /*LSG:SODIR_NG|【流程】so 路径反推的候选不可读*/
                 LSGE(LSG_SODIR_NG, "%s errno=%d", candidate, errno);
             } else {
-                LOGE("so path not in expected layout: %s", root);
                 /*LSG:SODIR_LAYOUT|【流程】so 路径不是预期安装布局,反推失败*/
                 LSGE(LSG_SODIR_LAYOUT, "%s", root);
             }
         } else {
-            LOGE("cannot resolve self so path (dladdr+maps both empty)");
             /*LSG:SODIR_NOSELF|【流程】无法取得本 so 自身路径*/
             LSGE0(LSG_SODIR_NOSELF);
         }
@@ -552,14 +546,17 @@ static int find_apk_path(char *out, size_t outlen) {
         DIR *d1, *d2;
         struct dirent *e1, *e2;
         if (get_pkg_name(pkg, sizeof(pkg)) != 0) {
-            LOGE("read /proc/self/cmdline failed: errno=%d", errno);
+            /*LSG:CMDLINE_FAIL|【失败】读取 /proc/self/cmdline 失败*/
+            LSGE(LSG_CMDLINE_FAIL, "errno=%d", errno);
             return -1;
         }
-        LOGI("pkg from cmdline: %s", pkg);
+        /*LSG:PKG_FROM_CMDLINE|【数据】从 cmdline 取到包名*/
+        LSGI(LSG_PKG_FROM_CMDLINE, "%s", pkg);
 
         d1 = opendir("/data/app");
         if (!d1) {
-            LOGE("opendir /data/app failed: errno=%d", errno);
+            /*LSG:DATA_OPENDIR_ERR|【失败】无法打开 /data/app（Android 11+ SELinux 常见）*/
+            LSGE(LSG_DATA_OPENDIR_ERR, "errno=%d", errno);
             return -1;
         }
         while ((e1 = readdir(d1))) {
@@ -576,7 +573,6 @@ static int find_apk_path(char *out, size_t outlen) {
                     snprintf(out, outlen, "%s", candidate);
                     closedir(d2);
                     closedir(d1);
-                    LOGI("apk path from data/app: %s", out);
                     /*LSG:DATA_OK|【成功】遍历 /data/app 定位到 APK*/
                     LSGI(LSG_DATA_OK, "%s", out);
                     return 0;
@@ -585,7 +581,6 @@ static int find_apk_path(char *out, size_t outlen) {
             closedir(d2);
         }
         closedir(d1);
-        LOGE("data/app scan exhausted: no <pkg>*/base.apk accessible");
         /*LSG:DATA_MISS|【失败】/data/app 扫描完毕,无可读 base.apk*/
         LSGE0(LSG_DATA_MISS);
     }

@@ -47,8 +47,21 @@
  * 清单里，导致 .rodata 字符串全明文（复测报告实测命中 2 处）。 */
 
 /*LSGS:G2_BLOCK_MAGIC|APK Sig Block 42*/
-/* /proc/self/maps 复用 sig_check.c 已定义的 LSGS_PATH_MAPS2，
- * 不另立标记（同内容两条标记会因生成器的宏名唯一性检查而 fail-fast）。 */
+/* 路径 ①② 用到的字面量（2026-10-22 补）。
+ * 实测报告《逆向分析报告》§6.3 明确点名这批串：
+ *   "apk path from maps: %s" / "/data/app" / "base.apk" …
+ *   报告说"相当于把校验流程的伪代码印在了 .rodata 里"。
+ * 本文件此前只做了 magic，路径串漏了 —— 复测实测 so 里仍可 strings 到。 */
+/*LSGS:G2_SUFFIX_APK|base.apk*/
+/*LSGS:G2_DIR_LIB|/lib/*/
+/* 注：/proc/self/maps 复用 sig_check.c 已定义的 LSGS_PATH_MAPS2，
+ * 不另立标记（同内容两条标记会因生成器的宏名唯一性检查而 fail-fast）。
+ *
+ * /proc/%d/root%s（路径 ② 的 SELinux 绕行前缀）：这个格式串无法整体密文化
+ * ——它含 %d/%s 占位符，且拆开后会暴露 "root" 这个语义关键词。改为
+ * 运行期由两段密文拼装（见 g2_root_prefix()）。 */
+/*LSGS:G2_PATH_PROC|/proc/*/
+/*LSGS:G2_PATH_ROOT|root*/
 
 /* ── .rodata 字符串密文化（2026-10-19）─────────────────────────
  * 本文件是独立的第二签名校验线（与 sig_check.c 双线互备），
@@ -201,6 +214,24 @@ static int g2_find_apk(char *out, size_t outlen) {
     }
 #endif
 
+/* ── 路径字面量：生产走 LSGS 密文，宿主测试用明文本地宏 ──────────────
+ * 为什么要回落：本文件在 SIGGUARD2_HOST_TEST 下【不包含】sig_log_data.h
+ *   （那是流水线产物），因此 lsg_s / LSGS_G2_* 在该模式下不存在。
+ *   宿主测试只验证派生公式，不需要密文 —— 与 g2_block_magic() 同款处理。
+ * 生产路径：这 5 条全部走 LSGS 解码，so 里零明文（实测确认）。 */
+#ifdef G2_HAVE_LSGS
+#  define G2_APK_SUFFIX()  (lsg_s(LSGS_G2_SUFFIX_APK, g2_kbuf1, sizeof(g2_kbuf1)))
+#  define G2_DIR_LIB()     (lsg_s(LSGS_G2_DIR_LIB,    g2_kbuf2, sizeof(g2_kbuf2)))
+#  define G2_PATH_PROC()   (lsg_s(LSGS_G2_PATH_PROC,  g2_kbuf3, sizeof(g2_kbuf3)))
+#  define G2_PATH_ROOT()   (lsg_s(LSGS_G2_PATH_ROOT,  g2_kbuf4, sizeof(g2_kbuf4)))
+static char g2_kbuf1[16], g2_kbuf2[16], g2_kbuf3[16], g2_kbuf4[8];
+#else
+#  define G2_APK_SUFFIX()  ("base.apk")
+#  define G2_DIR_LIB()     ("/lib/")
+#  define G2_PATH_PROC()   ("/proc/")
+#  define G2_PATH_ROOT()   ("root")
+#endif
+
     /* 路径 ①:maps 里的 base.apk */
 #ifdef G2_HAVE_LSGS
     char _mb[24];
@@ -211,7 +242,9 @@ static int g2_find_apk(char *out, size_t outlen) {
 #endif
     if (fp) {
         while (fgets(line, sizeof(line), fp)) {
-            char *p = strstr(line, "base.apk");
+            /* "base.apk" 走 LSGS（报告 §6.3 点名的明文串之一） */
+            const char *_apk = G2_APK_SUFFIX();
+            char *p = _apk ? strstr(line, _apk) : NULL;
             if (p) {
                 char *sp;
                 p += 8;
@@ -230,20 +263,28 @@ static int g2_find_apk(char *out, size_t outlen) {
     {
         Dl_info info;
         if (dladdr((const void *)&g2_find_apk, &info) != 0 && info.dli_fname) {
-            const char *p = strstr(info.dli_fname, "/lib/");
+            const char *_libp = G2_DIR_LIB();
+            const char *p = _libp ? strstr(info.dli_fname, _libp) : NULL;
             if (p) {
                 size_t n = (size_t)(p - info.dli_fname);
                 if (n + 64 < outlen) {
                     int i;
+                    const char *_apk2 = G2_APK_SUFFIX();
                     memcpy(out, info.dli_fname, n);
-                    /* /proc/<pid>/root 前缀,获得 SELinux 可读的真实路径 */
-                    snprintf(out + n, outlen - n, "/base.apk");
+                    /* /proc/<pid>/root 前缀,获得 SELinux 可读的真实路径。
+                     * 格式串本身也是泄露项 → 由两段密文拼装，见 g2_root_prefix()。 */
+                    snprintf(out + n, outlen - n, "/%s", _apk2 ? _apk2 : "base.apk");
                     if (out[0] == '/') {
                         char real[1024];
-                        snprintf(real, sizeof(real), "/proc/%d/root%s", (int)getpid(), out);
-                        if (access(real, R_OK) == 0) {
-                            snprintf(out, outlen, "%s", real);
-                            return 0;
+                        const char *_proc = G2_PATH_PROC();
+                        const char *_root = G2_PATH_ROOT();
+                        if (_proc && _root) {
+                            snprintf(real, sizeof(real), "%s%d/%s%s",
+                                     _proc, (int)getpid(), _root, out);
+                            if (access(real, R_OK) == 0) {
+                                snprintf(out, outlen, "%s", real);
+                                return 0;
+                            }
                         }
                     }
                     /* 直接试原路径 */
@@ -253,7 +294,8 @@ static int g2_find_apk(char *out, size_t outlen) {
                         if (out[i] == '/') {
                             char cand[1024];
                             out[i] = '\0';
-                            snprintf(cand, sizeof(cand), "%s/base.apk", out);
+                            snprintf(cand, sizeof(cand), "%s/%s", out,
+                                     _apk2 ? _apk2 : "base.apk");
                             if (access(cand, R_OK) == 0) {
                                 snprintf(out, outlen, "%s", cand);
                                 return 0;

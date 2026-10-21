@@ -129,6 +129,29 @@ PYSENS
         bad "未登记敏感串泄露（这些词不在 LSGS 清单里，故上面的断言查不到）:"
         echo "$hits" | sed 's/^/        /' >&2
     fi
+
+    # ⑧ 逆向报告 §6.3 点名的"流程说明书"字样（2026-10-22 新增）
+    # 报告原文："这相当于把校验流程的伪代码印在了二进制的 .rodata 里。
+    #           我靠这些字符串反推出：路径解析 → EOCD 解析 → v2 signing
+    #           block → 提取 DER → SHA-256 → 比对。没有它们，成本至少翻倍。"
+    # 这批串此前是裸 LOGI/LOGE 英文日志（多数还有一份重复的中文 LSG 版本，
+    # 等于白白多泄露一遍），已全部改为走 LSGS 或删除。
+    leak2=$(python3 - "$T/libtest.so" <<'PYFLOW' || true
+import sys
+pats = [b'apk path from', b'data/app scan exhausted', b'open apk failed',
+        b'nc: fp=', b'der_len=', b'id=0x', b'opendir /data/app failed',
+        b'pkg from cmdline', b'read /proc/self/cmdline failed',
+        b'base.apk', b'/proc/%d/root']
+d = open(sys.argv[1], 'rb').read()
+print('\n'.join(sorted({p.decode() for p in pats if p in d})))
+PYFLOW
+)
+    if [ -z "$leak2" ]; then
+        ok "⑧ 逆向报告 §6.3 的流程说明书字样零泄漏（11 条全清）"
+    else
+        bad "⑧ 仍有流程说明书字样泄漏（报告靠它们反推整条校验链）:"
+        echo "$leak2" | sed 's/^/        /' >&2
+    fi
 else
     bad "so 编译失败"; head -10 "$T/c.log"
 fi
