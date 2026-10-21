@@ -36,6 +36,7 @@
 #   T23 strip 真生效 + strip 后锁箱/开箱仍通（.symtab 归零）★ 2026-10-20
 #   T24 version script 真的生效（无失效 guard / 白名单 Java_* / --undefined-version）★ 2026-10-21
 #   T25 密钥不硬编码（k_stub/k_mac_head 每构建随机，且源码无硬编码字面量）★ 2026-10-22
+#   T26 amimo_dcc 僵尸符号不外泄（编译期改名 + 白名单仍 Java_*）★ 2026-10-22
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -930,6 +931,28 @@ if grep -q "k_stub = os.urandom(16)" "$LOCK" 2>/dev/null \
     ok "T25 k_stub / k_mac_head 均为 os.urandom(16)"
 else
     bad "T25 随机化写法缺失（应为 os.urandom(16)）"
+fi
+
+# ── T26 僵尸符号不外泄（2026-10-22，修逆向报告 v2 §8 F-13）──────────
+# Java_amimo_dcc_DccApplication_init__ 是 dex2c 引擎的空函数，实测产物里
+# 是纯僵尸（protect.sh 传 --no-build → loader 注入分支不执行 → APK 里没有
+# amimo/dcc/DccApplication 这个类 → ART 永不按名查找它）。
+# 导出它只白送情报："这库是从别处复用的"（报告 F-13 原文）。
+#
+# ⚠️ 为什么用编译期改名而不是 version script：实测 version script 里
+#   `local: Java_amimo_dcc_*` 不优先于 `global: Java_*`（三种写法均失败）；
+#   而收窄白名单到 Java_com_nc_link_* 会连带隐藏 dex2c 业务方法（e0e6bb2 的坑）。
+# ⚠️ 只查代码行：本文件的注释里也含该字符串，裸 grep 会自造假阳性
+#    （2026-10-22 实测：故意删掉改名后断言仍绿）
+if printf '%s\n' "$_LIBNDK_CODE" | grep -q 'CFLAGS.*-DJava_amimo_dcc_DccApplication_init__=ncg_zombie_dcc_init'; then
+    ok "T26 amimo_dcc 僵尸符号编译期改名（不再匹配 Java_* 白名单）"
+else
+    bad "T26 amimo_dcc 僵尸符号未处置 —— .dynsym 会导出它，泄露引擎复用痕迹"
+fi
+if printf '%s\n' "$_LIBNDK_CODE" | grep -q 'Java_\*;'; then
+    ok "T26 白名单仍为 Java_*（业务方法走短名绑定，收窄会导致 ULE）"
+else
+    bad "T26 白名单被收窄 —— dex2c 业务方法会 UnsatisfiedLinkError"
 fi
 
 echo

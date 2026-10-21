@@ -130,6 +130,33 @@ EOF
   #   加载时机（Application 初始化中）会崩（a7d9cbc 真机实证）。
   #   「隐藏 JNI 符号」与「短名绑定」二者不可兼得，此处选了先能跑。
   echo "  [mk] JNI 符号隐藏已启用（version-script：Java_* 导出，其余 local）"
+  # ── 排除 dex2c 引擎的僵尸符号（2026-10-22，修逆向报告 v2 §8 F-13）────
+  # Java_amimo_dcc_DccApplication_init__ 是 dex2c 引擎自带的一个空函数：
+  #
+  #     extern "C" { JNIEXPORT void JNICALL
+  #     Java_amimo_dcc_DccApplication_init__(JNIEnv *env, jobject thiz) { } }
+  #
+  # 实测确认它在产物里是【纯僵尸】：
+  #   · dcc.py:997 的 loader 注入（把 DccApplication.smali 塞进 APK）只在
+  #     `if is_apk(apkfile) and outapk:` 分支里跑；
+  #   · 而 protect.sh 传的是 --no-build，outapk 为空 → 该分支不执行；
+  #   · 实测 APK 的 6 个 dex 里【没有】amimo/dcc/DccApplication 这个类。
+  # 所以 ART 永远不会按名 dlsym 它，导出它只是白送情报：
+  # 逆向报告 v2 F-13 原文："泄露『这库是从别处复用』的痕迹，且无功能价值"。
+  #
+  # 处置：不动 tools/Dex2C/（那是引擎分发版，改了下游 dex2c.zip 就对不上），
+  # 用【编译期改名】把它改成非 Java_ 前缀的符号 —— 于是不匹配 version script
+  # 的 `Java_*` 白名单，被 `local: *` 收走，不再出现在 .dynsym。
+  #
+  # ⚠️ 为什么不用 version script 的 local 精确匹配：实测无效。
+  #   `global: Java_*; local: Java_amimo_dcc_*; *;` 里具体的 local 条目
+  #   【不会】优先于 global 的通配（ld 的匹配规则是同段内先匹配者胜，
+  #   跨段时 global 段先被扫描）。三种写法实测均仍导出该符号。
+  #   而改用精确白名单 `global: Java_com_nc_link_*` 会连带隐藏 dex2c 的
+  #   业务方法 —— 那正是 e0e6bb2 踩过的坑（业务方法走短名绑定，隐藏即 ULE）。
+  #   编译期改名是唯一既能摘掉僵尸符号、又不影响业务符号的办法。
+  #
+  # 若将来真启用 loader 注入（去掉 --no-build），删掉下面那行 -D 即可恢复。
   cat > "$jni/nc_hide.map" <<'MAPEOF'
 {
   global:
@@ -139,6 +166,10 @@ EOF
     *;
 };
 MAPEOF
+  cat >> "$jni/Android.mk" <<'EOF'
+LOCAL_CFLAGS   += -DJava_amimo_dcc_DccApplication_init__=ncg_zombie_dcc_init
+LOCAL_CPPFLAGS += -DJava_amimo_dcc_DccApplication_init__=ncg_zombie_dcc_init
+EOF
   cat >> "$jni/Android.mk" <<EOF
 LOCAL_LDFLAGS += -Wl,--version-script=\$(LOCAL_PATH)/nc_hide.map
 LOCAL_LDFLAGS += -Wl,--undefined-version

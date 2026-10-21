@@ -67,3 +67,38 @@ repack_build() {
   # max(原版本, minSdk 推导下限)),对任意 App/minSdk 组合通用
   python3 "$ROOT/scripts/repack/patch-dex-version.py" restore "$out" "$decompiled"
 }
+
+# repack_force_debuggable_off <解包目录> — 强制 debuggable=false
+#
+# 为什么必须做（逆向分析报告 v2 §8 F-11）：
+#   实测测试 APK 的 Manifest 写着 debuggable=true。带这个标记的 release 包：
+#     · `run-as <pkg>` 可进应用私有目录，读写文件、dump 内存
+#     · 调试器可直接 attach —— 我们那套 ptrace(TRACEME) / PR_SET_DUMPABLE
+#       全部建立"不许被调试"的前提，debuggable=true 等于从系统层面给开了后门
+#     · `am set-debug-app` 等工具链全线可用
+#
+# ⚠️ 与 extractNativeLibs 不同：debuggable 属性【可能不存在】。
+#   不存在时的语义就是 false（Android 默认），所以脚本对"属性不存在"
+#   返回成功而非报错 —— 绝大多数正常 App 本来就不写这个属性，
+#   若照搬 extractNativeLibs 的"缺则报错"，会让绝大多数包构建失败。
+repack_force_debuggable_off() {
+  local decompiled="$1"
+  local mf="$decompiled/AndroidManifest.xml"
+  # 解包可能产出二进制 AXML（-r 模式），也可能被 apktool 转成文本 XML。
+  # 文本形态下 patche 方式不同 —— 先探测，避免把文本 XML 喂给二进制解析器。
+  if [ ! -f "$mf" ]; then
+    log_warn "AndroidManifest.xml 不存在，跳过 debuggable 处理"
+    return 0
+  fi
+  if head -c 4 "$mf" | od -An -tx1 | tr -d ' \n' | grep -q '^03000800$'; then
+    python3 "$ROOT/scripts/repack/patch-debuggable.py" "$mf"
+  else
+    # 文本 XML：apktool 未加 -r 时会解码成文本。用属性替换处理。
+    if grep -q 'android:debuggable="true"' "$mf"; then
+      sed -i 's/android:debuggable="true"/android:debuggable="false"/g' "$mf"
+      log_info "debuggable → false（文本 XML）"
+    else
+      log_info "debuggable 已是 false 或未设置（文本 XML），跳过"
+    fi
+  fi
+}

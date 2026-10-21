@@ -663,6 +663,16 @@ if [[ $WANT_SIGCHECK -eq 1 || $WANT_TRANSPILE -eq 1 || $WANT_ENVCHECK -eq 1 ]]; 
   # 纯 dex 组合(仅 stringenc)没有 libnc.so,manifest 无需改写(报错二十三)
   repack_force_extractnativelibs "$WORK/decompiled"
 fi
+
+# ── 强制 debuggable=false（所有组合都做，2026-10-22）────────────────
+# 逆向报告 v2 §8 F-11 实证：测试包 Manifest 写着 debuggable=true。
+# 带这个标记的 release 包等于从系统层面给攻击者开了后门：
+#   · run-as 可进私有目录、dump 内存
+#   · 调试器可直接 attach —— 我们那套 ptrace/PR_SET_DUMPABLE 的前提被架空
+# 与 extractNativeLibs 不同，这个【所有组合都要做】，包括纯 dex 组合：
+# stringenc 的产物同样是 release 包，没有理由保留 debug 标记。
+repack_force_debuggable_off "$WORK/decompiled"
+
 repack_build "$WORK/decompiled" "$WORK/unsigned.apk"
 
 # ── 输出 ────────────────────────────────────────────────────────────
