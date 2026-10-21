@@ -868,10 +868,19 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # stub 侧靠 slot 里的 stub_sh_addr + 自身 PC 相对地址算出镜像基址，
     # 再加 head_sh_addr 定位 head 段，全程不碰符号表。
 
-    # k_stub：与 k_so 独立的第二把钥匙（hardcode 的理由同 master ——
-    # 真正的盐是证书指纹，占位值公开不影响"换 key 重打包即失效"）
-    k_stub = bytes([0x3B, 0x7C, 0x19, 0x5E, 0xA2, 0xDF, 0x48, 0x31,
-                    0x6C, 0x85, 0xEA, 0x27, 0x54, 0x9B, 0x0F, 0xD6])
+    # k_stub：与 k_so 独立的第二把钥匙。
+    #
+    # ⚠️⚠️ 2026-10-22 改为【每次构建随机】（原为硬编码常量）。
+    # 原注释的理由是"真正的盐是证书指纹，占位值公开不影响换 key 重打包即失效"
+    # —— 那个理由对 k_so 成立，对 k_stub【不成立】：
+    #   · k_so 走 HKDF(master, SHA256(certDER), pkg)，证书是外部输入，硬编码占位无妨；
+    #   · k_stub 直接就是 .ncxh 的加密钥匙，它硬编码在【公开仓库】里 =
+    #     攻击者不用逆向，读 so-section-lock.py 第 873 行就知道 k_stub，
+    #     再配合 slot 里明文的 wrapped_k_stub 反推 XOR_KEY，.ncxh 直接可解。
+    # 实测确认随机化零风险：k_stub 只被本函数 wrap 进 slot，运行期
+    # ncg_stub_recover() 从 slot unwrap 取回（boot.c:845），全程不依赖"值是什么"。
+    k_stub = os.urandom(16)
+    assert len(k_stub) == 16
 
     # ── 阶段3 代码自绑定（2026-10-19）────────────────────────────────
     # 修强度报告 §6「抗静态 patch = 弱」：此前 k_stub 与代码零关联，
@@ -901,8 +910,15 @@ def lock_head(so_path: str, out_path: str, force: bool = False) -> int:
     # k_mac_head：第三把钥匙，只用于 head 段的完整性校验（P0-b）。
     # 与 k_stub / k_so 都必须不同——复用任何一把都意味着"解开 head 就等于
     # 拿到业务段的钥匙"或"知道解密钥匙即可伪造 MAC"，分级失去意义。
-    k_mac_head = bytes([0x91, 0x4A, 0xD2, 0x08, 0x7B, 0xE3, 0x5F, 0xC6,
-                        0x2D, 0xB8, 0x64, 0x17, 0xAF, 0x39, 0x8E, 0x51])
+    #
+    # ⚠️⚠️ 2026-10-22 同 k_stub：改为【每次构建随机】。
+    # 原为硬编码常量，等于把"可伪造 head MAC"的能力印在公开仓库里——
+    # 攻击者拿到 k_mac_head 就能对任意篡改后的 .ncxh 重算正确 MAC，
+    # P0-b 那层完整性校验完全失效（报告 §五「解密器全部明文」的核心）。
+    # 零风险：运行期从 slot[NC_OFF_K_MAC_HEAD] unwrap 取回（boot.c:888），
+    # 不依赖"值是什么"，只依赖"两边一致"。
+    k_mac_head = os.urandom(16)
+    assert len(k_mac_head) == 16
 
     # ── master 随机化 + 藏进 .ncxhr（2026-10-19）──────────
     #
