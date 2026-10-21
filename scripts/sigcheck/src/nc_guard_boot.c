@@ -329,19 +329,34 @@ static int ncg_self_pkg(char *out, size_t cap) {
     return 0;
 }
 
-/* 包名指纹校验：构建期把 SHA256(pkg) 前 8 字节写进 slot[NC_OFF_PKG_SHA]。
- * 为什么要指纹而不是直接存明文包名：明文包名会让攻击者一眼看出
- * "密钥与包名有关"，且 slot 是明文段（.nck 只有内部字段被 XOR）。
- * 指纹长度 8 字节 = 64 bit，碰撞概率对本用途可忽略。 */
+/* 包名指纹：把构建期写入 slot[NC_OFF_PKG_SHA] 的 8 字节与运行期算出的
+ * SHA256(包名)[:8] 做【异或，并返回该偏差】——不是返回 bool。
+ *
+ * ⚠️ 2026-10-22 改造（消除可 patch 的判定点）：原实现返回 int（0/1），
+ *    调用方写 `if (!ncg_pkg_matches(...)) return -12;`。攻击者只要把本函数
+ *    改成 `return 1;`（4 字节）就绕过了整个包名绑定。
+ *
+ * 现在返回【偏差字节数】的逐字节异或值：
+ *   匹配   → 返回全 0  → 调用方把它异或进密钥，密钥不变（正常工作）
+ *   不匹配 → 返回非 0  → 密钥被污染 → 解出乱码 → 后续全崩
+ *
+ * 关键：调用方【不再有 if】，改返回值也没用——改成本 0 反而让攻击者
+ * 自己解不出东西（因为他不知道正确密钥）。这是"数据依赖"对"分支判断"
+ * 的本质差别：攻击者要绕过，必须知道正确包名并伪造，而不是改一行代码。
+ *
+ * 为什么不返回 bool：bool 只有两种语义落点，patch 成本极低；
+ * 返回实际偏差值则让"校验"和"密钥派生"共用同一次运算，不可分离。
+ *
+ * 指纹长度 8 字节 = 64 bit，碰撞概率对本用途可忽略。存指纹而非明文包名
+ * 的理由：明文会暴露"密钥与包名有关"这条线索，而 slot 是明文段。 */
 __attribute__((section(NC_SEC_HEAD), used, retain, noinline))
-static int ncg_pkg_matches(const uint8_t *slotdata, const char *pkg) {
+static void ncg_pkg_fault(const uint8_t *slotdata, const char *pkg,
+                          uint8_t fault[8]) {
     const uint8_t *want = slotdata + NC_OFF_PKG_SHA;
     uint8_t h[32];
     ksha256((const uint8_t *)pkg, strlen(pkg), h);
-    uint8_t diff = 0;
-    for (int i = 0; i < 8; i++) diff |= (uint8_t)(h[i] ^ want[i]);
-    memset(h, 0, sizeof(h));
-    return diff == 0;
+    for (int i = 0; i < 8; i++) fault[i] = (uint8_t)(h[i] ^ want[i]);
+    ncg_wipe(h, sizeof(h));
 }
 
 /* 定位自身 APK 路径。两条来源：
@@ -502,10 +517,20 @@ int ncg_head_unlock(void) {
         if (ncg_find_apk_path(so_path, apk_path, sizeof(apk_path)) == 0) {
             if (ncg_apk_first_cert_der(apk_path, der_buf, sizeof(der_buf),
                                        &der_len) == 0) {
+                /* ⚠️ 2026-10-22：包名校验不再是 if 条件，而是混进密钥。
+                 * 详见 ncg_pkg_fault 的说明——原写法
+                 *   `ncg_pkg_matches(...) && derive(...)`
+                 * 里那次调用可被 patch 成 return 1 绕过整个包名绑定。
+                 * 现在：包名不符 → fault 非 0 → k_cert 被污染 →
+                 *       解出乱码 → 后续全崩（不需要任何分支）。 */
                 if (ncg_self_pkg(pkg_buf, sizeof(pkg_buf)) == 0 &&
-                    ncg_pkg_matches(slotdata, pkg_buf) &&
                     ncg_derive_k_so_from_der(master, der_buf, der_len, pkg_buf,
                                              k_cert) == 0) {
+                    uint8_t fault[8];
+                    ncg_pkg_fault(slotdata, pkg_buf, fault);
+                    /* 把 8 字节偏差摊到 16 字节密钥上（每字节用一次） */
+                    for (int i = 0; i < 16; i++) k_cert[i] ^= fault[i & 7];
+                    ncg_wipe(fault, sizeof(fault));
                     cert_ok = 1;
                 }
             }

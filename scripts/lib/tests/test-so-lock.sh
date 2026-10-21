@@ -38,6 +38,7 @@
 #   T25 密钥不硬编码（k_stub/k_mac_head 每构建随机，且源码无硬编码字面量）★ 2026-10-22
 #   T26 amimo_dcc 僵尸符号不外泄（编译期改名 + 白名单仍 Java_*）★ 2026-10-22
 #   T27 密钥清零不可被优化（memset → volatile 写）★ 2026-10-22
+#   T28 包名校验不可 patch（bool 校验 → 数据依赖）★ 2026-10-22
 #
 # 用法：bash scripts/lib/tests/test-so-lock.sh
 set -uo pipefail
@@ -990,6 +991,35 @@ if [ -f libnc.so ] && nm libnc.so 2>/dev/null | grep -q ncg_wipe; then
 else
     # strip 后符号可能不可见，退回源码级判据（已在上面断言）
     ok "T27 ncg_wipe 反汇编检查跳过（strip 后符号不可见，源码级已断言）"
+fi
+
+# ── T28 包名校验不可 patch（2026-10-22，消除分支判定点）──────────────
+# 原实现：ncg_pkg_matches() 返回 int(0/1)，调用方 `if (!ncg_pkg_matches(...)) return -12;`
+#   → 攻击者把该函数改成 `return 1;`（4 字节）即绕过整个包名绑定。
+# 现实现：ncg_pkg_fault() 返回【实际异或偏差】，调用方把它混进 k_so：
+#   匹配 → 偏差全 0 → 密钥不变；不匹配 → 密钥被污染 → 解出乱码 → MAC 失败。
+#   → 没有 if 可 patch；攻击者改返回值只会让自己解不出东西。
+#
+# 本项断言：源码里不再有"包名判断 + 提前返回"的旧形态。
+BOOT_C2="$SRC/nc_guard_boot.c"
+# ⚠️ 只查代码行：注释里会引用旧函数名来说明改造原因，裸 grep 会自造假阳性
+#    （2026-10-22 实测：改造完成后断言仍红，因为注释了旧写法）
+BOOT_CODE2=$(grep -v '^[[:space:]]*\*' "$BOOT_C2" | grep -v '^[[:space:]]*/\*' | grep -v '^[[:space:]]*//')
+if printf '%s\n' "$BOOT_CODE2" | grep -q 'ncg_pkg_matches'; then
+    bad "T28 仍存在 ncg_pkg_matches（bool 校验 + if 分支，可被 patch 成 return 1）"
+else
+    ok "T28 包名校验已改为数据依赖（ncg_pkg_fault，无 if 可 patch）"
+fi
+if grep -q 'ncg_pkg_fault' "$BOOT_C2" 2>/dev/null \
+   && grep -q 'k_cert\[i\] \^= fault\[i & 7\]' "$BOOT_C2" 2>/dev/null; then
+    ok "T28 包名偏差确实异或进 k_so（不是仅计算不生效）"
+else
+    bad "T28 ncg_pkg_fault 存在但未混入密钥 —— 校验变成纯装饰"
+fi
+# 负向：不能被误写成"偏差算出来后丢弃"
+if grep -qE 'ncg_pkg_fault\([^)]*\);?[[:space:]]*$' "$BOOT_C2" 2>/dev/null \
+   && ! grep -q 'k_cert\[i\] \^= fault' "$BOOT_C2" 2>/dev/null; then
+    bad "T28 偏差算了但没用于密钥（静默失效）"
 fi
 
 echo
