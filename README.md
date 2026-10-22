@@ -35,7 +35,6 @@ scripts/
 ├── sigcheck/    签名校验 + 环境检测 + so 段加密（最大模块，内部再分层）
 ├── string-enc/  dex 字符串加密
 ├── anti-diff/   dex 结构噪声（防原版/加固版对比）
-├── dex2c        转译引擎（tools/dex2c.zip 分发，由 lib/common.sh ensure_dex2c 解压）
 ├── repack/      解包/回编/so 替换/dex 版本修补
 ├── packer/      基础加壳（dpt-shell）
 ├── inject/      loadLibrary 双保险注入
